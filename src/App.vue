@@ -307,7 +307,7 @@ function clearFinished() {
 /** 网页登录收割成功：写登录态 + 刷新界面 */
 function onWebConfirmed(loginInfo) {
   login.value = loginInfo;
-  showToast(`已登录：${loginInfo.uname}`);
+  showToast(loginInfo.uname ? `已登录：${loginInfo.uname}` : "已登录小红书");
   showLogin.value = false;
 }
 

@@ -111,19 +111,35 @@ impl XhsClient {
 
     /// 当前登录态与账号（`__INITIAL_STATE__.user.loggedIn` 是权威标志；
     /// 账号资料优先取 userPageData，取不到再退回 userInfo 的多套字段名）。
+    ///
+    /// 注意：**loggedIn 为真就是已登录**，昵称/头像可能因 SPA 懒加载而缺字段——
+    /// 缺字段只返回空串，不要当成"未登录"（实测踩过：登录成功却判未登录）。
     pub async fn account(&self) -> Result<Option<(String, String, String)>> {
         let url = "https://www.xiaohongshu.com/user/profile/me";
         let html = match self.fetch_text(url, crate::client::SITE_REFERER).await {
             Ok(text) => text,
-            Err(_) => return Ok(None),
+            Err(e) => {
+                crate::login::debug_log(&format!("account：请求失败（{e}）"));
+                return Ok(None);
+            }
         };
         let Ok(state) = XhsClient::parse_initial_state(&html) else {
+            crate::login::debug_log("account：页面里没有 __INITIAL_STATE__");
             return Ok(None);
         };
         let logged_in = state
             .pointer("/user/loggedIn")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let keys: Vec<String> = state
+            .pointer("/user")
+            .and_then(|v| v.as_object())
+            .map(|obj| obj.keys().cloned().collect())
+            .unwrap_or_default();
+        crate::login::debug_log(&format!(
+            "account：loggedIn={logged_in} user 键={:?}",
+            keys
+        ));
         if !logged_in {
             return Ok(None);
         }
@@ -134,22 +150,21 @@ impl XhsClient {
             for source in [page, info] {
                 if let Some(obj) = source {
                     for key in keys {
-                        if let Some(text) = obj.get(key).and_then(|v| v.as_str()) {
-                            if !text.is_empty() {
-                                return text.to_string();
-                            }
+                        if let Some(text) = str_at(obj, &[key]).filter(|t| !t.is_empty()) {
+                            return text;
                         }
                     }
                 }
             }
             String::new()
         };
-        let uid = pick(&["id", "userId", "user_id"]);
-        let nickname = pick(&["nickname", "nickName", "nick_name", "name"]);
-        let avatar = pick(&["headImage", "image", "avatar", "images"]);
-        if uid.is_empty() && nickname.is_empty() {
-            return Ok(None);
-        }
+        let uid = pick(&["id", "userId", "user_id", "userid"]);
+        let nickname = pick(&["nickname", "nickName", "nick_name", "name", "userName"]);
+        let avatar = pick(&["headImage", "image", "avatar", "images", "avatarUrl", "imageb"]);
+        crate::login::debug_log(&format!(
+            "account：提取到 uid={uid:?} 昵称={nickname:?} 头像={}",
+            if avatar.is_empty() { "无" } else { "有" }
+        ));
         Ok(Some((uid, nickname, avatar)))
     }
 }

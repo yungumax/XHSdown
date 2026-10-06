@@ -212,14 +212,35 @@ pub struct AppState {
     pub warmed: AtomicBool,
     /// 缓存的登录态（None = 未登录）
     pub login: RwLock<Option<LoginInfo>>,
+    /// 浏览器取数窗口只有一个，取数必须串行（同窗导航会互相打断）
+    pub fetch_lock: tokio::sync::Mutex<()>,
+}
+
+/// 浏览器数据目录：登录窗口与取数窗口共用同一个目录，
+/// 登录态因此在两个窗口之间共享、也能跨应用重启保留。
+pub fn webview_dir(settings: &Settings) -> PathBuf {
+    settings.data_root().join("webview")
+}
+
+/// 退出登录时若目录被 WebView2 占用删不掉，留这个标记，下次启动先清。
+pub fn webview_logout_marker(settings: &Settings) -> PathBuf {
+    settings.data_root().join("webview.logout")
 }
 
 impl AppState {
     pub fn new() -> Result<Self, String> {
         let settings = Settings::load();
+
+        // 上次退出登录时浏览器目录被占用没删掉：这里先清，避免"登出后又自动登录"
+        let marker = webview_logout_marker(&settings);
+        if marker.exists() {
+            let _ = std::fs::remove_dir_all(webview_dir(&settings));
+            let _ = std::fs::remove_file(&marker);
+        }
+
         let client = XhsClient::with_proxy(Some(&settings.proxy)).map_err(|e| e.to_string())?;
 
-        // 恢复登录态：cookies.json 是网页登录收割的会话凭据
+        // 恢复登录态：cookies.json 是网页登录收割的会话凭据（仅用于快速路径）
         let cookies: xhs_core::client::DomainCookies =
             std::fs::read_to_string(settings.cookies_path())
                 .ok()
@@ -239,6 +260,7 @@ impl AppState {
             batches: Mutex::new(HashMap::new()),
             warmed: AtomicBool::new(false),
             login: RwLock::new(None),
+            fetch_lock: tokio::sync::Mutex::new(()),
         })
     }
 

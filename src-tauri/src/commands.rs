@@ -13,7 +13,6 @@ use tauri::Emitter;
 use tauri::Manager;
 use tauri::State;
 use tauri_plugin_dialog::DialogExt;
-use xhs_core::api::NoteData;
 use xhs_core::download as dl;
 use xhs_core::parser::{parse_input, SourceTarget};
 use xhs_core::XhsClient;
@@ -66,54 +65,36 @@ async fn inline_avatar(client: &XhsClient, face_url: &str) -> String {
     )
 }
 
-/// 校验通过的登录态 → LoginInfo（头像已内嵌）。
-async fn build_login(client: &XhsClient, uid: String, uname: String, face: String) -> LoginInfo {
-    LoginInfo {
-        logged_in: true,
-        uname,
-        face: inline_avatar(client, &face).await,
-        mid: uid,
-        ..Default::default()
-    }
-}
-
 // ───────────────────────── 应用状态 ─────────────────────────
 
 #[tauri::command]
 pub async fn app_status(
-    _app: tauri::AppHandle,
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
 ) -> Result<AppStatus, String> {
     warmup_once(&state).await;
     let settings = state.settings_snapshot();
 
-    // 登录态：有 Cookie 文件就验证一次（10 秒内不给结果就当未登录，不卡启动）
+    // 登录态：让浏览器读一次「我的主页」——登录态存在浏览器数据目录里，
+    // 所以跨重启也能恢复。超时或失败一律当未登录，不卡界面。
     let mut login = LoginInfo::default();
-    if state.cookies_saved() {
-        let client = state.client();
-        let probe = tokio::time::timeout(Duration::from_secs(10), async move {
-            client.account().await
-        })
-        .await;
-        match probe {
-            Ok(Ok(Some((uid, uname, face)))) => {
-                let client = state.client();
-                login = build_login(&client, uid.clone(), uname, face).await;
-                *state.login.write().unwrap() = Some(login.clone());
-                xhs_core::login::debug_log(&format!("启动恢复登录 uid={uid}"));
-            }
-            Ok(Ok(None)) => {
-                xhs_core::login::debug_log("启动恢复登录：/user/profile/me 判未登录");
-            }
-            Ok(Err(e)) => {
-                xhs_core::login::debug_log(&format!("启动恢复登录：接口错误 {e}"));
-            }
-            Err(_) => {
-                xhs_core::login::debug_log("启动恢复登录：10 秒超时");
-            }
+    let check = tokio::time::timeout(Duration::from_secs(25), browser_login_check(&app)).await;
+    match check {
+        Ok(Ok(Some((uid, name, avatar)))) => {
+            let client = state.client();
+            login = LoginInfo {
+                logged_in: true,
+                uname: name,
+                face: inline_avatar(&client, &avatar).await,
+                mid: uid,
+                ..Default::default()
+            };
+            *state.login.write().unwrap() = Some(login.clone());
+            xhs_core::login::debug_log("启动恢复登录：已登录");
         }
-    } else {
-        xhs_core::login::debug_log("启动恢复登录：无 cookies.json");
+        Ok(Ok(None)) => xhs_core::login::debug_log("启动恢复登录：未登录"),
+        Ok(Err(e)) => xhs_core::login::debug_log(&format!("启动恢复登录失败：{e}")),
+        Err(_) => xhs_core::login::debug_log("启动恢复登录：检测超时"),
     }
 
     Ok(AppStatus {
@@ -182,44 +163,6 @@ pub fn update_settings(
 
 // ───────────────────────── 来源解析 ─────────────────────────
 
-/// NoteData → 表格条目
-fn entry_of(note: &NoteData) -> PostEntry {
-    PostEntry {
-        bid: note.note_id.clone(),
-        mid: String::new(),
-        title: naming::title_of(&note.title),
-        author: note.nickname.clone(),
-        created_at: note.created_at,
-        pics: note.pics.len() as u32,
-        has_video: note.has_video(),
-        is_audio: false,
-        media_url: String::new(),
-        page_url: note_page_url(&note.note_id, &note.xsec_token),
-        duration: note.duration,
-        is_retweet: false,
-        media_unknown: false,
-    }
-}
-
-/// 主页卡片 → 表格条目（媒体数量未知，进详情页才有）
-fn card_entry(note: &NoteData) -> PostEntry {
-    PostEntry {
-        bid: note.note_id.clone(),
-        mid: String::new(),
-        title: naming::title_of(&note.title),
-        author: note.nickname.clone(),
-        created_at: note.created_at,
-        pics: 0,
-        has_video: note.has_video(),
-        is_audio: false,
-        media_url: String::new(),
-        page_url: note_page_url(&note.note_id, &note.xsec_token),
-        duration: 0,
-        is_retweet: false,
-        media_unknown: true,
-    }
-}
-
 /// 笔记页地址：带 xsec_token（详情页多数情况必需），无 token 时用裸链接。
 fn note_page_url(id: &str, token: &str) -> String {
     if token.is_empty() {
@@ -230,13 +173,11 @@ fn note_page_url(id: &str, token: &str) -> String {
 }
 
 /// 视频清晰度选项：auto 永远在，hd/sd 按实际有没有给。
-fn quality_options(notes: &[NoteData]) -> Vec<QualityOption> {
-    let has_hd = notes.iter().any(|p| {
-        p.videos
-            .iter()
-            .any(|(label, _)| label == "1080P" || label == "720P")
-    });
-    let has_sd = notes.iter().any(|p| !p.videos.is_empty());
+fn quality_options(videos: &[(String, String)]) -> Vec<QualityOption> {
+    let has_hd = videos
+        .iter()
+        .any(|(label, _)| label == "1080P" || label == "720P");
+    let has_sd = !videos.is_empty();
     vec![
         QualityOption { value: "auto".into(), label: "最佳可用".into(), available: true, hint: String::new() },
         QualityOption { value: "hd".into(), label: "高清".into(), available: has_hd, hint: if has_hd { String::new() } else { "该来源没有高清档".into() } },
@@ -263,6 +204,7 @@ fn note_fetch_url(id: &str, token: &Option<String>, url: &str) -> String {
 
 #[tauri::command]
 pub async fn probe_source(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     input: String,
 ) -> Result<Probe, String> {
@@ -289,8 +231,22 @@ pub async fn probe_source(
     match input {
         SourceTarget::Note { id, token, url } => {
             let fetch_url = note_fetch_url(&id, &token, &url);
-            let note = retry(2, || client.note_detail(&fetch_url)).await.map_err(err)?;
-            let entry = entry_of(&note);
+            let note = fetch_note(&app, &client, &fetch_url, 2).await?;
+            let entry = PostEntry {
+                bid: note.note_id.clone(),
+                mid: String::new(),
+                title: naming::title_of(&note.title),
+                author: note.nickname.clone(),
+                created_at: note.created_at,
+                pics: note.pics.len() as u32,
+                has_video: !note.videos.is_empty(),
+                is_audio: false,
+                media_url: String::new(),
+                page_url: fetch_url.clone(),
+                duration: note.duration,
+                is_retweet: false,
+                media_unknown: false,
+            };
             let probe = Probe {
                 kind: "post".into(),
                 bid: note.note_id.clone(),
@@ -303,7 +259,7 @@ pub async fn probe_source(
                 total: 1,
                 loaded: 1,
                 exhausted: true,
-                qualities: quality_options(&[note.clone()]),
+                qualities: quality_options(&note.videos),
                 items: vec![entry],
             };
             let key = input_key(SourceTarget::Note {
@@ -323,11 +279,29 @@ pub async fn probe_source(
             Ok(probe)
         }
         SourceTarget::User(uid) => {
-            let (info, notes) = retry(2, || client.user_profile(&uid)).await.map_err(err)?;
-            let entries: Vec<PostEntry> = notes.iter().map(card_entry).collect();
+            let user = fetch_user(&app, &client, &uid).await?;
+            let entries: Vec<PostEntry> = user
+                .cards
+                .iter()
+                .map(|card| PostEntry {
+                    bid: card.id.clone(),
+                    mid: String::new(),
+                    title: naming::title_of(&card.title),
+                    author: user.nickname.clone(),
+                    created_at: card.created_at,
+                    pics: 0,
+                    has_video: card.is_video,
+                    is_audio: false,
+                    media_url: String::new(),
+                    page_url: note_page_url(&card.id, &card.token),
+                    duration: 0,
+                    is_retweet: false,
+                    media_unknown: true,
+                })
+                .collect();
             let exhausted = true;
             let note = if entries.is_empty() {
-                "这个博主没有可解析的笔记（或仅对粉丝可见）".to_string()
+                "这个作者没有可解析的笔记（或仅对粉丝可见）".to_string()
             } else {
                 // 网页端只内嵌最新一批笔记；更早的要走带签名的翻页接口
                 format!(
@@ -340,19 +314,19 @@ pub async fn probe_source(
                 kind: "user".into(),
                 bid: String::new(),
                 mid: String::new(),
-                title: info.nickname.clone(),
-                author: info.nickname.clone(),
-                uid: info.uid.clone(),
-                cover: info.avatar.clone(),
+                title: user.nickname.clone(),
+                author: user.nickname.clone(),
+                uid: user.uid.clone(),
+                cover: user.avatar.clone(),
                 note,
-                total: if info.notes_count > 0 {
-                    info.notes_count as usize
+                total: if user.notes_count > 0 {
+                    user.notes_count as usize
                 } else {
                     entries.len()
                 },
                 loaded: entries.len(),
                 exhausted,
-                qualities: quality_options(&notes),
+                qualities: quality_options(&[]),
                 items: entries,
             };
             xhs_core::login::debug_log(&format!(
@@ -360,7 +334,7 @@ pub async fn probe_source(
                 probe.items.len()
             ));
             let cache = BatchCache {
-                uid: info.uid.clone(),
+                uid: user.uid.clone(),
                 items: probe.items.clone(),
                 exhausted,
             };
@@ -564,10 +538,10 @@ async fn run_task(app: tauri::AppHandle, req: DownloadReq, id: String) {
     } else {
         req.page_url.clone()
     };
-    let note = match retry(settings.retry_count as usize, || client.note_detail(&fetch_url)).await {
+    let note = match fetch_note(&app, &client, &fetch_url, settings.retry_count as usize).await {
         Ok(note) => note,
         Err(e) => {
-            done("failed", &err(e), "");
+            done("failed", &e, "");
             return;
         }
     };
@@ -949,43 +923,448 @@ fn civil_from_unix(secs: i64) -> (i64, u32, u32) {
 
 // ───────────────────────── 网页登录（内嵌官方页） ─────────────────────────
 
-#[tauri::command]
-pub async fn web_login_open(app: tauri::AppHandle) -> Result<(), String> {
-    use tauri::{WebviewUrl, WebviewWindowBuilder};
-    if let Some(window) = app.get_webview_window("web-login") {
-        let _ = window.set_focus();
-        return Ok(());
+// ── 浏览器取数 ─────────────────────────────────────────────
+//
+// 为什么不让 reqwest 直接抓：小红书会拒绝"复制 Cookie 再来请求"的会话
+// （实测：登录小窗里 Cookie 明明齐全，程序自己请求仍被判未登录）。
+// 所以取数一律借登录窗口那个真实浏览器的会话——签名与风控由浏览器处理，
+// 程序只负责最后一步：下载 CDN 直链（那些地址自带签名，不需要 Cookie）。
+
+/// 取数窗口（隐藏）：与登录窗口共用浏览器数据目录，因此天然带着登录态。
+async fn ensure_fetch_window(
+    app: &tauri::AppHandle,
+    settings: &Settings,
+) -> Result<tauri::WebviewWindow, String> {
+    if let Some(window) = app.get_webview_window("xhs-fetch") {
+        return Ok(window);
     }
-    // 每次开窗用全新临时数据目录：天然无历史 Cookie/缓存残留，
-    // 退出登录后重新打开也绝不会"自动登录回去"。
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let data_dir = std::env::temp_dir().join(format!("xhsdown-weblogin-{stamp}"));
-    WebviewWindowBuilder::new(
-        &app,
-        "web-login",
-        WebviewUrl::External("https://www.xiaohongshu.com/".parse().unwrap()),
+    let dir = crate::state::webview_dir(settings);
+    std::fs::create_dir_all(&dir).map_err(err)?;
+    let window = tauri::WebviewWindowBuilder::new(
+        app,
+        "xhs-fetch",
+        tauri::WebviewUrl::External("about:blank".parse().unwrap()),
     )
-    .title("小红书登录")
-    .inner_size(460.0, 640.0)
-    .resizable(true)
-    .center()
-    .data_directory(data_dir)
+    .title("XHSdown 取数窗口")
+    .inner_size(1000.0, 760.0)
+    .visible(false)
+    .data_directory(dir)
     .build()
     .map_err(err)?;
-    Ok(())
+    Ok(window)
 }
 
-#[tauri::command]
-pub async fn web_login_cookies(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<LoginInfo, String> {
-    let settings = state.settings_snapshot();
+/// 页面提取脚本：把当前页的关键数据（笔记详情 / 用户主页）打包写进 URL 片段。
+/// webview 里的远程页面没有 Tauri IPC，URL 片段是唯一能把值带回 Rust 的通道。
+const EXTRACT_JS: &str = r#"(function () {
+  var report = function (out) {
+    try {
+      location.replace('#xhsdownid=' + Date.now() + '~' + encodeURIComponent(JSON.stringify(out)));
+    } catch (e) {}
+  };
+  try {
+    var st = window.__INITIAL_STATE__ || null;
+    if (!st) { report({ ready: false, pageUrl: location.href }); return; }
+    var map = st.noteDetailMap || {};
+    var ids = Object.keys(map);
+    if (ids.length) {
+      var note = (map[ids[0]] || {}).note || {};
+      var pics = [];
+      var list = note.imageList || [];
+      for (var i = 0; i < list.length && i < 80; i++) {
+        var pic = list[i] || {};
+        var best = '';
+        var infos = pic.infoList || [];
+        for (var j = 0; j < infos.length; j++) {
+          if (infos[j] && infos[j].imageScene === 'WB_DFT' && infos[j].url) { best = infos[j].url; break; }
+        }
+        if (!best && infos.length && infos[0].url) best = infos[0].url;
+        if (!best) best = pic.urlDefault || pic.urlPre || '';
+        if (best) pics.push(best);
+      }
+      var videos = [];
+      var streams = (((note.video || {}).media || {}).stream) || {};
+      var codecs = ['h264', 'h265', 'av1'];
+      for (var c = 0; c < codecs.length && !videos.length; c++) {
+        var arr = streams[codecs[c]] || [];
+        for (var k = 0; k < arr.length; k++) {
+          var it = arr[k] || {};
+          var meta = it.videoMeta || {};
+          if (it.masterUrl) videos.push({ url: it.masterUrl, height: meta.height || 0, duration: meta.duration || 0 });
+        }
+      }
+      var u = note.user || {};
+      report({
+        ready: true, kind: 'note', pageUrl: location.href,
+        noteId: note.noteId || ids[0],
+        title: note.title || '',
+        desc: String(note.desc || '').slice(0, 20000),
+        time: note.time || 0,
+        userId: u.userId || '', nickname: u.nickname || '', avatar: u.image || '',
+        images: pics, videos: videos
+      });
+      return;
+    }
+    var pu = st.user || {};
+    var page = pu.userPageData;
+    if (page && typeof page === 'object' && !Array.isArray(page)) {
+      var cards = [];
+      var notes = pu.notes || [];
+      for (var n = 0; n < notes.length && n < 300; n++) {
+        var card = notes[n] || {};
+        var nc = card.noteCard || {};
+        cards.push({
+          id: card.id || '', token: card.xsecToken || '',
+          title: nc.displayTitle || '', type: nc.type || '',
+          time: card.time || nc.time || 0
+        });
+      }
+      report({
+        ready: true, kind: 'user', pageUrl: location.href,
+        uid: page.id || page.userId || '', nickname: page.nickname || '',
+        avatar: page.headImage || page.image || '',
+        desc: String(page.desc || '').slice(0, 3000),
+        notesCount: page.notes || 0,
+        notes: cards
+      });
+      return;
+    }
+    report({ ready: false, pageUrl: location.href });
+  } catch (e) {
+    report({ error: String(e), pageUrl: location.href });
+  }
+})();"#;
 
-    // 从 webview 引擎层按域取 Cookie（HttpOnly 也能拿到）。
-    let Some(window) = app.get_webview_window("web-login") else {
-        return Err("登录窗口已关闭，请重新打开网页登录".into());
+/// 在当前页面注入提取脚本并把片段读回来。
+async fn extract_from_page(window: &tauri::WebviewWindow) -> Option<serde_json::Value> {
+    let _ = window.eval(EXTRACT_JS);
+    for _ in 0..6 {
+        tokio::time::sleep(Duration::from_millis(160)).await;
+        let Ok(url) = window.url() else { continue };
+        let text = url.to_string();
+        let Some(idx) = text.find("xhsdownid=") else { continue };
+        let rest = &text[idx + "xhsdownid=".len()..];
+        let Some(tilde) = rest.find('~') else { continue };
+        let payload = rest[tilde + 1..].split('&').next().unwrap_or("");
+        let decoded = percent_decode(payload);
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&decoded) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+/// 用浏览器会话打开一个页面并取回数据。
+/// 串行执行：取数窗口只有一个，并发导航会互相打断。
+async fn webview_fetch(app: &tauri::AppHandle, url: &str) -> Result<serde_json::Value, String> {
+    let state = app.state::<AppState>();
+    let settings = state.settings_snapshot();
+    let _guard = state.fetch_lock.lock().await;
+
+    let window = ensure_fetch_window(app, &settings).await?;
+    let parsed: tauri::Url = url.parse().map_err(|e| format!("地址无效：{e}"))?;
+    window.navigate(parsed).map_err(err)?;
+
+    let started = std::time::Instant::now();
+    let mut last_page = String::new();
+    while started.elapsed() < Duration::from_secs(30) {
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let Some(value) = extract_from_page(&window).await else { continue };
+        if let Some(page) = value.get("pageUrl").and_then(|v| v.as_str()) {
+            last_page = page.to_string();
+        }
+        if value.get("ready").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return Ok(value);
+        }
+        if let Some(e) = value.get("error").and_then(|v| v.as_str()) {
+            xhs_core::login::debug_log(&format!("取数脚本异常：{e}"));
+        }
+        // 明确的"要登录 / 不可见"页面：不用再等
+        if last_page.contains("/login") || last_page.contains("/404") {
+            return Err(
+                "需要登录：小红书要求登录后才能浏览该内容（或内容已删除、仅自己可见）".into(),
+            );
+        }
+    }
+    Err(format!(
+        "页面读取超时（最后停在 {}）——可能是网络慢或被风控",
+        if last_page.is_empty() { "未知页面" } else { &last_page }
+    ))
+}
+
+/// 让浏览器去读「我的主页」：拿到真实资料才算已登录。
+/// 这是登录判定的唯一权威依据——页面里的 loggedIn 字段对匿名访客也为 true（实测踩过）。
+async fn browser_login_check(
+    app: &tauri::AppHandle,
+) -> Result<Option<(String, String, String)>, String> {
+    let value = match webview_fetch(app, "https://www.xiaohongshu.com/user/profile/me").await {
+        Ok(value) => value,
+        Err(e) => {
+            // "需要登录"是正常状态（就是没登录），不该当错误抛给界面
+            xhs_core::login::debug_log(&format!("登录检测：{e}"));
+            return Ok(None);
+        }
     };
+    if value.get("kind").and_then(|v| v.as_str()) != Some("user") {
+        return Ok(None);
+    }
+    let uid = value.get("uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let name = value.get("nickname").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let avatar = value.get("avatar").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    if uid.is_empty() && name.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some((uid, name, avatar)))
+}
+
+/// 笔记数据（reqwest 快路径与浏览器取数共用的中间结构）
+#[derive(Debug, Clone, Default)]
+struct NoteBundle {
+    note_id: String,
+    title: String,
+    desc: String,
+    created_at: i64,
+    user_id: String,
+    nickname: String,
+    pics: Vec<String>,
+    videos: Vec<(String, String)>,
+    duration: i64,
+}
+
+impl NoteBundle {
+    fn from_core(note: xhs_core::api::NoteData) -> Self {
+        Self {
+            note_id: note.note_id,
+            title: note.title,
+            desc: note.desc,
+            created_at: note.created_at,
+            user_id: note.user_id,
+            nickname: note.nickname,
+            pics: note.pics,
+            videos: note.videos,
+            duration: note.duration,
+        }
+    }
+
+    fn from_web(value: &serde_json::Value) -> Result<Self, String> {
+        let note_id = value
+            .get("noteId")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if note_id.is_empty() {
+            return Err("页面里没有笔记数据（可能已被删除或仅自己可见）".into());
+        }
+        let mut pics = Vec::new();
+        if let Some(arr) = value.get("images").and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(url) = item.as_str() {
+                    if !url.is_empty() {
+                        pics.push(https(url));
+                    }
+                }
+            }
+        }
+        let mut videos: Vec<(String, String)> = Vec::new();
+        if let Some(arr) = value.get("videos").and_then(|v| v.as_array()) {
+            for item in arr {
+                let Some(url) = item
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .filter(|u| !u.is_empty())
+                else {
+                    continue;
+                };
+                let height = item.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+                videos.push((height_label(height), https(url)));
+            }
+        }
+        videos.sort_by(|a, b| height_rank(&b.0).cmp(&height_rank(&a.0)));
+        videos.dedup_by(|a, b| a.1 == b.1);
+        let duration = value
+            .get("videos")
+            .and_then(|v| v.as_array())
+            .and_then(|arr| arr.first())
+            .and_then(|item| item.get("duration"))
+            .and_then(|v| v.as_f64())
+            .map(|ms| (ms / 1000.0) as i64)
+            .unwrap_or(0);
+        Ok(Self {
+            note_id,
+            title: value.get("title").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            desc: value.get("desc").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            created_at: value
+                .get("time")
+                .and_then(|v| v.as_i64())
+                .map(|ms| ms / 1000)
+                .unwrap_or(0),
+            user_id: value.get("userId").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            nickname: value.get("nickname").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            pics,
+            videos,
+            duration,
+        })
+    }
+}
+
+/// 主页卡片
+#[derive(Debug, Clone, Default)]
+struct CardBundle {
+    id: String,
+    token: String,
+    title: String,
+    is_video: bool,
+    created_at: i64,
+}
+
+/// 用户主页数据
+#[derive(Debug, Clone, Default)]
+struct UserBundle {
+    uid: String,
+    nickname: String,
+    avatar: String,
+    notes_count: u32,
+    cards: Vec<CardBundle>,
+}
+
+impl UserBundle {
+    fn from_web(value: &serde_json::Value) -> Result<Self, String> {
+        let uid = value.get("uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        if uid.is_empty() {
+            return Err("页面里没有主页数据（可能已被注销或需要登录）".into());
+        }
+        let mut cards = Vec::new();
+        if let Some(arr) = value.get("notes").and_then(|v| v.as_array()) {
+            for item in arr {
+                let id = item.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                cards.push(CardBundle {
+                    id,
+                    token: item.get("token").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                    title: item.get("title").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                    is_video: item.get("type").and_then(|v| v.as_str()) == Some("video"),
+                    created_at: item
+                        .get("time")
+                        .and_then(|v| v.as_i64())
+                        .map(|ms| ms / 1000)
+                        .unwrap_or(0),
+                });
+            }
+        }
+        Ok(Self {
+            uid,
+            nickname: value.get("nickname").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            avatar: value.get("avatar").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+            notes_count: value.get("notesCount").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            cards,
+        })
+    }
+}
+
+/// 取一条笔记：先试 reqwest（Cookie 可用时更快），失败就借浏览器会话（可靠）。
+async fn fetch_note(
+    app: &tauri::AppHandle,
+    client: &XhsClient,
+    url: &str,
+    retries: usize,
+) -> Result<NoteBundle, String> {
+    if let Ok(note) = retry(retries, || client.note_detail(url)).await {
+        return Ok(NoteBundle::from_core(note));
+    }
+    xhs_core::login::debug_log("笔记：reqwest 路径失败，改用浏览器会话取数");
+    let value = webview_fetch(app, url).await?;
+    NoteBundle::from_web(&value)
+}
+
+/// 取一个用户主页：同样的两段式。
+async fn fetch_user(
+    app: &tauri::AppHandle,
+    client: &XhsClient,
+    uid: &str,
+) -> Result<UserBundle, String> {
+    if let Ok((info, notes)) = retry(1, || client.user_profile(uid)).await {
+        let cards: Vec<CardBundle> = notes
+            .iter()
+            .map(|n| CardBundle {
+                id: n.note_id.clone(),
+                token: n.xsec_token.clone(),
+                title: n.title.clone(),
+                is_video: n.has_video(),
+                created_at: n.created_at,
+            })
+            .collect();
+        return Ok(UserBundle {
+            uid: info.uid,
+            nickname: info.nickname,
+            avatar: info.avatar,
+            notes_count: info.notes_count,
+            cards,
+        });
+    }
+    xhs_core::login::debug_log("主页：reqwest 路径失败，改用浏览器会话取数");
+    let url = format!("https://www.xiaohongshu.com/user/profile/{uid}");
+    let value = webview_fetch(app, &url).await?;
+    UserBundle::from_web(&value)
+}
+
+fn https(url: &str) -> String {
+    if let Some(rest) = url.strip_prefix("http://") {
+        format!("https://{rest}")
+    } else if let Some(rest) = url.strip_prefix("//") {
+        format!("https://{rest}")
+    } else {
+        url.to_string()
+    }
+}
+
+/// 视频高度 → 档位标签
+fn height_label(height: u64) -> String {
+    if height >= 1080 {
+        "1080P".into()
+    } else if height >= 720 {
+        "720P".into()
+    } else if height >= 540 {
+        "540P".into()
+    } else if height >= 480 {
+        "480P".into()
+    } else if height > 0 {
+        format!("{height}P")
+    } else {
+        "视频".into()
+    }
+}
+
+/// 档位标签 → 数值高度（排序用）
+fn height_rank(label: &str) -> u64 {
+    label.trim_end_matches('P').trim().parse().unwrap_or(0)
+}
+
+/// 百分号解码（只处理 %XX，其余原样保留）。
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if let Some(hex) = input.get(i + 1..i + 3) {
+                if let Ok(byte) = u8::from_str_radix(hex, 16) {
+                    out.push(byte);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+/// 从登录小窗收割 Cookie（HttpOnly 也能拿到）。
+/// 只是备份一份给 reqwest 快路径用——登录态本身靠浏览器数据目录共享。
+fn harvest_webview_cookies(window: &tauri::WebviewWindow) -> Vec<(String, String)> {
     let mut cookies: Vec<(String, String)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for origin in xhs_core::client::COOKIE_ORIGINS {
@@ -997,51 +1376,95 @@ pub async fn web_login_cookies(app: tauri::AppHandle, state: State<'_, AppState>
                 continue;
             }
         };
-        let names: Vec<String> = list.iter().map(|c| c.name().to_string()).collect();
-        xhs_core::login::debug_log(&format!("webview {origin} → {names:?}"));
         for c in list {
             let pair = (c.name().to_string(), c.value().to_string());
-            if seen.insert(format!("{origin}{}", pair.0)) {
+            if seen.insert(pair.0.clone()) {
                 cookies.push(pair);
             }
         }
     }
+    xhs_core::login::debug_log(&format!("浏览器 Cookie 备份：{} 个", cookies.len()));
+    cookies
+}
 
-    // 全新会话：避免旧访客 Cookie 与登录 Cookie 混杂
-    let session = XhsClient::with_proxy(Some(&settings.proxy)).map_err(err)?;
-    session.install_cookies(&cookies);
-
-    let has_session = session.has_session();
-    if !has_session {
-        xhs_core::login::debug_log("web_login_cookies：未发现 web_session");
-        return Err("还没有检测到登录 Cookie（web_session）——请确认已在小窗里完成登录，再点一次「完成绑定」".into());
-    }
-    xhs_core::login::debug_log(&format!(
-        "web_login_cookies：{} 个 Cookie（含 web_session），开始校验",
-        cookies.len()
-    ));
-    match session.account().await {
-        Ok(Some((uid, uname, face))) => {
-            // 校验通过才换上新会话并落盘，然后关掉登录小窗
-            let login = build_login(&session, uid, uname, face).await;
-            *state.client.write().unwrap() = Arc::new(session);
+/// 登录成功后收尾：备份 Cookie、内嵌头像、写登录态、关登录小窗。
+async fn finish_login(
+    app: &tauri::AppHandle,
+    state: &State<'_, AppState>,
+    uid: String,
+    name: String,
+    avatar: String,
+) -> Result<LoginInfo, String> {
+    let settings = state.settings_snapshot();
+    if let Some(window) = app.get_webview_window("web-login") {
+        let cookies = harvest_webview_cookies(&window);
+        if !cookies.is_empty() {
+            let client = XhsClient::with_proxy(Some(&settings.proxy)).map_err(err)?;
+            client.install_cookies(&cookies);
+            *state.client.write().unwrap() = Arc::new(client);
             state.save_cookies();
-            xhs_core::login::debug_log("web_login_cookies：校验通过，已落盘");
-            *state.login.write().unwrap() = Some(login.clone());
-            if let Some(window) = app.get_webview_window("web-login") {
-                let _ = window.close();
-            }
-            Ok(login)
-        }
-        Ok(None) => {
-            xhs_core::login::debug_log("web_login_cookies：account() 判未登录（Cookie 无效）");
-            Err("登录态校验未通过（主页判未登录），稍后再试".into())
-        }
-        Err(e) => {
-            xhs_core::login::debug_log(&format!("web_login_cookies：account() 错误 {e}"));
-            Err(format!("登录态校验失败：{e}"))
         }
     }
+    let client = state.client();
+    let face = inline_avatar(&client, &avatar).await;
+    let login = LoginInfo {
+        logged_in: true,
+        uname: name,
+        face,
+        mid: uid,
+        ..Default::default()
+    };
+    *state.login.write().unwrap() = Some(login.clone());
+    xhs_core::login::debug_log(&format!(
+        "登录完成：昵称={:?} uid={:?}",
+        login.uname, login.mid
+    ));
+    if let Some(window) = app.get_webview_window("web-login") {
+        let _ = window.close();
+    }
+    Ok(login)
+}
+
+#[tauri::command]
+pub async fn web_login_open(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    use tauri::{WebviewUrl, WebviewWindowBuilder};
+    if let Some(window) = app.get_webview_window("web-login") {
+        let _ = window.set_focus();
+        return Ok(());
+    }
+    // 与取数窗口共用浏览器数据目录：登录态因此能被取数窗口复用，
+    // 也能跨应用重启保留（退出登录时会整体清除）。
+    let settings = state.settings_snapshot();
+    let data_dir = crate::state::webview_dir(&settings);
+    std::fs::create_dir_all(&data_dir).map_err(err)?;
+    // 直接落在官方登录页：页面内提供 手机号验证码 / 账号密码 / 扫码 三种方式
+    WebviewWindowBuilder::new(
+        &app,
+        "web-login",
+        WebviewUrl::External("https://www.xiaohongshu.com/login".parse().unwrap()),
+    )
+    .title("小红书登录")
+    .inner_size(520.0, 720.0)
+    .min_inner_size(420.0, 560.0)
+    .resizable(true)
+    .center()
+    .data_directory(data_dir)
+    .build()
+    .map_err(err)?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn web_login_cookies(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<LoginInfo, String> {
+    // 让浏览器自己读「我的主页」：拿到真实资料才算登录。
+    // （页面状态里的 loggedIn 字段对匿名访客也是 true，不能用来判定——实测踩过）
+    let Some((uid, name, avatar)) = browser_login_check(&app).await? else {
+        return Err(
+            "还没有检测到登录状态——请在小窗里完成登录（手机号验证码 / 账号密码 / 扫码都可以）"
+                .into(),
+        );
+    };
+    finish_login(&app, &state, uid, name, avatar).await
 }
 
 #[tauri::command]
@@ -1054,17 +1477,26 @@ pub async fn web_login_close(app: tauri::AppHandle) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn logout(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<LoginInfo, String> {
-    // 只在确有登录态时才清 Cookie 文件：误触发会把网页登录的成果毁掉
-    let was_logged_in = state.login.read().unwrap().is_some();
     let settings = state.settings_snapshot();
-    if was_logged_in {
-        let _ = std::fs::remove_file(settings.cookies_path());
-        xhs_core::login::debug_log("logout：已清除登录态");
+    // 关掉登录窗与取数窗：浏览器数据目录被占用时删不掉
+    for label in ["web-login", "xhs-fetch"] {
+        if let Some(window) = app.get_webview_window(label) {
+            let _ = window.close();
+        }
     }
-    // 关掉登录小窗（async 命令里窗口操作可靠；同步命令里会静默失效——实测踩过）。
-    if let Some(window) = app.get_webview_window("web-login") {
-        let _ = window.close();
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    // 清掉浏览器数据目录（登录态真正所在），删不掉就留标记下次启动再删——
+    // 不这样做会出现"点了退出登录，重启又自动登录回去"
+    let dir = crate::state::webview_dir(&settings);
+    if dir.exists() && std::fs::remove_dir_all(&dir).is_err() {
+        let _ = std::fs::create_dir_all(settings.data_root());
+        let _ = std::fs::write(crate::state::webview_logout_marker(&settings), b"1");
+        xhs_core::login::debug_log("logout：浏览器目录被占用，已留标记下次启动清理");
     }
+    let _ = std::fs::remove_file(settings.cookies_path());
+    xhs_core::login::debug_log("logout：已清除登录态");
+
     let client = XhsClient::with_proxy(Some(&settings.proxy)).map_err(err)?;
     *state.client.write().unwrap() = Arc::new(client);
     *state.login.write().unwrap() = None;
@@ -1074,43 +1506,42 @@ pub async fn logout(app: tauri::AppHandle, state: State<'_, AppState>) -> Result
 // ───────────────────────── 内容库（我的笔记） ─────────────────────────
 
 #[tauri::command]
-pub async fn library_folders(state: State<'_, AppState>) -> Result<LibraryFolders, String> {
-    warmup_once(&state).await;
+pub async fn library_folders(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<LibraryFolders, String> {
     let client = state.client();
-
     let login = state.login.read().unwrap().clone().unwrap_or_default();
     let uid = if !login.mid.is_empty() {
-        login.mid
+        login.mid.clone()
     } else {
-        client
-            .account()
-            .await
-            .map_err(err)?
+        browser_login_check(&app)
+            .await?
             .map(|(uid, _, _)| uid)
             .ok_or_else(|| "读取我的笔记需要先登录".to_string())?
     };
 
-    let (info, notes) = client.user_profile(&uid).await.map_err(err)?;
-    let created: Vec<FavItem> = notes
+    let user = fetch_user(&app, &client, &uid).await?;
+    let created: Vec<FavItem> = user
+        .cards
         .iter()
         .enumerate()
-        .map(|(index, note)| FavItem {
+        .map(|(index, card)| FavItem {
             id: index as u64 + 1,
-            bid: note.note_id.clone(),
-            title: naming::title_of(&note.title),
-            created_at: note.created_at,
+            bid: card.id.clone(),
+            title: naming::title_of(&card.title),
+            created_at: card.created_at,
             pics: 0,
-            video: note.has_video(),
-            url: note_page_url(&note.note_id, &note.xsec_token),
+            video: card.is_video,
+            url: note_page_url(&card.id, &card.token),
             kind: "fav".into(),
         })
         .collect();
     let fav_note = if created.is_empty() {
-        "这个账号还没有发布笔记，或笔记仅自己可见".to_string()
+        "这个账号还没有公开笔记，或笔记仅自己可见".to_string()
     } else {
         format!("网页端仅能读取主页最新 {} 条笔记", created.len())
     };
-    let _ = info;
 
     Ok(LibraryFolders {
         mid: uid,
