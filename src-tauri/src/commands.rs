@@ -2476,27 +2476,40 @@ pub async fn web_login_open(app: tauri::AppHandle, state: State<'_, AppState>) -
 /// 而注入只影响页面本身，不引入第二个浏览器环境（多环境会丢登录态，实测踩过）。
 /// 幂等：重复注入只在页面里补一条，不会叠出多条。
 const PAGE_BAR_JS: &str = r#"(function () {
-  var hidden = function () {
-    try { return sessionStorage.getItem('xhsdownBarHidden') === '1'; } catch (e) { return false; }
-  };
-  if (hidden()) return;
   var Z = '2147483000';
-  var open = false;
-  var hideTimer = null;
+  // 展开状态钉在会话里：换页/刷新后仍保持展开（用户手动点过展开就不要再自己收回去）
+  var pinned = function () {
+    try { return sessionStorage.getItem('xhsdownBarPinned') === '1'; } catch (e) { return false; }
+  };
+  var setPinned = function (on) {
+    try { sessionStorage.setItem('xhsdownBarPinned', on ? '1' : '0'); } catch (e) {}
+  };
+  var open = pinned();
+
+  var apply = function (bar) {
+    bar.style.transform = open ? 'translateY(0)' : 'translateY(-102%)';
+  };
+
+  var setOpen = function (next) {
+    open = next;
+    setPinned(next);
+    var bar = document.getElementById('xhsdown-bar');
+    if (bar) apply(bar);
+  };
 
   var ensure = function () {
     var handle = document.getElementById('xhsdown-handle');
     var bar = document.getElementById('xhsdown-bar');
-    // 小把手：不遮挡内容（左下角 20px 半透明方块），点它/悬停展开整条地址栏
+    // 小把手：不遮挡内容（左下角 20px 半透明方块）；鼠标碰到/点它就展开并**钉住**
     if (!handle) {
       handle = document.createElement('div');
       handle.id = 'xhsdown-handle';
       handle.textContent = '⌃';
-      handle.title = '地址栏（点击展开）';
+      handle.title = '地址栏（移上去展开，展开后不会自动收起）';
       handle.style.cssText = 'position:fixed;left:8px;bottom:10px;width:20px;height:20px;z-index:' + Z + ';display:flex;align-items:center;justify-content:center;background:#ff2442;color:#fff;border-radius:6px;font:11px/1 sans-serif;cursor:pointer;opacity:.4;transition:opacity .15s;box-shadow:0 2px 8px rgba(0,0,0,.28);';
       handle.onmouseenter = function () {
         handle.style.opacity = '1';
-        setOpen(true); // 鼠标碰到把手就展开（像全屏浏览器的地址栏）
+        setOpen(true); // 展开后保持，不再因鼠标移开而收回
       };
       handle.onmouseleave = function () { handle.style.opacity = '.4'; };
       handle.onclick = function () { setOpen(true); };
@@ -2505,7 +2518,7 @@ const PAGE_BAR_JS: &str = r#"(function () {
     if (!bar) {
       bar = document.createElement('div');
       bar.id = 'xhsdown-bar';
-      bar.style.cssText = 'position:fixed;left:0;right:0;top:0;height:34px;z-index:' + Z + ';display:flex;align-items:center;gap:6px;padding:0 10px;background:#17181a;color:#e8e9ea;border-bottom:1px solid #282a2d;font:12px/1 "Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;box-sizing:border-box;transform:translateY(-102%);transition:transform .16s ease;';
+      bar.style.cssText = 'position:fixed;left:0;right:0;top:0;height:34px;z-index:' + Z + ';display:flex;align-items:center;gap:6px;padding:0 10px;background:#17181a;color:#e8e9ea;border-bottom:1px solid #282a2d;font:12px/1 "Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;box-sizing:border-box;transition:transform .16s ease;';
       var btn = function (label, title, fn) {
         var b = document.createElement('button');
         b.textContent = label;
@@ -2542,48 +2555,25 @@ const PAGE_BAR_JS: &str = r#"(function () {
         var url = location.href.split('#')[0];
         location.replace('#xhsdownparse=' + encodeURIComponent(url));
       });
-      btn('收起', '收起地址栏（本次会话不再展开）', function () {
-        var el = document.getElementById('xhsdown-bar');
-        if (el) el.remove();
-        var h = document.getElementById('xhsdown-handle');
-        if (h) h.remove();
-        try { sessionStorage.setItem('xhsdownBarHidden', '1'); } catch (e) {}
-      });
-      bar.onmouseenter = function () { if (hideTimer) clearTimeout(hideTimer); };
-      bar.onmouseleave = function () { setOpen(false); };
+      btn('收起', '收起地址栏（收回到左下角小方块）', function () { setOpen(false); });
       (document.body || document.documentElement).appendChild(bar);
     }
-    bar.style.transform = open ? 'translateY(0)' : 'translateY(-102%)';
+    apply(bar);
     return { bar: bar, handle: handle };
   };
 
-  var setOpen = function (next) {
-    open = next;
-    var pair = ensure();
-    pair.bar.style.transform = open ? 'translateY(0)' : 'translateY(-102%)';
-    if (open) {
-      // 展开后没人用就自动收起，别一直挡着页面
-      if (hideTimer) clearTimeout(hideTimer);
-      hideTimer = setTimeout(function () {
-        var input = document.getElementById('xhsdown-url');
-        if (!input || document.activeElement !== input) setOpen(false);
-      }, 6000);
-    }
-  };
-
-  ensure();
-  // SPA 换页/页面重渲染后补回并同步地址显示
+  // 换页/页面重渲染后补回，并同步地址显示（展开状态由 sessionStorage 钉住）
   setInterval(function () {
     try {
-      if (hidden()) return;
-      var pair = ensure();
+      ensure();
       var input = document.getElementById('xhsdown-url');
-      var handle = pair.handle;
-      var bar = pair.bar;
-      if (input && document.activeElement !== input) input.value = location.href.split('#')[0];
-      bar.onmouseenter = function () { if (hideTimer) clearTimeout(hideTimer); };
+      if (input && document.activeElement !== input) {
+        input.value = location.href.split('#')[0];
+      }
     } catch (e) {}
   }, 800);
+
+  ensure();
 })();"#;
 
 /// 网页显示期间：定期注入地址栏，并接收页面里「解析」按钮送来的地址
