@@ -2477,11 +2477,19 @@ pub async fn web_login_open(app: tauri::AppHandle, state: State<'_, AppState>) -
 /// 幂等：重复注入只在页面里补一条，不会叠出多条。
 const PAGE_BAR_JS: &str = r#"(function () {
   var Z = '2147483000';
-  // 展开状态钉在会话里：换页/刷新后仍保持展开（用户手动点过展开就不要再自己收回去）
+  // 展开状态钉在**页面元素自己身上**（DOM 属性），而不是 sessionStorage——
+  // 小红书页面可能限制会话存储，那样后端每次重新注入都会读成"未展开"，
+  // 把已经展开的条子又收回去，看起来就是反复上下跳（实测踩过）
   var pinned = function () {
+    var el = document.getElementById('xhsdown-bar') || document.getElementById('xhsdown-handle');
+    if (el && el.dataset && el.dataset.pinned === '1') return true;
     try { return sessionStorage.getItem('xhsdownBarPinned') === '1'; } catch (e) { return false; }
   };
   var setPinned = function (on) {
+    var bar = document.getElementById('xhsdown-bar');
+    var handle = document.getElementById('xhsdown-handle');
+    if (bar && bar.dataset) bar.dataset.pinned = on ? '1' : '0';
+    if (handle && handle.dataset) handle.dataset.pinned = on ? '1' : '0';
     try { sessionStorage.setItem('xhsdownBarPinned', on ? '1' : '0'); } catch (e) {}
   };
   var open = pinned();
@@ -2492,9 +2500,14 @@ const PAGE_BAR_JS: &str = r#"(function () {
 
   var setOpen = function (next) {
     open = next;
-    setPinned(next);
     var bar = document.getElementById('xhsdown-bar');
-    if (bar) apply(bar);
+    if (!bar) {
+      // 元素还没建出来：先按目标状态建好元素，再写钉住标记
+      var pair = ensure();
+      bar = pair.bar;
+    }
+    setPinned(next);
+    apply(bar);
   };
 
   var ensure = function () {
@@ -2579,6 +2592,8 @@ const PAGE_BAR_JS: &str = r#"(function () {
 /// 网页显示期间：定期注入地址栏，并接收页面里「解析」按钮送来的地址
 fn spawn_page_bar(app: tauri::AppHandle) {
     tokio::spawn(async move {
+        let mut last_url = String::new();
+        let mut last_inject = std::time::Instant::now() - Duration::from_secs(600);
         loop {
             tokio::time::sleep(Duration::from_millis(1200)).await;
             let Some(window) = app.get_webview_window("xhs-work") else {
@@ -2587,7 +2602,16 @@ fn spawn_page_bar(app: tauri::AppHandle) {
             if !window.is_visible().unwrap_or(false) {
                 break;
             }
-            let _ = window.eval(PAGE_BAR_JS);
+            // 只在换页后重新注入（页面内的定时器会自己维持），避免反复注入打扰页面
+            let url = window
+                .url()
+                .map(|u| u.to_string().split('#').next().unwrap_or("").to_string())
+                .unwrap_or_default();
+            if url != last_url || last_inject.elapsed() > Duration::from_secs(5) {
+                last_url = url;
+                last_inject = std::time::Instant::now();
+                let _ = window.eval(PAGE_BAR_JS);
+            }
             // 页面里点了「解析」：地址被写进 #xhsdownparse=…，这里读出来送过去
             if let Ok(url) = window.url() {
                 let text = url.to_string();
