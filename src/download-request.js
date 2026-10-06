@@ -9,6 +9,7 @@ export const KIND_LABELS = {
   post: "单条笔记",
   user: "用户主页",
   feed: "推荐流",
+  search: "搜索结果",
 };
 
 export function localDate(unixSecs) {

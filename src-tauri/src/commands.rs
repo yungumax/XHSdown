@@ -314,6 +314,44 @@ pub async fn probe_source(
             }
             Ok(probe)
         }
+        SourceTarget::Search { url } => {
+            // 搜索结果页：解析结果里那一屏笔记卡片（与推荐流同构）
+            let value = webview_fetch(&app, &url).await?;
+            let cards = UserBundle::cards_from_web(&value);
+            if cards.is_empty() {
+                return Err(
+                    "搜索结果页没有解析到笔记卡片（可能关键词无结果、被风控或页面还没加载完）——请稍后重试"
+                        .into(),
+                );
+            }
+            let entries: Vec<PostEntry> = cards.iter().map(|card| card.entry("")).collect();
+            let count = entries.len();
+            let probe = Probe {
+                kind: "search".into(),
+                bid: String::new(),
+                mid: String::new(),
+                title: "搜索结果".into(),
+                author: String::new(),
+                uid: String::new(),
+                cover: String::new(),
+                note: format!(
+                    "搜索结果这一屏共 {count} 条。结果是持续加载的，程序只能读到当前这一屏；更精准的话可直接粘单条笔记链接"
+                ),
+                total: count,
+                loaded: count,
+                exhausted: true,
+                qualities: quality_options(&[]),
+                items: entries,
+            };
+            xhs_core::login::debug_log(&format!("probe search：本屏 {count} 条"));
+            let cache = BatchCache {
+                uid: String::new(),
+                items: probe.items.clone(),
+                exhausted: true,
+            };
+            state.cache_batch("search:last".to_string(), cache);
+            Ok(probe)
+        }
         SourceTarget::Feed => {
             // 推荐流首页：解析页面里这一屏笔记卡片（都带 token，可直接下载）
             let value = webview_fetch(&app, "https://www.xiaohongshu.com/explore").await?;
@@ -413,6 +451,7 @@ fn input_key(target: SourceTarget) -> String {
         SourceTarget::Note { id, .. } => format!("post:{id}"),
         SourceTarget::User { uid, .. } => format!("user:{uid}"),
         SourceTarget::Feed => "feed:explore".to_string(),
+        SourceTarget::Search { .. } => "search:last".to_string(),
     }
 }
 
@@ -1070,8 +1109,42 @@ const EXTRACT_JS: &str = r#"(function () {
     var isProfilePage = here.indexOf("/user/profile/") >= 0;
     // 裸 /explore（可带查询串）才算推荐流：带笔记 id 的走笔记分支
     var isFeedPage = !urlNote && /\/explore(\/|\?|$)/.test(here);
-    if (!isNotePage && !isProfilePage && !isFeedPage) {
+    // 搜索结果页（/search_result?keyword=…）；判定要放在"未就绪兜底"之前，
+    // 否则会被当成无关页面直接挡掉（实测踩过）
+    var isSearchPage = here.indexOf("/search_result") >= 0 || /\/search(\/|\?|$)/.test(here);
+    if (!isNotePage && !isProfilePage && !isFeedPage && !isSearchPage) {
       report({ ready: false, pageUrl: here });
+      return;
+    }
+
+    // ── 搜索结果页：这一屏结果卡片（与信息流同构，在 search.feeds 下）──
+    if (isSearchPage) {
+      var searchRoot = unwrap(st.search) || {};
+      var searchFeeds = arr(searchRoot.feeds);
+      var searchCards = [];
+      for (var si = 0; si < searchFeeds.length && si < 200; si++) {
+        var sc = unwrap(searchFeeds[si]) || {};
+        var snc = unwrap(sc.noteCard) || {};
+        var scu = unwrap(snc.user) || {};
+        var sid = sc.id || '';
+        if (!sid) continue;
+        searchCards.push({
+          id: sid,
+          token: sc.xsecToken || '',
+          title: snc.displayTitle || '',
+          type: snc.type || '',
+          time: sc.time || snc.time || 0,
+          author: scu.nickname || scu.nickName || '',
+        });
+      }
+      report({
+        ready: searchCards.length > 0,
+        kind: 'search',
+        pageUrl: here,
+        uid: '', nickname: '搜索结果', avatar: '', desc: '',
+        notesCount: searchCards.length,
+        notes: searchCards,
+      });
       return;
     }
 
@@ -2063,6 +2136,29 @@ const PAGE_SNAPSHOT_JS: &str = r#"(function () {
   try {
     var out = { url: location.href.split('#')[0], title: document.title };
     var st = window.__INITIAL_STATE__ || {};
+    // 勘察：把可能装着"笔记卡片数组"的字段找出来（搜索页/信息流结构未知时用）
+    var survey = {};
+    var probe = function (label, obj) {
+      var o = unwrap(obj);
+      if (!o || typeof o !== 'object') {
+        survey[label] = '[' + Object.prototype.toString.call(o).slice(8, -1) + ']';
+        return;
+      }
+      var keys = Object.keys(o).slice(0, 18);
+      var info = {};
+      for (var i = 0; i < keys.length; i++) {
+        var v = unwrap(o[keys[i]]);
+        if (Array.isArray(v)) info[keys[i]] = '数组' + v.length;
+        else if (v && typeof v === 'object') info[keys[i]] = '对象';
+        else info[keys[i]] = String(v).slice(0, 20);
+      }
+      survey[label] = info;
+    };
+    probe('search', st.search);
+    probe('feed', st.feed);
+    probe('note', st.note);
+    probe('global', st.global);
+    out.survey = survey;
     var pu = unwrap(st.user) || {};
     out.userFields = fields(pu, 18);
     out.notesLen = ((unwrap(pu.notes) || []).length);
@@ -2170,6 +2266,16 @@ async fn login_selftest(app: tauri::AppHandle, settings: Settings, probe_url: St
                         user.notes_count
                     )),
                     Err(e) => xhs_core::login::debug_log(&format!("自检·主页失败：{e}")),
+                }
+            }
+            Ok(SourceTarget::Search { url }) => {
+                xhs_core::login::debug_log(&format!("自检·搜索链接：{url}"));
+                match probe_source(app.clone(), app.state::<AppState>(), url).await {
+                    Ok(probe) => xhs_core::login::debug_log(&format!(
+                        "自检·搜索结果：{} 条",
+                        probe.items.len()
+                    )),
+                    Err(e) => xhs_core::login::debug_log(&format!("自检·搜索失败：{e}")),
                 }
             }
             Ok(SourceTarget::Feed) => {

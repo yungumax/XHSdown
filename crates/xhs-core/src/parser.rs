@@ -13,6 +13,9 @@ pub enum SourceTarget {
     /// 推荐流首页（https://www.xiaohongshu.com/explore，没有具体笔记 id）：
     /// 解析页面里那一屏笔记卡片，勾选后即可下载
     Feed,
+    /// 搜索结果页（https://www.xiaohongshu.com/search_result?keyword=…）：
+    /// 解析搜索结果里那一屏笔记卡片
+    Search { url: String },
     /// 单条笔记（id = 24 位十六进制；token = xsec_token，详情页多数情况必需）
     Note { id: String, token: Option<String>, url: String },
     /// 用户主页（uid = 24 位十六进制）
@@ -79,6 +82,15 @@ pub fn parse_input(input: &str) -> Result<SourceTarget> {
             }
         }
     }
+    // 搜索结果页：/search_result?keyword=…（保留完整地址，重新按同一关键词搜）
+    if segments.iter().any(|s| *s == "search_result" || *s == "search") {
+        if is_xhs {
+            return Ok(SourceTarget::Search {
+                url: candidate.to_string(),
+            });
+        }
+    }
+
     // /explore/{id}
     if let Some(i) = segments.iter().position(|s| *s == "explore") {
         match segments.get(i + 1) {
@@ -189,6 +201,18 @@ mod tests {
                 assert!(url.contains("xsec_token="));
             }
             other => panic!("应为 User，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn search_result_is_search() {
+        match parse_input(
+            "https://www.xiaohongshu.com/search_result?keyword=%25E6%2597%25A0&source=web_explore_feed",
+        )
+        .unwrap()
+        {
+            SourceTarget::Search { url } => assert!(url.contains("keyword=")),
+            other => panic!("应为 Search，实际 {other:?}"),
         }
     }
 
