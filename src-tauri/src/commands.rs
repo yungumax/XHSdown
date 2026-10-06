@@ -97,6 +97,16 @@ pub async fn app_status(
         Err(_) => xhs_core::login::debug_log("启动恢复登录：检测超时"),
     }
 
+    // 自检开关：数据目录里放一个 login_selftest 文件 → 启动后自动探一次登录页
+    // （验证 WebView2 里的二维码状态与保活脚本；平时不跑）
+    let selftest_marker = settings.data_root().join("login_selftest");
+    if selftest_marker.exists() {
+        let _ = std::fs::remove_file(&selftest_marker);
+        let app2 = app.clone();
+        let settings2 = settings.clone();
+        tokio::spawn(async move { login_selftest(app2, settings2).await });
+    }
+
     Ok(AppStatus {
         version: APP_VERSION.to_string(),
         login,
@@ -1341,6 +1351,68 @@ fn height_rank(label: &str) -> u64 {
     label.trim_end_matches('P').trim().parse().unwrap_or(0)
 }
 
+/// 二维码保活脚本最近一次上报（用于"只在变化时打日志"）
+fn state_of_qr_log() -> &'static std::sync::Mutex<Option<String>> {
+    static LAST: std::sync::OnceLock<std::sync::Mutex<Option<String>>> = std::sync::OnceLock::new();
+    LAST.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// 登录页自检：隐藏窗口打开官方登录页，探测「二维码状态 + 保活脚本是否生效」并写日志。
+/// 由数据目录里的 login_selftest 标记文件触发（平时不跑），用于远程诊断。
+async fn login_selftest(app: tauri::AppHandle, settings: Settings) {
+    let dir = crate::state::webview_dir(&settings);
+    let _ = std::fs::create_dir_all(&dir);
+    let window = match tauri::WebviewWindowBuilder::new(
+        &app,
+        "xhs-logintest",
+        tauri::WebviewUrl::External("https://www.xiaohongshu.com/login".parse().unwrap()),
+    )
+    .title("登录页自检")
+    .inner_size(520.0, 720.0)
+    .visible(false)
+    .data_directory(dir)
+    .build()
+    {
+        Ok(window) => window,
+        Err(e) => {
+            xhs_core::login::debug_log(&format!("自检：窗口创建失败 {e}"));
+            return;
+        }
+    };
+
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    let _ = window.eval(LOGIN_SELFTEST_JS);
+    xhs_core::login::debug_log(&format!(
+        "自检·注入前：{}",
+        read_selftest(&window).await.unwrap_or_else(|| "未取到".into())
+    ));
+
+    let _ = window.eval(QR_KEEPER_JS);
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let _ = window.eval(LOGIN_SELFTEST_JS);
+    xhs_core::login::debug_log(&format!(
+        "自检·注入后：{}",
+        read_selftest(&window).await.unwrap_or_else(|| "未取到".into())
+    ));
+
+    let _ = window.close();
+}
+
+/// 读取自检脚本写进 URL 片段的结果。
+async fn read_selftest(window: &tauri::WebviewWindow) -> Option<String> {
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if let Ok(url) = window.url() {
+            let text = url.to_string();
+            if let Some(idx) = text.find("xhsdownselftest=") {
+                let rest = &text[idx + "xhsdownselftest=".len()..];
+                return Some(percent_decode(rest.split('&').next().unwrap_or("")));
+            }
+        }
+    }
+    None
+}
+
 /// 百分号解码（只处理 %XX，其余原样保留）。
 fn percent_decode(input: &str) -> String {
     let bytes = input.as_bytes();
@@ -1362,17 +1434,29 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
-/// 二维码保活脚本：小红书登录页的二维码约一分钟就过期，
-/// 过期后页面上会出现「点击刷新」——这里替用户点掉，二维码自动续上。
-/// （脚本幂等：同一页面里重复注入只会生效一份。）
+/// 二维码保活脚本：小红书登录页的二维码过期后会出现「点击刷新」。
+/// 这里替用户点掉；点不动（8 秒仍是过期态）就直接重载登录页拿新码。
+/// 每轮把「点击次数,重载次数,是否过期」写进 URL 片段，Rust 侧读出来记日志。
 const QR_KEEPER_JS: &str = r#"(function () {
   if (window.__xhsdownQrKeeper) return;
   window.__xhsdownQrKeeper = true;
-  setInterval(function () {
+  window.__xhsdownQrClicks = 0;
+  window.__xhsdownQrReloads = 0;
+  window.__xhsdownQrLastClick = 0;
+  var report = function (expired) {
     try {
+      location.replace(
+        '#xhsdownqr=' + window.__xhsdownQrClicks + ',' + window.__xhsdownQrReloads + ',' + (expired ? 1 : 0)
+      );
+    } catch (e) {}
+  };
+  var tick = function () {
+    var expired = (document.body.innerText || '').indexOf('二维码已过期') >= 0;
+    var target = null;
+    if (expired) {
       var nodes = document.querySelectorAll('a, button, span, div, p');
-      var first = null;
       var leaf = null;
+      var first = null;
       for (var i = 0; i < nodes.length; i++) {
         var el = nodes[i];
         var t = (el.textContent || '').replace(/\s+/g, '');
@@ -1382,10 +1466,68 @@ const QR_KEEPER_JS: &str = r#"(function () {
           if (!leaf && el.children.length === 0) leaf = el;
         }
       }
-      var target = leaf || first;
-      if (target) target.click();
-    } catch (e) {}
-  }, 4000);
+      target = leaf || first;
+    }
+    if (target) {
+      target.click();
+      window.__xhsdownQrClicks += 1;
+      window.__xhsdownQrLastClick = Date.now();
+    } else if (
+      expired &&
+      window.__xhsdownQrLastClick &&
+      Date.now() - window.__xhsdownQrLastClick > 8000
+    ) {
+      // 点了还没恢复：重载页面拿新二维码（最可靠的一手）
+      window.__xhsdownQrReloads += 1;
+      report(true);
+      location.reload();
+      return;
+    }
+    report(expired);
+  };
+  window.__xhsdownQrTick = tick;
+  setInterval(function () {
+    try { tick(); } catch (e) {}
+  }, 2500);
+  // 窗口被切走时系统会降频（页面定时器几乎停摆）：
+  // 回到前台/重新可见时立刻补一次刷新，用户看到的就是"新码"
+  window.addEventListener('focus', function () { try { tick(); } catch (e) {} });
+  document.addEventListener('visibilitychange', function () {
+    if (!document.hidden) { try { tick(); } catch (e) {} }
+  });
+})();"#;
+
+/// 自检脚本：把登录页的真实状态（有没有二维码、是否过期、刷新元素、手机号输入框、
+/// 保活脚本是否装上）写进 URL 片段，供 Rust 侧记日志。
+const LOGIN_SELFTEST_JS: &str = r#"(function () {
+  try {
+    var text = document.body.innerText || '';
+    var imgs = document.querySelectorAll('img');
+    var qr = 0;
+    for (var i = 0; i < imgs.length; i++) {
+      if ((imgs[i].src || '').indexOf('data:image') === 0) qr += 1;
+    }
+    var refresh = 0;
+    var nodes = document.querySelectorAll('a, button, span, div, p');
+    for (var j = 0; j < nodes.length; j++) {
+      var t = (nodes[j].textContent || '').replace(/\s+/g, '');
+      if (t === '点击刷新' || t === '刷新二维码') { refresh = 1; break; }
+    }
+    var phone = document.querySelectorAll('input[type="tel"], input[placeholder*="手机号"]').length;
+    var out = {
+      url: location.href.slice(0, 120),
+      qrImgs: qr,
+      expired: text.indexOf('二维码已过期') >= 0,
+      refreshBtn: refresh,
+      phoneInputs: phone,
+      keeper: !!window.__xhsdownQrKeeper,
+      clicks: window.__xhsdownQrClicks || 0,
+      reloads: window.__xhsdownQrReloads || 0
+    };
+    location.replace('#xhsdownselftest=' + encodeURIComponent(JSON.stringify(out)));
+  } catch (e) {
+    location.replace('#xhsdownselftest=' + encodeURIComponent(JSON.stringify({ error: String(e) })));
+  }
 })();"#;
 
 /// 浏览器 Cookie 指纹：只看「名字=值」的集合，用来判断登录状态有没有变化。
@@ -1498,9 +1640,28 @@ pub async fn web_login_cookies(app: tauri::AppHandle, state: State<'_, AppState>
             .to_string()
     };
 
-    // 顺手把过期的二维码刷掉（登录页约一分钟过期一次）
+    // 顺手把过期的二维码刷掉（过期后自动点刷新，点不动就重载页面）
     if let Some(window) = app.get_webview_window("web-login") {
         let _ = window.eval(QR_KEEPER_JS);
+        if let Ok(url) = window.url() {
+            let text = url.to_string();
+            if let Some(idx) = text.find("xhsdownqr=") {
+                let rest = &text[idx + "xhsdownqr=".len()..];
+                let state = rest.split('&').next().unwrap_or("").to_string();
+                if !state.is_empty() {
+                    let mut last = state_of_qr_log().lock().unwrap();
+                    if last.as_deref() != Some(state.as_str()) {
+                        xhs_core::login::debug_log(&format!(
+                            "登录页二维码：点击={} 重载={} 过期={}",
+                            state.split(',').next().unwrap_or("?"),
+                            state.split(',').nth(1).unwrap_or("?"),
+                            if state.ends_with('1') { "是" } else { "否" }
+                        ));
+                        *last = Some(state);
+                    }
+                }
+            }
+        }
     }
 
     // 便宜预检：Cookies 没变化、且距上次权威检测不到 12 秒 → 直接回答"还没登录"，

@@ -102,6 +102,17 @@ async function checkNow() {
   }
 }
 
+/** 重新加载登录页：二维码/页面卡住时的恢复手段（关掉重开 = 全新页面） */
+async function reloadLogin() {
+  stop();
+  try {
+    await api.webLoginClose();
+  } catch {}
+  await new Promise((r) => setTimeout(r, 400));
+  status.value = "已重新加载登录页…";
+  waitForLogin();
+}
+
 async function closeAll() {
   stop();
   try {
@@ -153,9 +164,8 @@ onMounted(() => {
             <b>手机号 + 短信验证码</b>（推荐，最稳）、<b>扫码</b>（小红书 App 或微信）。
           </p>
           <p class="hint dim">
-            二维码过期会<b>自动刷新</b>，不用手动点。账号密码登录只有小红书 App 里有，
-            网页端不提供——本应用走官方网页登录，所以也没有密码方式。
-            登录成功后这里会自动完成绑定并关闭弹窗。
+            二维码过期会<b>自动刷新</b>（点不动会自动重载页面）；若仍卡在过期状态，
+            点下方「重新加载登录页」。账号密码登录只有小红书 App 里有，网页端不提供。
           </p>
           <p v-if="status" class="status">{{ status }}</p>
           <p v-if="busy" class="waiting">
@@ -164,7 +174,9 @@ onMounted(() => {
           </p>
         </div>
         <div class="actions">
-          <button class="ghost" @click="openWindow">打开登录窗口</button>
+          <button class="ghost" :disabled="busy" @click="reloadLogin">
+            重新加载登录页
+          </button>
           <button class="primary" :disabled="busy" @click="checkNow">
             {{ busy ? "检测中…" : "我已登录，立即绑定" }}
           </button>
