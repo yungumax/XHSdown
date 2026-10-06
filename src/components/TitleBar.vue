@@ -10,7 +10,7 @@ const props = defineProps({
   /** 主题模式：light / dark / system */
   theme: { type: String, default: "system" },
 });
-const emit = defineEmits(["login", "set-theme"]);
+const emit = defineEmits(["login", "set-theme", "web"]);
 
 const THEME_OPTIONS = [
   { value: "light", label: "浅色" },
@@ -153,6 +153,10 @@ function onDrag(event) {
       </Transition>
     </div>
 
+    <button class="web-chip" title="打开小红书网页（看/复制链接）" @click="emit('web')">
+      WEB
+    </button>
+
     <button class="login-chip" :class="{ on: login.logged_in }" @click="emit('login')">
       <img
         v-if="login.logged_in && login.face"
@@ -226,6 +230,26 @@ function onDrag(event) {
 .drag-fill {
   flex: 1;
   align-self: stretch;
+}
+
+.web-chip {
+  height: 26px;
+  padding: 0 10px;
+  margin-right: 8px;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  color: var(--muted);
+  background: var(--field);
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+
+.web-chip:hover {
+  color: var(--accent);
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
 }
 
 .login-chip {

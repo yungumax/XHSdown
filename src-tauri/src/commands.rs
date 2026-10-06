@@ -1303,6 +1303,11 @@ async fn webview_fetch_inner(
     }
 
     let window = ensure_work_window(app, &settings).await?;
+    // 用户正在看这个网页窗口时先收起：取数要导航，别当面把人家页面翻走
+    if !allow_login_window && window.is_visible().unwrap_or(false) {
+        let _ = window.hide();
+        xhs_core::login::debug_log("取数前收起网页窗口（避免把用户正在看的页面导航走）");
+    }
     let parsed: tauri::Url = url.parse().map_err(|e| format!("地址无效：{e}"))?;
     window.navigate(parsed).map_err(err)?;
 
@@ -2463,6 +2468,28 @@ pub async fn web_login_open(app: tauri::AppHandle, state: State<'_, AppState>) -
     let _ = window.set_focus();
     let _ = window.eval(QR_KEEPER_JS);
     state.login_window_open.store(true, Ordering::SeqCst);
+    Ok(())
+}
+
+/// 打开网页窗口：登录了就开当前账号的主页，没登录就开推荐流。
+/// 用途：在软件里直接看/复制链接（分享出来的链接 token 才是新鲜的）。
+#[tauri::command]
+pub async fn open_web_home(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    let settings = state.settings_snapshot();
+    let window = ensure_work_window(&app, &settings).await?;
+    let login = state.login.read().unwrap().clone().unwrap_or_default();
+    let url = if login.logged_in && !login.mid.is_empty() {
+        format!("https://www.xiaohongshu.com/user/profile/{}", login.mid)
+    } else {
+        "https://www.xiaohongshu.com/explore".to_string()
+    };
+    let parsed: tauri::Url = url.parse().map_err(|e| format!("地址无效：{e}"))?;
+    window.navigate(parsed).map_err(err)?;
+    let _ = window.set_title("小红书（网页）");
+    let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(1000.0, 760.0)));
+    let _ = window.center();
+    let _ = window.show();
+    let _ = window.set_focus();
     Ok(())
 }
 

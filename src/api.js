@@ -218,6 +218,12 @@ export async function onLoginConfirmed(handler) {
   return listen("login://confirmed", (event) => handler(event.payload));
 }
 
+/** 打开网页窗口：登录了就开当前账号主页，没登录就开推荐流 */
+export async function openWebHome() {
+  if (!hasTauri) return;
+  return invokeZh("open_web_home");
+}
+
 /** 网页登录：关闭内嵌窗口 */
 export async function webLoginClose() {
   if (!hasTauri) return;

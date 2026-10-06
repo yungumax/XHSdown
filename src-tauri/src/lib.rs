@@ -100,6 +100,7 @@ pub fn run() {
             commands::web_login_open,
             commands::web_login_cookies,
             commands::web_login_watch,
+            commands::open_web_home,
             commands::web_login_close,
             commands::logout,
             commands::choose_output_dir,

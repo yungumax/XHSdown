@@ -327,6 +327,16 @@ function onWebConfirmed(loginInfo) {
 }
 
 /** 点「未登录」：直接打开小红书官方登录页（独立窗口），不再套自家弹窗 */
+/** 打开网页窗口：看/复制链接用（登录了就是当前账号主页） */
+async function openWeb() {
+  try {
+    await api.openWebHome();
+    showToast("已打开小红书网页；解析时它会自动收起");
+  } catch (error) {
+    showToast(String(error));
+  }
+}
+
 async function openLogin() {
   if (login.value.logged_in) {
     showLogin.value = true; // 已登录时打开的是账号面板（看昵称头像、退出登录）
@@ -360,6 +370,7 @@ async function doLogout() {
       :theme="settings?.theme || 'system'"
       @login="openLogin"
       @set-theme="setTheme"
+      @web="openWeb"
     />
 
     <div class="body">
