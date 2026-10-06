@@ -2601,7 +2601,8 @@ const PAGE_BAR_JS: &str = r#"(function () {
   var open = pinned();
 
   var apply = function (bar) {
-    bar.style.transform = open ? 'translateY(0)' : 'translateY(-102%)';
+    var want = open ? 'translateY(0)' : 'translateY(-102%)';
+    if (bar.style.transform !== want) bar.style.transform = want;
   };
 
   var setOpen = function (next) {
@@ -2632,12 +2633,14 @@ const PAGE_BAR_JS: &str = r#"(function () {
       };
       handle.onmouseleave = function () { handle.style.opacity = '.4'; };
       handle.onclick = function () { setOpen(true); };
-      (document.body || document.documentElement).appendChild(handle);
+      (document.documentElement || document.body).appendChild(handle);
     }
     if (!bar) {
       bar = document.createElement('div');
       bar.id = 'xhsdown-bar';
-      bar.style.cssText = 'position:fixed;left:0;right:0;top:0;height:34px;z-index:' + Z + ';display:flex;align-items:center;gap:6px;padding:0 10px;background:#17181a;color:#e8e9ea;border-bottom:1px solid #282a2d;font:12px/1 "Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;box-sizing:border-box;transition:transform .16s ease;';
+      // 关键：创建时就带上初始位置（否则会先"闪现在顶部"再滑上去，看起来就是反复上下跳），
+      // 过渡动画推迟到下一帧再挂（避免重建时也走一遍动画）
+      bar.style.cssText = 'position:fixed;left:0;right:0;top:0;height:34px;z-index:' + Z + ';display:flex;align-items:center;gap:6px;padding:0 10px;background:#17181a;color:#e8e9ea;border-bottom:1px solid #282a2d;font:12px/1 "Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;box-sizing:border-box;transform:' + (open ? 'translateY(0)' : 'translateY(-102%)') + ';';
       var btn = function (label, title, fn) {
         var b = document.createElement('button');
         b.textContent = label;
@@ -2675,7 +2678,13 @@ const PAGE_BAR_JS: &str = r#"(function () {
         location.replace('#xhsdownparse=' + encodeURIComponent(url));
       });
       btn('收起', '收起地址栏（收回到左下角小方块）', function () { setOpen(false); });
-      (document.body || document.documentElement).appendChild(bar);
+      // 挂到 documentElement 上：SPA 重渲染 body 时不容易被清掉
+      (document.documentElement || document.body).appendChild(bar);
+      // 下一帧再启用过渡：这样"被页面清掉后补回"时不会再演一遍滑入动画
+      var first = bar;
+      requestAnimationFrame(function () {
+        try { first.style.transition = 'transform .16s ease'; } catch (e) {}
+      });
     }
     apply(bar);
     return { bar: bar, handle: handle };
