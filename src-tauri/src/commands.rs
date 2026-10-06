@@ -1299,21 +1299,58 @@ const EXTRACT_JS: &str = r#"(function () {
       }
     }
 
-    // 笔记列表：页面把**访问对象**的主页笔记放在 user.notes 里（实测）
+    // 笔记列表：页面把**访问对象**的主页笔记放在 user.notes 里。
+    // 注意结构可能是"分页嵌套"——每一项是一页（20 条）的容器，键名是数字，
+    // 必须递归展平；否则一条都读不到（实测：某主页 notes 有 5 项、实际 100 条笔记）
+    var flatten = function (value) {
+      var out = [];
+      var walk = function (node, depth) {
+        if (depth > 4 || out.length >= 600) return;
+        var list = arr(node);
+        for (var i = 0; i < list.length && out.length < 600; i++) {
+          var item = unwrap(list[i]);
+          if (Array.isArray(item)) {
+            walk(item, depth + 1);
+            continue;
+          }
+          if (!item || typeof item !== 'object') continue;
+          var keys = Object.keys(item);
+          var numericOnly =
+            keys.length > 0 &&
+            keys.every(function (k) {
+              return /^[0-9]+$/.test(k);
+            });
+          if (numericOnly && !item.id && !item.noteId && !item.noteCard) {
+            walk(
+              keys.map(function (k) {
+                return item[k];
+              }),
+              depth + 1
+            );
+            continue;
+          }
+          out.push(item);
+        }
+      };
+      walk(value, 0);
+      return out;
+    };
+
     var cards = [];
-    var noteList = arr(pu.notes);
+    var noteList = flatten(pu.notes);
     for (var n = 0; n < noteList.length && n < 300; n++) {
-      var card = unwrap(noteList[n]) || {};
+      var card = noteList[n];
       var nc = unwrap(card.noteCard) || {};
       var cu = unwrap(nc.user) || {};
-      var cid = card.id || '';
+      var cid = card.id || card.noteId || nc.noteId || nc.id || '';
       if (!cid) continue;
       cards.push({
         id: cid,
-        token: card.xsecToken || cu.xsecToken || '',
-        title: nc.displayTitle || '',
+        token: card.xsecToken || cu.xsecToken || nc.xsecToken || '',
+        title: nc.displayTitle || nc.title || '',
         type: nc.type || '',
-        time: card.time || nc.time || 0
+        time: card.time || nc.time || 0,
+        author: cu.nickname || cu.nickName || ''
       });
     }
 
@@ -2146,6 +2183,10 @@ const PAGE_SNAPSHOT_JS: &str = r#"(function () {
   var safe = function (v) {
     try { return JSON.stringify(unwrap(v)).slice(0, 300); } catch (e) { return '[circular]'; }
   };
+  var arr = function (v) {
+    v = unwrap(v);
+    return Array.isArray(v) ? v : [];
+  };
   try {
     var out = { url: location.href.split('#')[0], title: document.title };
     var st = window.__INITIAL_STATE__ || {};
@@ -2174,7 +2215,26 @@ const PAGE_SNAPSHOT_JS: &str = r#"(function () {
     out.survey = survey;
     var pu = unwrap(st.user) || {};
     out.userFields = fields(pu, 18);
-    out.notesLen = ((unwrap(pu.notes) || []).length);
+    var notesArr = arr(unwrap(pu.notes));
+    out.notesLen = notesArr.length;
+    // 转储第一条笔记的真实结构（主页条目与信息流条目字段名可能不同）
+    if (notesArr.length > 0) {
+      var firstNote = unwrap(notesArr[0]) || {};
+      out.firstNoteKeys = Object.keys(firstNote).slice(0, 20);
+      var nk = {};
+      var fkeys = Object.keys(firstNote).slice(0, 20);
+      for (var ni = 0; ni < fkeys.length; ni++) {
+        var nv = unwrap(firstNote[fkeys[ni]]);
+        if (Array.isArray(nv)) nk[fkeys[ni]] = '数组' + nv.length;
+        else if (nv && typeof nv === 'object') nk[fkeys[ni]] = '对象';
+        else nk[fkeys[ni]] = String(nv).slice(0, 40);
+      }
+      out.firstNoteFields = nk;
+      var inner = unwrap(firstNote.noteCard);
+      if (inner && typeof inner === 'object') {
+        out.noteCardFields = fields(inner, 16);
+      }
+    }
     out.noteQueriesType = Object.prototype.toString.call(unwrap(pu.noteQueries));
     out.noteQueriesKeys = Object.keys(unwrap(pu.noteQueries) || {}).slice(0, 6);
     out.noteQueriesSample = safe(pu.noteQueries);
@@ -2257,6 +2317,33 @@ async fn login_selftest(app: tauri::AppHandle, settings: Settings, probe_url: St
                 "自检·转储[{url}]：{}",
                 dump.unwrap_or_else(|| "未取到".into())
             ));
+        }
+    }
+
+    // 探针五：主页"笔记为空"的归因对比（带 token / 不带 token / 页面快照）
+    if !probe_url.is_empty() && probe_url.contains("/user/profile/") {
+        let plain = probe_url.split('?').next().unwrap_or("").to_string();
+        for (label, url) in [("带token", probe_url.clone()), ("不带token", plain.clone())] {
+            match webview_fetch(&app, &url).await {
+                Ok(value) => {
+                    let name = value.get("nickname").and_then(|v| v.as_str()).unwrap_or("");
+                    let notes = value.get("notes").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+                    xhs_core::login::debug_log(&format!(
+                        "自检·主页[{label}]：昵称={name:?} 笔记={notes} 条"
+                    ));
+                }
+                Err(e) => {
+                    xhs_core::login::debug_log(&format!("自检·主页[{label}]：失败 {e}"));
+                }
+            }
+            // 再取一次页面快照，看到底是"没登录"还是"页面没给数据"
+            if let Ok(window) = ensure_work_window(&app, &settings).await {
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                let _ = window.eval(PAGE_SNAPSHOT_JS);
+                if let Some(text) = read_selftest(&window).await {
+                    xhs_core::login::debug_log(&format!("自检·结构[{label}]：{text}"));
+                }
+            }
         }
     }
 
