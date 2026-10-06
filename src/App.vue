@@ -211,7 +211,9 @@ onMounted(async () => {
       return;
     }
     collected.value = { items, stamp: Date.now() };
-    showToast(`网页收集完成：${items.length} 条，已送入解析结果`);
+    showToast(
+      `网页收集完成：${items.length} 条，已送入解析结果（数量明显少于主页总数时，先登录再收集可拿到更多）`,
+    );
   });
 });
 
