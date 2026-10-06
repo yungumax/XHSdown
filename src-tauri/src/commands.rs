@@ -1350,6 +1350,13 @@ async fn browser_login_check(
         }
     };
 
+    let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    if kind != "user" {
+        xhs_core::login::debug_log(&format!(
+            "登录检测：拿到的不是主页数据（kind={kind:?}），继续等待"
+        ));
+        return Ok(None);
+    }
     let mut uid = value.get("uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let mut name = value.get("nickname").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let mut avatar = value.get("avatar").and_then(|v| v.as_str()).unwrap_or_default().to_string();
@@ -1715,13 +1722,29 @@ async fn login_watch(app: tauri::AppHandle) {
         // 阶段 1：完整取数（含导航）最多每 20 秒一次；其余时间只读当前页面，
         // 让页面的异步资料有机会加载完
         let now = std::time::Instant::now();
-        let value = if now.duration_since(last_full_fetch) >= Duration::from_secs(20) {
+        let full = now.duration_since(last_full_fetch) >= Duration::from_secs(20);
+        let value = if full {
             last_full_fetch = now;
-            webview_fetch_inner(&app, "https://www.xiaohongshu.com/user/profile/me", true)
+            match webview_fetch_inner(&app, "https://www.xiaohongshu.com/user/profile/me", true)
                 .await
-                .ok()
+            {
+                Ok(value) => Some(value),
+                Err(e) => {
+                    xhs_core::login::debug_log(&format!("读资料失败（{e}），稍后重试"));
+                    None
+                }
+            }
         } else {
-            extract_from_page(&window).await
+            let value = extract_from_page(&window).await;
+            if value.is_none() {
+                // 页面还没就绪（或停在错误页）：记一次，便于远程排查
+                let page = window.url().map(|u| u.to_string()).unwrap_or_default();
+                xhs_core::login::debug_log(&format!(
+                    "读当前页面暂无数据（{}）",
+                    xhs_core::error::truncate(&page, 100)
+                ));
+            }
+            value
         };
 
         let Some(value) = value else { continue };
@@ -1731,6 +1754,7 @@ async fn login_watch(app: tauri::AppHandle) {
             .unwrap_or_default()
             .to_string();
         if name.is_empty() {
+            xhs_core::login::debug_log("读到主页数据但还没昵称，继续等待");
             continue;
         }
         let uid = value.get("uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
