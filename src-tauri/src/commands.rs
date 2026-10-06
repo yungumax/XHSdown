@@ -1725,8 +1725,11 @@ async fn webview_fetch_inner(
     }
 
     let window = ensure_work_window(app, &settings).await?;
+    // 取数前窗口是否可见要记下来：隐藏窗口的渲染与定时器会被 WebView2 挂起/节流
+    // （见 lib.rs 的启动参数），日志里有这条信息才能一眼分辨"取数失败"是不是窗口被挂起
+    let was_visible = window.is_visible().unwrap_or(false);
     // 用户正在看这个网页窗口时先收起：取数要导航，别当面把人家页面翻走
-    if !allow_login_window && window.is_visible().unwrap_or(false) {
+    if !allow_login_window && was_visible {
         let _ = window.hide();
         xhs_core::login::debug_log("取数前收起网页窗口（避免把用户正在看的页面导航走）");
     }
@@ -1741,9 +1744,11 @@ async fn webview_fetch_inner(
         // 目标地址记进日志（token 只留长度）：取数失败时能一眼看出是链接形态问题还是站点问题
         let (note_id, token) = split_note_url(url);
         xhs_core::login::debug_log(&format!(
-            "取数目标：{} （id={note_id} token 长度={}）",
+            "取数目标：{} （id={note_id} token 长度={}；起始页={}；窗口={}）",
             xhs_core::error::truncate(url.split('?').next().unwrap_or(url), 100),
-            token.len()
+            token.len(),
+            xhs_core::error::truncate(&before_url, 90),
+            if was_visible { "可见" } else { "隐藏" }
         ));
     }
     window.navigate(parsed).map_err(err)?;
@@ -1756,6 +1761,8 @@ async fn webview_fetch_inner(
     let started = std::time::Instant::now();
     let mut last_page = String::new();
     let mut stale_kind_logged = false;
+    // 浏览器地址每次变化都记一笔：导航有没有落地、被弹到哪儿，全看这条日志
+    let mut last_live = before_url.clone();
     while started.elapsed() < Duration::from_secs(30) {
         tokio::time::sleep(Duration::from_millis(700)).await;
 
@@ -1765,6 +1772,13 @@ async fn webview_fetch_inner(
             .url()
             .map(|u| u.to_string().split('#').next().unwrap_or("").to_string())
             .unwrap_or_default();
+        if !live_url.is_empty() && live_url != last_live {
+            xhs_core::login::debug_log(&format!(
+                "取数：浏览器地址 → {}",
+                xhs_core::error::truncate(&live_url, 120)
+            ));
+            last_live = live_url.clone();
+        }
         if !live_url.is_empty() && live_url != before_url {
             if live_url.contains("/explore") && !live_url.contains("/explore/") && expect == "note" {
                 return Err(

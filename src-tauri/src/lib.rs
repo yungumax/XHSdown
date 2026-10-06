@@ -11,6 +11,20 @@ const BG_DARK: tauri::window::Color = tauri::window::Color(15, 16, 17, 255);
 const BG_LIGHT: tauri::window::Color = tauri::window::Color(245, 243, 244, 255);
 
 pub fn run() {
+    // 取数窗口常年是隐藏的（登录后默认收起、取数时也会先收起），而 WebView2 对
+    // 隐藏/被遮挡的页面会挂起渲染、把定时器降到 1 次/分钟 —— 实测表现为：导航指令
+    // 发出后新页面根本没落地，取数一直读到旧页面，还把我们引向"token 失效"的误判。
+    // 这几个开关让隐藏窗口照常跑（WebView2 环境创建前设置才生效）。
+    if std::env::var_os("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS").is_none() {
+        std::env::set_var(
+            "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+            "--disable-background-timer-throttling \
+             --disable-backgrounding-occluded-windows \
+             --disable-renderer-backgrounding \
+             --disable-features=CalculateNativeWinOcclusion",
+        );
+    }
+
     let state = state::AppState::new().expect("初始化应用状态失败");
     // 启动前读出主题，注入初始化脚本：页面首帧即为正确配色，杜绝启动闪白
     let theme_mode = state.settings().theme.clone();
