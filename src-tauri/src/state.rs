@@ -221,6 +221,8 @@ pub struct AppState {
     pub last_login_check: Mutex<Option<std::time::Instant>>,
     /// 后端登录轮询是否在跑（同一时刻只允许一个）
     pub login_watch_running: AtomicBool,
+    /// 登录窗口是否正开着（开着时取数不许抢窗口）
+    pub login_window_open: AtomicBool,
 }
 
 /// 浏览器数据目录：登录窗口与取数窗口共用同一个目录，
@@ -271,6 +273,7 @@ impl AppState {
             login_cookie_baseline: Mutex::new(None),
             last_login_check: Mutex::new(None),
             login_watch_running: AtomicBool::new(false),
+            login_window_open: AtomicBool::new(false),
         })
     }
 

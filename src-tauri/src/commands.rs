@@ -959,22 +959,26 @@ fn civil_from_unix(secs: i64) -> (i64, u32, u32) {
 // 所以取数一律借登录窗口那个真实浏览器的会话——签名与风控由浏览器处理，
 // 程序只负责最后一步：下载 CDN 直链（那些地址自带签名，不需要 Cookie）。
 
-/// 取数窗口（隐藏）：与登录窗口共用浏览器数据目录，因此天然带着登录态。
-async fn ensure_fetch_window(
+/// 唯一的浏览器窗口：**登录与取数都用它**。
+///
+/// 为什么不分成两个窗口：WebView2 在同一数据目录下的多个环境之间不能可靠共享
+/// 会话 Cookie——实测"登录窗关闭后取数窗就变成未登录"，所以干脆一个窗口一个会话，
+/// 登录态天然共享，没有跨环境竞态。
+async fn ensure_work_window(
     app: &tauri::AppHandle,
     settings: &Settings,
 ) -> Result<tauri::WebviewWindow, String> {
-    if let Some(window) = app.get_webview_window("xhs-fetch") {
+    if let Some(window) = app.get_webview_window("xhs-work") {
         return Ok(window);
     }
     let dir = crate::state::webview_dir(settings);
     std::fs::create_dir_all(&dir).map_err(err)?;
     let window = tauri::WebviewWindowBuilder::new(
         app,
-        "xhs-fetch",
+        "xhs-work",
         tauri::WebviewUrl::External("about:blank".parse().unwrap()),
     )
-    .title("XHSdown 取数窗口")
+    .title("XHSdown")
     .inner_size(1000.0, 760.0)
     .visible(false)
     .data_directory(dir)
@@ -1187,11 +1191,27 @@ async fn extract_from_page(window: &tauri::WebviewWindow) -> Option<serde_json::
 /// 用浏览器会话打开一个页面并取回数据。
 /// 串行执行：取数窗口只有一个，并发导航会互相打断。
 async fn webview_fetch(app: &tauri::AppHandle, url: &str) -> Result<serde_json::Value, String> {
+    webview_fetch_inner(app, url, false).await
+}
+
+/// `allow_login_window`：登录流程自己要借这个窗口读资料，那时不能拦。
+async fn webview_fetch_inner(
+    app: &tauri::AppHandle,
+    url: &str,
+    allow_login_window: bool,
+) -> Result<serde_json::Value, String> {
     let state = app.state::<AppState>();
     let settings = state.settings_snapshot();
     let _guard = state.fetch_lock.lock().await;
 
-    let window = ensure_fetch_window(app, &settings).await?;
+    // 登录窗正开着（用户在登录）就别抢窗口：会把登录页导航走
+    if !allow_login_window && state.login_window_open.load(Ordering::SeqCst) {
+        return Err(
+            "登录窗口还开着：请先完成登录（成功后会自动关闭）或关掉它，再解析".into(),
+        );
+    }
+
+    let window = ensure_work_window(app, &settings).await?;
     let parsed: tauri::Url = url.parse().map_err(|e| format!("地址无效：{e}"))?;
     window.navigate(parsed).map_err(err)?;
 
@@ -1211,9 +1231,11 @@ async fn webview_fetch(app: &tauri::AppHandle, url: &str) -> Result<serde_json::
         }
         // 明确的"要登录 / 不可见"页面：不用再等
         if last_page.contains("/login") || last_page.contains("/404") {
-            return Err(
-                "需要登录：小红书要求登录后才能浏览该内容（或内容已删除、仅自己可见）".into(),
-            );
+            let kind = if last_page.contains("/404") { "404/不可见" } else { "登录页" };
+            return Err(format!(
+                "需要登录：小红书要求登录后才能浏览该内容（落地页={kind}；{}）",
+                xhs_core::error::truncate(&last_page, 120)
+            ));
         }
     }
     Err(format!(
@@ -1298,7 +1320,8 @@ async fn read_identity(window: &tauri::WebviewWindow) -> Option<(String, String,
 async fn browser_login_check(
     app: &tauri::AppHandle,
 ) -> Result<Option<(String, String, String)>, String> {
-    let value = match webview_fetch(app, "https://www.xiaohongshu.com/user/profile/me").await {
+    let value = match webview_fetch_inner(app, "https://www.xiaohongshu.com/user/profile/me", true).await
+    {
         Ok(value) => value,
         Err(e) => {
             // "需要登录"就是没登录，不算错误
@@ -1328,7 +1351,7 @@ async fn browser_login_check(
 
     // 状态里没资料就退回 DOM（文档标题=昵称、头像图）
     if name.is_empty() || avatar.is_empty() {
-        if let Some(window) = app.get_webview_window("xhs-fetch") {
+        if let Some(window) = app.get_webview_window("xhs-work") {
             // 资料异步到达：最多重试 3 轮（每轮内部轮询 ~5 秒）
             for _ in 0..3 {
                 let _ = window.eval(IDENTITY_DOM_JS);
@@ -1577,6 +1600,18 @@ async fn fetch_user(
             }
         }
     }
+    // 两种链接都失败：复核会话是否还有效，便于区分"会话失效"与"内容/链接问题"
+    match webview_fetch(app, "https://www.xiaohongshu.com/user/profile/me").await {
+        Ok(value) => {
+            let name = value.get("nickname").and_then(|v| v.as_str()).unwrap_or_default();
+            xhs_core::login::debug_log(&format!(
+                "主页取数复核：会话仍有效（我的主页昵称={name:?}）——问题在目标链接/内容"
+            ));
+        }
+        Err(e) => {
+            xhs_core::login::debug_log(&format!("主页取数复核：会话可能已失效（{e}）"));
+        }
+    }
     Err(last_err)
 }
 
@@ -1654,7 +1689,6 @@ fn log_qr_state(window: &tauri::WebviewWindow) {
 async fn login_watch(app: tauri::AppHandle) {
     let state = app.state::<AppState>();
     let started = std::time::Instant::now();
-    let mut last_left_login = false;
 
     loop {
         if started.elapsed() > Duration::from_secs(600) {
@@ -1663,50 +1697,49 @@ async fn login_watch(app: tauri::AppHandle) {
         }
         tokio::time::sleep(Duration::from_millis(2500)).await;
 
-        // 登录窗被关掉（用户取消/完成绑定）就停
-        let Some(window) = app.get_webview_window("web-login") else {
+        if !state.login_window_open.load(Ordering::SeqCst) {
             xhs_core::login::debug_log("登录轮询：登录窗已关闭，停止");
+            break;
+        }
+        let Some(window) = app.get_webview_window("xhs-work") else {
+            xhs_core::login::debug_log("登录轮询：窗口不存在，停止");
             break;
         };
 
-        // 二维码保活也交给后端：定时器不降频，二维码不会停在过期态
+        // 二维码保活：定时器不降频，不会停在过期态
         let _ = window.eval(QR_KEEPER_JS);
         log_qr_state(&window);
 
-        // 登录完成的强信号：登录页不再停留在 /login（成功后会跳到推荐流）
+        // 登录完成的强信号：页面自己离开了 /login（成功后跳到推荐流等）
         let page_url = window.url().map(|u| u.to_string()).unwrap_or_default();
-        let left_login_page = page_url.parse::<String>().is_ok()
-            && !page_url.contains("/login")
-            && page_url.contains("xiaohongshu.com");
-        let just_left_login = left_login_page && last_left_login == false;
-        last_left_login = left_login_page;
-
-        // 检测节奏：**只在真有信号时才去请求主页**——
-        // Cookie 有变化（登录会写 Cookie）、或登录页已经离开 /login。
-        // 之前每 5 秒无条件查一次，未登录时那个请求会跳转到登录页，
-        // 等于在浏览器里反复加载登录页，把用户正在扫的二维码会话顶掉
-        // （实测：二维码每 3 秒"过期↔正常"来回跳，保活脚本被带着一直刷新）。
-        let fingerprint = cookie_fingerprint(&window);
-        let changed = {
-            let mut baseline = state.login_cookie_baseline.lock().unwrap();
-            match baseline.as_ref() {
-                Some(saved) => saved != &fingerprint,
-                None => {
-                    *baseline = Some(fingerprint.clone());
-                    false
-                }
-            }
-        };
-        if !changed && !just_left_login {
+        let left_login = page_url.contains("xiaohongshu.com") && !page_url.contains("/login");
+        if !left_login {
             continue;
         }
-        if just_left_login {
-            xhs_core::login::debug_log("登录页已跳走，立即检测登录状态");
-        }
-        *state.last_login_check.lock().unwrap() = Some(std::time::Instant::now());
 
-        match browser_login_check(&app).await {
-            Ok(Some((uid, name, avatar))) => {
+        xhs_core::login::debug_log("登录页已跳走，开始读取账号资料");
+        // 用同一个窗口读「我的主页」——这时用户已经登录完成，导航过去不会打扰他
+        match webview_fetch_inner(&app, "https://www.xiaohongshu.com/user/profile/me", true).await {
+            Ok(value) => {
+                let name = value
+                    .get("nickname")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let uid = value
+                    .get("uid")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let avatar = value
+                    .get("avatar")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if name.is_empty() {
+                    xhs_core::login::debug_log("登录检测：已登录但资料未就绪，继续等待");
+                    continue;
+                }
                 xhs_core::login::debug_log(&format!(
                     "检测到登录：昵称={:?} uid={:?}",
                     name, uid
@@ -1716,16 +1749,11 @@ async fn login_watch(app: tauri::AppHandle) {
                         let _ = app.emit("login://confirmed", login);
                         break;
                     }
-                    Err(e) => {
-                        xhs_core::login::debug_log(&format!("登录收尾失败：{e}"));
-                    }
+                    Err(e) => xhs_core::login::debug_log(&format!("登录收尾失败：{e}")),
                 }
             }
-            Ok(None) => {
-                xhs_core::login::debug_log("登录检测：仍未登录");
-            }
             Err(e) => {
-                xhs_core::login::debug_log(&format!("登录检测出错：{e}"));
+                xhs_core::login::debug_log(&format!("登录检测：读取我的主页失败（{e}），继续等待"));
             }
         }
     }
@@ -1801,27 +1829,19 @@ const PAGE_SNAPSHOT_JS: &str = r#"(function () {
 /// 登录页自检：隐藏窗口打开官方登录页，探测「二维码状态 + 保活脚本是否生效」并写日志。
 /// 由数据目录里的 login_selftest 标记文件触发（平时不跑），用于远程诊断。
 async fn login_selftest(app: tauri::AppHandle, settings: Settings, probe_url: String) {
-    // 探针一：登录页（二维码状态）
-    let dir = crate::state::webview_dir(&settings);
-    let _ = std::fs::create_dir_all(&dir);
-    let window = match tauri::WebviewWindowBuilder::new(
-        &app,
-        "xhs-logintest",
-        tauri::WebviewUrl::External("https://www.xiaohongshu.com/login".parse().unwrap()),
-    )
-    .title("登录页自检")
-    .inner_size(520.0, 720.0)
-    .visible(false)
-    .data_directory(dir)
-    .build()
-    {
+    // 探针一：登录页（二维码状态）——共用唯一窗口
+    let window = match ensure_work_window(&app, &settings).await {
         Ok(window) => window,
         Err(e) => {
-            xhs_core::login::debug_log(&format!("自检：窗口创建失败 {e}"));
+            xhs_core::login::debug_log(&format!("自检：窗口不可用 {e}"));
             return;
         }
     };
-
+    {
+        if let Ok(parsed) = "https://www.xiaohongshu.com/login".parse::<tauri::Url>() {
+            let _ = window.navigate(parsed);
+        }
+    }
     tokio::time::sleep(Duration::from_secs(10)).await;
     let _ = window.eval(LOGIN_SELFTEST_JS);
     xhs_core::login::debug_log(&format!(
@@ -1842,7 +1862,7 @@ async fn login_selftest(app: tauri::AppHandle, settings: Settings, probe_url: St
         "https://www.xiaohongshu.com/user/profile/me",
         "https://www.xiaohongshu.com/user/profile/58c8014a6a6a690dbb0c84c1",
     ] {
-        if let Ok(window) = ensure_fetch_window(&app, &settings).await {
+        if let Ok(window) = ensure_work_window(&app, &settings).await {
             if let Ok(parsed) = url.parse::<tauri::Url>() {
                 let _ = window.navigate(parsed);
             }
@@ -2117,7 +2137,7 @@ async fn finish_login(
     avatar: String,
 ) -> Result<LoginInfo, String> {
     let settings = state.settings_snapshot();
-    if let Some(window) = app.get_webview_window("web-login") {
+    if let Some(window) = app.get_webview_window("xhs-work") {
         let cookies = harvest_webview_cookies(&window);
         if !cookies.is_empty() {
             let client = XhsClient::with_proxy(Some(&settings.proxy)).map_err(err)?;
@@ -2140,39 +2160,27 @@ async fn finish_login(
         "登录完成：昵称={:?} uid={:?}",
         login.uname, login.mid
     ));
-    if let Some(window) = app.get_webview_window("web-login") {
-        let _ = window.close();
+    if let Some(window) = app.get_webview_window("xhs-work") {
+        let _ = window.hide();
     }
+    state.login_window_open.store(false, Ordering::SeqCst);
     Ok(login)
 }
 
 #[tauri::command]
 pub async fn web_login_open(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
-    use tauri::{WebviewUrl, WebviewWindowBuilder};
-    if let Some(window) = app.get_webview_window("web-login") {
-        let _ = window.set_focus();
-        return Ok(());
-    }
-    // 与取数窗口共用浏览器数据目录：登录态因此能被取数窗口复用，
-    // 也能跨应用重启保留（退出登录时会整体清除）。
     let settings = state.settings_snapshot();
-    let data_dir = crate::state::webview_dir(&settings);
-    std::fs::create_dir_all(&data_dir).map_err(err)?;
-    // 直接落在官方登录页：页面内提供 手机号验证码 / 账号密码 / 扫码 三种方式
-    let window = WebviewWindowBuilder::new(
-        &app,
-        "web-login",
-        WebviewUrl::External("https://www.xiaohongshu.com/login".parse().unwrap()),
-    )
-    .title("小红书登录")
-    .inner_size(520.0, 720.0)
-    .min_inner_size(420.0, 560.0)
-    .resizable(true)
-    .center()
-    .data_directory(data_dir)
-    .build()
-    .map_err(err)?;
+    // 与取数共用一个窗口：登录态天然共享（分两个窗口会出现跨环境会话丢失，实测踩过）
+    let window = ensure_work_window(&app, &settings).await?;
+    let url: tauri::Url = "https://www.xiaohongshu.com/login".parse().unwrap();
+    window.navigate(url).map_err(err)?;
+    let _ = window.set_title("小红书登录");
+    let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(520.0, 720.0)));
+    let _ = window.center();
+    let _ = window.show();
+    let _ = window.set_focus();
     let _ = window.eval(QR_KEEPER_JS);
+    state.login_window_open.store(true, Ordering::SeqCst);
     Ok(())
 }
 
@@ -2184,7 +2192,7 @@ pub async fn web_login_cookies(app: tauri::AppHandle, state: State<'_, AppState>
     };
 
     // 顺手把过期的二维码刷掉（过期后自动点刷新，点不动就重载页面）
-    if let Some(window) = app.get_webview_window("web-login") {
+    if let Some(window) = app.get_webview_window("xhs-work") {
         let _ = window.eval(QR_KEEPER_JS);
         log_qr_state(&window);
     }
@@ -2192,7 +2200,7 @@ pub async fn web_login_cookies(app: tauri::AppHandle, state: State<'_, AppState>
     // 便宜预检：Cookies 没变化、且距上次权威检测不到 12 秒 → 直接回答"还没登录"，
     // 省掉一次主页请求（轮询每 2 秒一次，全量请求太密）
     let fingerprint = app
-        .get_webview_window("web-login")
+        .get_webview_window("xhs-work")
         .map(|window| cookie_fingerprint(&window))
         .unwrap_or_default();
     let (changed, due) = {
@@ -2225,10 +2233,12 @@ pub async fn web_login_cookies(app: tauri::AppHandle, state: State<'_, AppState>
 }
 
 #[tauri::command]
-pub async fn web_login_close(app: tauri::AppHandle) -> Result<(), String> {
-    if let Some(window) = app.get_webview_window("web-login") {
-        let _ = window.close();
+pub async fn web_login_close(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    // 只隐藏、不关闭：窗口一关会销毁 WebView2 环境，会话 Cookie 可能来不及落盘
+    if let Some(window) = app.get_webview_window("xhs-work") {
+        let _ = window.hide();
     }
+    state.login_window_open.store(false, Ordering::SeqCst);
     Ok(())
 }
 
@@ -2236,7 +2246,7 @@ pub async fn web_login_close(app: tauri::AppHandle) -> Result<(), String> {
 pub async fn logout(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<LoginInfo, String> {
     let settings = state.settings_snapshot();
     // 关掉登录窗与取数窗：浏览器数据目录被占用时删不掉
-    for label in ["web-login", "xhs-fetch"] {
+    for label in ["xhs-work"] {
         if let Some(window) = app.get_webview_window(label) {
             let _ = window.close();
         }
