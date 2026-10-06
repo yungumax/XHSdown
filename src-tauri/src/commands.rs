@@ -1362,6 +1362,42 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).to_string()
 }
 
+/// 二维码保活脚本：小红书登录页的二维码约一分钟就过期，
+/// 过期后页面上会出现「点击刷新」——这里替用户点掉，二维码自动续上。
+/// （脚本幂等：同一页面里重复注入只会生效一份。）
+const QR_KEEPER_JS: &str = r#"(function () {
+  if (window.__xhsdownQrKeeper) return;
+  window.__xhsdownQrKeeper = true;
+  setInterval(function () {
+    try {
+      var nodes = document.querySelectorAll('a, button, span, div, p');
+      var first = null;
+      var leaf = null;
+      for (var i = 0; i < nodes.length; i++) {
+        var el = nodes[i];
+        var t = (el.textContent || '').replace(/\s+/g, '');
+        if (t === '点击刷新' || t === '刷新二维码') {
+          if (!first) first = el;
+          // 优先点最内层元素：外层容器点了不生效（事件挂在叶子节点上）
+          if (!leaf && el.children.length === 0) leaf = el;
+        }
+      }
+      var target = leaf || first;
+      if (target) target.click();
+    } catch (e) {}
+  }, 4000);
+})();"#;
+
+/// 浏览器 Cookie 指纹：只看「名字=值」的集合，用来判断登录状态有没有变化。
+fn cookie_fingerprint(window: &tauri::WebviewWindow) -> String {
+    let mut parts: Vec<String> = harvest_webview_cookies(window)
+        .into_iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
+    parts.sort();
+    parts.join(";")
+}
+
 /// 从登录小窗收割 Cookie（HttpOnly 也能拿到）。
 /// 只是备份一份给 reqwest 快路径用——登录态本身靠浏览器数据目录共享。
 fn harvest_webview_cookies(window: &tauri::WebviewWindow) -> Vec<(String, String)> {
@@ -1438,7 +1474,7 @@ pub async fn web_login_open(app: tauri::AppHandle, state: State<'_, AppState>) -
     let data_dir = crate::state::webview_dir(&settings);
     std::fs::create_dir_all(&data_dir).map_err(err)?;
     // 直接落在官方登录页：页面内提供 手机号验证码 / 账号密码 / 扫码 三种方式
-    WebviewWindowBuilder::new(
+    let window = WebviewWindowBuilder::new(
         &app,
         "web-login",
         WebviewUrl::External("https://www.xiaohongshu.com/login".parse().unwrap()),
@@ -1451,18 +1487,53 @@ pub async fn web_login_open(app: tauri::AppHandle, state: State<'_, AppState>) -
     .data_directory(data_dir)
     .build()
     .map_err(err)?;
+    let _ = window.eval(QR_KEEPER_JS);
     Ok(())
 }
 
 #[tauri::command]
 pub async fn web_login_cookies(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<LoginInfo, String> {
-    // 让浏览器自己读「我的主页」：拿到真实资料才算登录。
-    // （页面状态里的 loggedIn 字段对匿名访客也是 true，不能用来判定——实测踩过）
+    let not_yet = || {
+        "还没有检测到登录状态——请在登录页完成登录（扫码，或手机号 + 短信验证码；小红书网页端不提供账号密码登录）"
+            .to_string()
+    };
+
+    // 顺手把过期的二维码刷掉（登录页约一分钟过期一次）
+    if let Some(window) = app.get_webview_window("web-login") {
+        let _ = window.eval(QR_KEEPER_JS);
+    }
+
+    // 便宜预检：Cookies 没变化、且距上次权威检测不到 12 秒 → 直接回答"还没登录"，
+    // 省掉一次主页请求（轮询每 2 秒一次，全量请求太密）
+    let fingerprint = app
+        .get_webview_window("web-login")
+        .map(|window| cookie_fingerprint(&window))
+        .unwrap_or_default();
+    let (changed, due) = {
+        let mut baseline = state.login_cookie_baseline.lock().unwrap();
+        let changed = match baseline.as_ref() {
+            Some(saved) => saved != &fingerprint,
+            None => {
+                // 第一次轮询：记下基线（此刻用户还没登录）
+                *baseline = Some(fingerprint.clone());
+                true
+            }
+        };
+        let last = *state.last_login_check.lock().unwrap();
+        let due = last
+            .map(|t| t.elapsed() > Duration::from_secs(12))
+            .unwrap_or(true);
+        (changed, due)
+    };
+    if !changed && !due {
+        return Err(not_yet());
+    }
+    *state.last_login_check.lock().unwrap() = Some(std::time::Instant::now());
+
+    // 权威检测：让浏览器自己读「我的主页」，拿到真实资料才算登录。
+    // （页面里的 loggedIn 字段对匿名访客也是 true，不能用来判定——实测踩过）
     let Some((uid, name, avatar)) = browser_login_check(&app).await? else {
-        return Err(
-            "还没有检测到登录状态——请在小窗里完成登录（手机号验证码 / 账号密码 / 扫码都可以）"
-                .into(),
-        );
+        return Err(not_yet());
     };
     finish_login(&app, &state, uid, name, avatar).await
 }
@@ -1500,6 +1571,8 @@ pub async fn logout(app: tauri::AppHandle, state: State<'_, AppState>) -> Result
     let client = XhsClient::with_proxy(Some(&settings.proxy)).map_err(err)?;
     *state.client.write().unwrap() = Arc::new(client);
     *state.login.write().unwrap() = None;
+    *state.login_cookie_baseline.lock().unwrap() = None;
+    *state.last_login_check.lock().unwrap() = None;
     Ok(LoginInfo::default())
 }
 

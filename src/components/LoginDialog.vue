@@ -74,7 +74,8 @@ async function waitForLogin() {
           status.value = "登录窗口已关闭。点下方按钮重新打开，或直接在此关闭。";
           return;
         }
-        // 还没登录：继续等（超时才把最后一次的错误显示出来）
+        // 「还没登录」是预期状态，不打扰；其它错误（超时、风控、页面异常）早点显示出来
+        if (!text.includes("还没有检测到登录状态") && i >= 1) status.value = text;
         if (i === limit - 1) status.value = text;
       }
     }
@@ -148,12 +149,13 @@ onMounted(() => {
         <div class="web-login">
           <Icon name="lock" class="big-icon" />
           <p class="hint">
-            已打开**小红书官方登录页**（独立小窗）——手机号验证码、账号密码、扫码都可以，
-            本应用不接触你的密码。
+            已打开<b>小红书官方登录页</b>（独立小窗）。两种方式：
+            <b>手机号 + 短信验证码</b>（推荐，最稳）、<b>扫码</b>（小红书 App 或微信）。
           </p>
           <p class="hint dim">
-            登录成功后这里会**自动完成绑定**并关闭弹窗，昵称与头像会显示在右上角。
-            登录凭据只保存在本机数据目录。
+            二维码过期会<b>自动刷新</b>，不用手动点。账号密码登录只有小红书 App 里有，
+            网页端不提供——本应用走官方网页登录，所以也没有密码方式。
+            登录成功后这里会自动完成绑定并关闭弹窗。
           </p>
           <p v-if="status" class="status">{{ status }}</p>
           <p v-if="busy" class="waiting">

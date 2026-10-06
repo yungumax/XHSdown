@@ -214,6 +214,11 @@ pub struct AppState {
     pub login: RwLock<Option<LoginInfo>>,
     /// 浏览器取数窗口只有一个，取数必须串行（同窗导航会互相打断）
     pub fetch_lock: tokio::sync::Mutex<()>,
+    /// 登录窗刚打开时的浏览器 Cookie 指纹：轮询时先比指纹，
+    /// 没变化就不去请求主页（省请求、也少触发风控）
+    pub login_cookie_baseline: Mutex<Option<String>>,
+    /// 上一次做权威登录检测的时间
+    pub last_login_check: Mutex<Option<std::time::Instant>>,
 }
 
 /// 浏览器数据目录：登录窗口与取数窗口共用同一个目录，
@@ -261,6 +266,8 @@ impl AppState {
             warmed: AtomicBool::new(false),
             login: RwLock::new(None),
             fetch_lock: tokio::sync::Mutex::new(()),
+            login_cookie_baseline: Mutex::new(None),
+            last_login_check: Mutex::new(None),
         })
     }
 
