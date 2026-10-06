@@ -518,11 +518,17 @@ pub async fn probe_more(
         .map(|u| u.to_string().split('#').next().unwrap_or("").to_string())
         .unwrap_or_default();
     if current != url {
-        let _ = window.hide();
         if let Ok(parsed) = url.parse::<tauri::Url>() {
             let _ = window.navigate(parsed);
         }
         tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    // 可见模式（与 DYdown 的可见加载一致）：解析过程就在网页窗口里进行，
+    // 用户能看着列表一页页滚出来；不再后台偷偷滚
+    if !window.is_visible().unwrap_or(false) {
+        let _ = window.show();
+        let _ = window.set_focus();
+        xhs_core::login::debug_log("继续解析：切到网页窗口（可见模式，滚动加载中）");
     }
 
     // 滚到底 + 抽取：条数不再增长连续 3 轮即认为到底（参考 DYdown 的判定）
@@ -531,7 +537,8 @@ pub async fn probe_more(
     while rounds < 8 && !exhausted {
         rounds += 1;
         let _ = window.eval(SCROLL_BOTTOM_JS);
-        tokio::time::sleep(Duration::from_millis(1300)).await;
+        // 节奏放慢一点：滚太快容易触发小红书的风控（验证码）
+        tokio::time::sleep(Duration::from_millis(1800)).await;
         let Some(value) = extract_from_page(&window).await else {
             stale += 1;
             if stale >= 3 {
@@ -1155,11 +1162,16 @@ const SCROLL_BOTTOM_JS: &str = r#"(function () {
       try {
         var st = getComputedStyle(e);
         if ((st.overflowY === 'auto' || st.overflowY === 'scroll') && e.scrollHeight > e.clientHeight + 50) {
+          // 分两步滚：有些加载器只在"能看到底部"时才请求下一页
+          e.scrollTop = Math.max(0, e.scrollHeight - e.clientHeight - 400);
           e.scrollTop = e.scrollHeight - e.clientHeight;
+          try { e.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (x) {}
         }
       } catch (x) {}
     }
     try { window.scrollTo(0, (document.body || document.documentElement).scrollHeight); } catch (x) {}
+    // 无限列表常用 scroll 事件驱动加载，这里补一发
+    try { window.dispatchEvent(new Event('scroll', { bubbles: true })); } catch (x) {}
     // 只认文本明确的按钮，避免误点关注/收藏
     var btns = document.querySelectorAll('button, div[role="button"], span');
     for (var j = 0; j < btns.length; j++) {
@@ -1570,6 +1582,20 @@ async fn webview_fetch_inner(
         if let Some(e) = value.get("error").and_then(|v| v.as_str()) {
             xhs_core::login::debug_log(&format!("取数脚本异常：{e}"));
         }
+        // 风控验证码页：把网页窗口打开让用户过验证（滑块/验证码由真人完成）
+        if last_page.contains("/captcha") || last_page.contains("website-login") {
+            if !allow_login_window {
+                if let Some(win) = app.get_webview_window("xhs-work") {
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+            }
+            return Err(
+                "小红书要求完成安全验证：已为您打开网页窗口，请在页面里完成滑块/验证码，完成后回到解析页重试（建议同时登录账号，可减少验证频率）"
+                    .into(),
+            );
+        }
+
         // 明确的"要登录 / 不可见"页面：不用再等
         if last_page.contains("/login") || last_page.contains("/404") {
             let kind = if last_page.contains("/404") { "404/不可见" } else { "登录页" };
@@ -2511,6 +2537,16 @@ async fn login_selftest(app: tauri::AppHandle, settings: Settings, probe_url: St
                                     ));
                                     break;
                                 }
+                            }
+                        }
+                        // 滚完之后把页面提示文字打出来：区分"被登录墙挡住"与"确实到底"
+                        if let Ok(window) = ensure_work_window(&app, &settings).await {
+                            // 不用正则，避免 Rust 字符串里的反斜杠转义问题
+                            let _ = window.eval(
+                                "(function(){var t=document.body.innerText||'';t=t.split(String.fromCharCode(10)).join(' ').split('  ').join(' ');location.replace('#xhsdownselftest='+encodeURIComponent(t.slice(0,400)));})()",
+                            );
+                            if let Some(text) = read_selftest(&window).await {
+                                xhs_core::login::debug_log(&format!("自检·页尾提示：{text}"));
                             }
                         }
                     }
