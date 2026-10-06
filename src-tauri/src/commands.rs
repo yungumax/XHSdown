@@ -101,10 +101,15 @@ pub async fn app_status(
     // （验证 WebView2 里的二维码状态与保活脚本；平时不跑）
     let selftest_marker = settings.data_root().join("login_selftest");
     if selftest_marker.exists() {
+        // 标记文件的内容可以是"要额外探测的链接"（为空就只跑常规探测）
+        let probe_url = std::fs::read_to_string(&selftest_marker)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
         let _ = std::fs::remove_file(&selftest_marker);
         let app2 = app.clone();
         let settings2 = settings.clone();
-        tokio::spawn(async move { login_selftest(app2, settings2).await });
+        tokio::spawn(async move { login_selftest(app2, settings2, probe_url).await });
     }
 
     Ok(AppStatus {
@@ -193,6 +198,19 @@ fn quality_options(videos: &[(String, String)]) -> Vec<QualityOption> {
         QualityOption { value: "hd".into(), label: "高清".into(), available: has_hd, hint: if has_hd { String::new() } else { "该来源没有高清档".into() } },
         QualityOption { value: "sd".into(), label: "标清".into(), available: has_sd, hint: String::new() },
     ]
+}
+
+/// 主页地址：原链接带 token 就原样用（搜索来源的主页必须带），否则按 uid 拼裸链接。
+fn user_fetch_url(uid: &str, token: &Option<String>, url: &str) -> String {
+    if url.contains("/user/profile/") && url.contains("xsec_token=") {
+        return url.to_string();
+    }
+    match token {
+        Some(tok) if !tok.is_empty() => format!(
+            "https://www.xiaohongshu.com/user/profile/{uid}?xsec_token={tok}&xsec_source=pc_search"
+        ),
+        _ => format!("https://www.xiaohongshu.com/user/profile/{uid}"),
+    }
 }
 
 /// 笔记页地址：原链接已带 xsec_token 就原样用，否则把 token 补进查询串。
@@ -288,8 +306,9 @@ pub async fn probe_source(
             }
             Ok(probe)
         }
-        SourceTarget::User(uid) => {
-            let user = fetch_user(&app, &client, &uid).await?;
+        SourceTarget::User { uid, token, url } => {
+            let page_url = user_fetch_url(&uid, &token, &url);
+            let user = fetch_user(&app, &client, &uid, &page_url).await?;
             let entries: Vec<PostEntry> = user
                 .cards
                 .iter()
@@ -348,7 +367,7 @@ pub async fn probe_source(
                 items: probe.items.clone(),
                 exhausted,
             };
-            let key = input_key(SourceTarget::User(uid));
+            let key = format!("user:{uid}");
             state.cache_batch(key.clone(), cache.clone());
             if raw_input.trim() != key {
                 state.cache_batch(raw_input.trim().to_string(), cache);
@@ -361,7 +380,7 @@ pub async fn probe_source(
 fn input_key(target: SourceTarget) -> String {
     match target {
         SourceTarget::Note { id, .. } => format!("post:{id}"),
-        SourceTarget::User(uid) => format!("user:{uid}"),
+        SourceTarget::User { uid, .. } => format!("user:{uid}"),
     }
 }
 
@@ -1503,10 +1522,12 @@ async fn fetch_note(
 }
 
 /// 取一个用户主页：同样的两段式。
+/// `page_url` 必须带上原始链接里的 token（搜索来源的主页没它会被拒）。
 async fn fetch_user(
     app: &tauri::AppHandle,
     client: &XhsClient,
     uid: &str,
+    page_url: &str,
 ) -> Result<UserBundle, String> {
     if let Ok((info, notes)) = retry(1, || client.user_profile(uid)).await {
         let cards: Vec<CardBundle> = notes
@@ -1528,9 +1549,35 @@ async fn fetch_user(
         });
     }
     xhs_core::login::debug_log("主页：reqwest 路径失败，改用浏览器会话取数");
-    let url = format!("https://www.xiaohongshu.com/user/profile/{uid}");
-    let value = webview_fetch(app, &url).await?;
-    UserBundle::from_web(&value)
+    // 先按原链接（带 token）取；失败再试裸链接——token 有时会过期/失效，
+    // 而裸链接在登录态下多数也能打开（反之亦然）
+    let bare = format!("https://www.xiaohongshu.com/user/profile/{uid}");
+    let mut candidates: Vec<String> = Vec::new();
+    if !page_url.trim().is_empty() && page_url.contains("xsec_token=") {
+        candidates.push(page_url.to_string());
+    }
+    candidates.push(bare.clone());
+    if page_url.trim() != bare && !candidates.iter().any(|u| u == page_url) {
+        candidates.push(page_url.to_string());
+    }
+
+    let mut last_err = String::from("主页取数失败");
+    for (index, url) in candidates.iter().enumerate() {
+        match webview_fetch(app, url).await {
+            Ok(value) => {
+                if let Ok(bundle) = UserBundle::from_web(&value) {
+                    return Ok(bundle);
+                }
+            }
+            Err(e) => {
+                last_err = e.clone();
+                if index + 1 < candidates.len() {
+                    xhs_core::login::debug_log(&format!("主页取数失败（{e}），换一种链接重试"));
+                }
+            }
+        }
+    }
+    Err(last_err)
 }
 
 fn https(url: &str) -> String {
@@ -1753,7 +1800,7 @@ const PAGE_SNAPSHOT_JS: &str = r#"(function () {
 
 /// 登录页自检：隐藏窗口打开官方登录页，探测「二维码状态 + 保活脚本是否生效」并写日志。
 /// 由数据目录里的 login_selftest 标记文件触发（平时不跑），用于远程诊断。
-async fn login_selftest(app: tauri::AppHandle, settings: Settings) {
+async fn login_selftest(app: tauri::AppHandle, settings: Settings, probe_url: String) {
     // 探针一：登录页（二维码状态）
     let dir = crate::state::webview_dir(&settings);
     let _ = std::fs::create_dir_all(&dir);
@@ -1813,6 +1860,44 @@ async fn login_selftest(app: tauri::AppHandle, settings: Settings) {
                 "自检·转储[{url}]：{}",
                 dump.unwrap_or_else(|| "未取到".into())
             ));
+        }
+    }
+
+    // 探针四：指定链接（标记文件里给的那条），走真实解析路径
+    if !probe_url.is_empty() {
+        let client = app.state::<AppState>().client();
+        match parse_input(&probe_url) {
+            Ok(SourceTarget::User { uid, token, url }) => {
+                let page_url = user_fetch_url(&uid, &token, &url);
+                xhs_core::login::debug_log(&format!(
+                    "自检·主页链接：uid={uid} 带token={} 取数地址={page_url}",
+                    token.is_some()
+                ));
+                match fetch_user(&app, &client, &uid, &page_url).await {
+                    Ok(user) => xhs_core::login::debug_log(&format!(
+                        "自检·主页结果：昵称={:?} uid={:?} 笔记={} 总数={}",
+                        user.nickname,
+                        user.uid,
+                        user.cards.len(),
+                        user.notes_count
+                    )),
+                    Err(e) => xhs_core::login::debug_log(&format!("自检·主页失败：{e}")),
+                }
+            }
+            Ok(SourceTarget::Note { id, token, url }) => {
+                let fetch_url = note_fetch_url(&id, &token, &url);
+                xhs_core::login::debug_log(&format!("自检·笔记链接：{id} 带token={}", token.is_some()));
+                match fetch_note(&app, &client, &fetch_url, 1).await {
+                    Ok(note) => xhs_core::login::debug_log(&format!(
+                        "自检·笔记结果：标题={:?} 图={} 视频档={:?}",
+                        note.title,
+                        note.pics.len(),
+                        note.videos.iter().map(|(l, _)| l.clone()).collect::<Vec<_>>()
+                    )),
+                    Err(e) => xhs_core::login::debug_log(&format!("自检·笔记失败：{e}")),
+                }
+            }
+            Err(e) => xhs_core::login::debug_log(&format!("自检·链接无法识别：{e}")),
         }
     }
 
@@ -2195,7 +2280,8 @@ pub async fn library_folders(
             .ok_or_else(|| "读取我的笔记需要先登录".to_string())?
     };
 
-    let user = fetch_user(&app, &client, &uid).await?;
+    // 自己的主页用 /user/profile/me：它不需要 token（别人的主页才需要）
+    let user = fetch_user(&app, &client, &uid, "https://www.xiaohongshu.com/user/profile/me").await?;
     let created: Vec<FavItem> = user
         .cards
         .iter()
@@ -2409,7 +2495,7 @@ pub async fn rename_downloaded(
 ) -> Result<RenamePlan, String> {
     let settings = state.settings_snapshot();
     let key = match parse_input(&input) {
-        Ok(SourceTarget::User(uid)) => format!("user:{uid}"),
+        Ok(SourceTarget::User { uid, .. }) => format!("user:{uid}"),
         _ => input.trim().to_string(),
     };
     let cache = {

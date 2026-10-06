@@ -13,7 +13,14 @@ pub enum SourceTarget {
     /// 单条笔记（id = 24 位十六进制；token = xsec_token，详情页多数情况必需）
     Note { id: String, token: Option<String>, url: String },
     /// 用户主页（uid = 24 位十六进制）
-    User(String),
+    ///
+    /// token / url：从搜索结果复制来的主页链接带 `xsec_token`，**必须带上**，
+    /// 否则小红书会拒绝该主页（实测：丢了 token 就解析失败）。
+    User {
+        uid: String,
+        token: Option<String>,
+        url: String,
+    },
 }
 
 /// 解析一行输入。支持：
@@ -61,7 +68,11 @@ pub fn parse_input(input: &str) -> Result<SourceTarget> {
     if let Some(i) = segments.iter().position(|s| *s == "profile") {
         if let Some(uid) = segments.get(i + 1) {
             if is_xhs && looks_like_id(uid) {
-                return Ok(SourceTarget::User(uid.to_string()));
+                return Ok(SourceTarget::User {
+                    uid: uid.to_string(),
+                    token: token.clone(),
+                    url: candidate.to_string(),
+                });
             }
         }
     }
@@ -153,10 +164,26 @@ mod tests {
             }
             other => panic!("应为 Note，实际 {other:?}"),
         }
-        assert_eq!(
-            parse_input("https://www.xiaohongshu.com/user/profile/58c8014a6a6a690dbb0c84c1").unwrap(),
-            SourceTarget::User("58c8014a6a6a690dbb0c84c1".into())
-        );
+        match parse_input("https://www.xiaohongshu.com/user/profile/58c8014a6a6a690dbb0c84c1").unwrap() {
+            SourceTarget::User { uid, token, .. } => {
+                assert_eq!(uid, "58c8014a6a6a690dbb0c84c1");
+                assert!(token.is_none());
+            }
+            other => panic!("应为 User，实际 {other:?}"),
+        }
+        // 带 token 的主页链接：token 必须保留（搜索来源的主页没它会被拒）
+        match parse_input(
+            "https://www.xiaohongshu.com/user/profile/66f3c481000000001c002a76?xsec_token=ABQkKpAAA2GD&xsec_source=pc_search",
+        )
+        .unwrap()
+        {
+            SourceTarget::User { uid, token, url } => {
+                assert_eq!(uid, "66f3c481000000001c002a76");
+                assert_eq!(token.as_deref(), Some("ABQkKpAAA2GD"));
+                assert!(url.contains("xsec_token="));
+            }
+            other => panic!("应为 User，实际 {other:?}"),
+        }
     }
 
     #[test]
