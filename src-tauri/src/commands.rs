@@ -2471,6 +2471,86 @@ pub async fn web_login_open(app: tauri::AppHandle, state: State<'_, AppState>) -
     Ok(())
 }
 
+/// 地址栏状态：当前网页地址 + 窗口是否可见（主界面的网页工具栏据此显示）
+#[tauri::command]
+pub fn web_bar_state(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+    let window = app.get_webview_window("xhs-work");
+    let visible = window
+        .as_ref()
+        .map(|w| w.is_visible().unwrap_or(false))
+        .unwrap_or(false);
+    let url = window
+        .and_then(|w| w.url().ok())
+        .map(|u| u.to_string().split('#').next().unwrap_or("").to_string())
+        .unwrap_or_default();
+    Ok(serde_json::json!({ "url": url, "visible": visible }))
+}
+
+/// 地址栏：跳转（只允许 http/https）
+#[tauri::command]
+pub fn web_bar_go(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+        return Err("只支持 http/https 地址".into());
+    }
+    let window = app
+        .get_webview_window("xhs-work")
+        .ok_or_else(|| "网页窗口不存在".to_string())?;
+    let parsed: tauri::Url = trimmed.parse().map_err(|e| format!("地址无效：{e}"))?;
+    window.navigate(parsed).map_err(err)?;
+    Ok(())
+}
+
+/// 地址栏：后退 / 前进 / 刷新（在网页里执行对应脚本）
+#[tauri::command]
+pub fn web_bar_cmd(app: tauri::AppHandle, cmd: String) -> Result<(), String> {
+    let window = app
+        .get_webview_window("xhs-work")
+        .ok_or_else(|| "网页窗口不存在".to_string())?;
+    let script = match cmd.as_str() {
+        "back" => "history.back()",
+        "forward" => "history.forward()",
+        "reload" => "location.reload()",
+        other => return Err(format!("不认识的指令：{other}")),
+    };
+    window.eval(script).map_err(err)?;
+    Ok(())
+}
+
+/// 地址栏：收起网页窗口
+#[tauri::command]
+pub fn web_bar_hide(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(window) = app.get_webview_window("xhs-work") {
+        let _ = window.hide();
+    }
+    Ok(())
+}
+
+/// 网页窗口显示期间，把当前地址同步到窗口标题（用户一眼看到自己在哪一页）。
+/// 用后端定时器：界面窗口被遮挡时前端定时器会被降频，后端不受影响。
+fn spawn_title_sync(app: tauri::AppHandle) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let Some(window) = app.get_webview_window("xhs-work") else {
+                break;
+            };
+            if !window.is_visible().unwrap_or(false) {
+                break;
+            }
+            if let Ok(url) = window.url() {
+                let text = url.to_string().split('#').next().unwrap_or("").to_string();
+                let title = if text.is_empty() {
+                    "小红书（网页）".to_string()
+                } else {
+                    format!("小红书（网页）— {}", xhs_core::error::truncate(&text, 120))
+                };
+                let _ = window.set_title(&title);
+            }
+        }
+    });
+}
+
 /// 打开网页窗口：登录了就开当前账号的主页，没登录就开推荐流。
 /// 用途：在软件里直接看/复制链接（分享出来的链接 token 才是新鲜的）。
 #[tauri::command]
@@ -2490,6 +2570,8 @@ pub async fn open_web_home(app: tauri::AppHandle, state: State<'_, AppState>) ->
     let _ = window.center();
     let _ = window.show();
     let _ = window.set_focus();
+    // 显示期间把当前地址同步到窗口标题（后端定时器，不受界面降频影响）
+    spawn_title_sync(app.clone());
     Ok(())
 }
 

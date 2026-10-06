@@ -218,6 +218,34 @@ export async function onLoginConfirmed(handler) {
   return listen("login://confirmed", (event) => handler(event.payload));
 }
 
+/** 网页工具栏：当前网页地址与可见状态 */
+export async function webBarState() {
+  if (!hasTauri) return { url: "", visible: false };
+  return invokeZh("web_bar_state");
+}
+
+/** 网页工具栏：跳转 / 后退前进刷新 / 收起 */
+export async function webBarGo(url) {
+  if (!hasTauri) return;
+  return invokeZh("web_bar_go", { url });
+}
+
+export async function webBarCmd(cmd) {
+  if (!hasTauri) return;
+  return invokeZh("web_bar_cmd", { cmd });
+}
+
+export async function webBarHide() {
+  if (!hasTauri) return;
+  return invokeZh("web_bar_hide");
+}
+
+/** WEB 地址栏点「解析」：把当前网页地址送到解析页 */
+export async function onWebToParse(handler) {
+  if (!hasTauri) return () => {};
+  return listen("web://to-parse", (event) => handler(event.payload?.url || ""));
+}
+
 /** 打开网页窗口：登录了就开当前账号主页，没登录就开推荐流 */
 export async function openWebHome() {
   if (!hasTauri) return;

@@ -51,8 +51,69 @@ const settings = ref(null);
 const settingsEnv = ref(null);
 const showOnboarding = ref(false);
 
+/** 网页工具栏：WEB 窗口的地址与可见性（每 1.5 秒同步一次） */
+const webBar = ref({ url: "", visible: false });
+const webDraft = ref("");
+let webEditing = false;
+let webBarTimer = null;
+
+async function pollWebBar() {
+  try {
+    const state = await api.webBarState();
+    webBar.value.visible = !!state?.visible;
+    if (!webEditing) {
+      webBar.value.url = state?.url || "";
+      webDraft.value = state?.url || "";
+    }
+  } catch {
+    // 忽略：窗口可能正在关闭
+  }
+}
+
+async function webCmd(cmd) {
+  try {
+    await api.webBarCmd(cmd);
+  } catch (error) {
+    showToast(String(error));
+  }
+}
+
+async function webGo() {
+  webEditing = false;
+  try {
+    await api.webBarGo(webDraft.value.trim());
+  } catch (error) {
+    showToast(String(error));
+  }
+}
+
+async function webCopy() {
+  try {
+    await navigator.clipboard.writeText(webBar.value.url || webDraft.value);
+    showToast("已复制当前网页地址");
+  } catch {
+    showToast("复制失败，请手动选中复制");
+  }
+}
+
+async function webToParse() {
+  const url = webBar.value.url || webDraft.value;
+  if (!url) return;
+  openSource(url);
+}
+
+async function webHide() {
+  try {
+    await api.webBarHide();
+    webBar.value.visible = false;
+  } catch (error) {
+    showToast(String(error));
+  }
+}
+
 let unlistenTask = null;
 let unlistenLogin = null;
+let unlistenFromWeb = null;
 let toastTimer = null;
 
 const queue = computed(() => {
@@ -115,6 +176,9 @@ onMounted(async () => {
       .catch(() => {});
   }
 
+  await pollWebBar();
+  webBarTimer = setInterval(pollWebBar, 1500);
+
   unlistenTask = await api.onTaskUpdate((task) => {
     const index = tasks.value.findIndex((item) => item.id === task.id);
     if (index === -1) tasks.value.unshift(task);
@@ -126,11 +190,18 @@ onMounted(async () => {
   unlistenLogin = await api.onLoginConfirmed((info) => {
     onWebConfirmed(info);
   });
+
+  // WEB 地址栏的「解析」按钮：把当前地址送到解析页
+  unlistenFromWeb = await api.onWebToParse((url) => {
+    if (url) openSource(url);
+  });
 });
 
 onUnmounted(() => {
+  if (webBarTimer) clearInterval(webBarTimer);
   if (unlistenTask) unlistenTask();
   if (unlistenLogin) unlistenLogin();
+  if (unlistenFromWeb) unlistenFromWeb();
   clearTimeout(toastTimer);
 });
 
@@ -373,6 +444,25 @@ async function doLogout() {
       @web="openWeb"
     />
 
+    <!-- 网页工具栏：WEB 窗口可见时出现（地址实时同步，可复制/直接送解析） -->
+    <div v-if="webBar.visible" class="web-bar">
+      <button class="wb-btn" title="后退" @click="webCmd('back')">◀</button>
+      <button class="wb-btn" title="前进" @click="webCmd('forward')">▶</button>
+      <button class="wb-btn" title="刷新" @click="webCmd('reload')">⟳</button>
+      <input
+        v-model="webDraft"
+        class="wb-url"
+        spellcheck="false"
+        placeholder="小红书网页地址（回车跳转）"
+        @focus="webEditing = true"
+        @blur="webEditing = false"
+        @keydown.enter="webGo"
+      />
+      <button class="wb-btn wide" title="复制当前地址" @click="webCopy">复制</button>
+      <button class="wb-btn wide" title="把当前地址送到解析页" @click="webToParse">解析</button>
+      <button class="wb-btn wide" title="收起网页窗口" @click="webHide">收起</button>
+    </div>
+
     <div class="body">
       <Sidebar
         :current="page"
@@ -469,6 +559,57 @@ async function doLogout() {
   min-width: 0;
   overflow-y: auto;
   padding: 18px 22px 22px;
+}
+
+.web-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 12px;
+  background: var(--raised);
+  border-bottom: 1px solid var(--line);
+}
+
+.wb-btn {
+  flex: none;
+  height: 24px;
+  min-width: 28px;
+  padding: 0 8px;
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--field);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+
+.wb-btn:hover {
+  color: var(--accent);
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+
+.wb-btn.wide {
+  min-width: 44px;
+}
+
+.wb-url {
+  flex: 1;
+  min-width: 0;
+  height: 24px;
+  padding: 0 10px;
+  font-size: 12.5px;
+  color: var(--text);
+  background: var(--field);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+}
+
+.wb-url:focus {
+  outline: none;
+  border-color: var(--accent-line);
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
 .toast {
