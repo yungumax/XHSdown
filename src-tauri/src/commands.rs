@@ -3167,6 +3167,14 @@ fn spawn_page_bar(app: tauri::AppHandle) {
             }
             if stale >= 3 {
                 collecting = false;
+                // 把页面尾部提示记下来：区分"站点说没有更多了"与"被登录墙/风控挡住"
+                let _ = window.eval(
+                    "(function(){var t=document.body.innerText||'';t=t.split(String.fromCharCode(10)).join(' ');var tail=t.slice(-260);location.replace('#xhsdownselftest='+encodeURIComponent(tail));})()",
+                );
+                if let Some(tail) = read_selftest(&window).await {
+                    xhs_core::login::debug_log(&format!("网页收集：页面尾部提示 = {tail}"));
+                }
+                let _ = window.eval("history.replaceState(null,'',location.pathname+location.search)");
                 emit_done(&app, &collected, true);
                 continue;
             }
