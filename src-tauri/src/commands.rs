@@ -2293,31 +2293,63 @@ async fn fetch_note(
         "笔记取数：id={id} token 长度={}",
         token.len()
     ));
+    // 批量下载降速：两条笔记之间至少隔 3 秒。猛拉详情是最容易触发风控的动作，
+    // 降速换来的时间远比"全批被挡、等五分钟冷却"划算。
+    // 注意：锁必须在 await 之前放掉（MutexGuard 不能跨 await，否则 future 不是 Send）
+    let pace_wait = {
+        const NOTE_MIN_INTERVAL: Duration = Duration::from_secs(3);
+        let state = app.state::<AppState>();
+        let mut last = state.last_note_fetch.lock().unwrap();
+        let wait = match *last {
+            Some(at) => NOTE_MIN_INTERVAL.saturating_sub(at.elapsed()),
+            None => Duration::ZERO,
+        };
+        *last = Some(std::time::Instant::now() + wait);
+        wait
+    };
+    if !pace_wait.is_zero() {
+        tokio::time::sleep(pace_wait).await;
+    }
+
     let candidates = note_url_candidates(url);
     let mut last_err = String::from("笔记取数失败");
-    for (index, cand) in candidates.iter().enumerate() {
-        match webview_fetch(app, cand).await {
-            Ok(value) => match NoteBundle::from_web(&value) {
-                Ok(bundle) => {
-                    note_block_mark(app, false);
-                    return Ok(bundle);
-                }
-                Err(e) => last_err = e,
-            },
-            Err(e) => last_err = e,
+    // 最多两轮：被风控挡下时等 30 秒再试一次（短时限流常常自己就过去了）；
+    // 仍被挡就记一笔熔断，交给闸门去停手
+    for round in 0..2 {
+        if round > 0 {
+            xhs_core::login::debug_log("笔记取数被风控挡下：等 30 秒再试一次");
+            tokio::time::sleep(Duration::from_secs(30)).await;
         }
-        // 风控挡下：换形态也没用（实测六种形态全被弹回），立即停手并记一笔熔断
-        if last_err.contains(NOTE_BLOCK_HINT) {
-            note_block_mark(app, true);
+        let mut blocked = false;
+        for (index, cand) in candidates.iter().enumerate() {
+            match webview_fetch(app, cand).await {
+                Ok(value) => match NoteBundle::from_web(&value) {
+                    Ok(bundle) => {
+                        note_block_mark(app, false);
+                        return Ok(bundle);
+                    }
+                    Err(e) => last_err = e,
+                },
+                Err(e) => last_err = e,
+            }
+            // 风控挡下：换形态也没用（实测六种形态全被弹回），本轮到此为止
+            if last_err.contains(NOTE_BLOCK_HINT) {
+                blocked = true;
+                break;
+            }
+            if index + 1 < candidates.len() {
+                xhs_core::login::debug_log(&format!(
+                    "笔记取数候选 {} 失败（{last_err}），换下一个地址形态",
+                    index + 1
+                ));
+            }
+        }
+        if !blocked {
+            // 不是风控（链接本身的问题）：没有必要等 30 秒再试一遍
             return Err(last_err);
         }
-        if index + 1 < candidates.len() {
-            xhs_core::login::debug_log(&format!(
-                "笔记取数候选 {} 失败（{last_err}），换下一个地址形态",
-                index + 1
-            ));
-        }
     }
+    note_block_mark(app, true);
     Err(last_err)
 }
 

@@ -221,6 +221,8 @@ pub struct AppState {
     /// 笔记详情的风控熔断器：(最近一次被挡的时间, 连续被挡次数)。
     /// 被站点定向限流时逐条硬试只会越撞越黑：连挡两条就停手并给用户明确提示。
     pub note_block: Mutex<(std::time::Instant, u32)>,
+    /// 上一次笔记取数的时间：批量下载按最小间隔降速（猛拉详情最容易触发风控）
+    pub last_note_fetch: Mutex<Option<std::time::Instant>>,
     /// 登录窗刚打开时的浏览器 Cookie 指纹：轮询时先比指纹，
     /// 没变化就不去请求主页（省请求、也少触发风控）
     pub login_cookie_baseline: Mutex<Option<String>>,
@@ -277,6 +279,7 @@ impl AppState {
                 std::time::Instant::now() - std::time::Duration::from_secs(3600),
                 0,
             )),
+            last_note_fetch: Mutex::new(None),
             login_cookie_baseline: Mutex::new(None),
             last_login_check: Mutex::new(None),
             login_watch_running: AtomicBool::new(false),
