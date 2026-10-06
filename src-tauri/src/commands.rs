@@ -861,8 +861,8 @@ async fn run_task(app: tauri::AppHandle, req: DownloadReq, id: String) {
             task.message = "下载图片".into();
         }
         for (index, pic) in note.pics.iter().enumerate() {
-            let url = dl::image_variant(pic, &image_spec);
-            let ext = url_ext(&url);
+            let candidates = dl::image_candidates(pic, &image_spec);
+            let ext = candidates.first().map(|u| url_ext(u)).unwrap_or_else(|| "jpg".into());
             let name = if pic_total == 1 { prefix.clone() } else { format!("{prefix}-{}", index + 1) };
             let dest = final_path(&name, &ext);
 
@@ -906,32 +906,80 @@ async fn run_task(app: tauri::AppHandle, req: DownloadReq, id: String) {
                 return;
             }
             // 图片也走断点续传：暂停能在一个分块内停下（普通下载不检查旗标，
-            // 会出现「UI 已暂停、底层还在下」），中止也不会留下半个损坏的图片文件
-            match dl::download_resumable(&client.http, &url, &dest, &opts, progress, Some(pause.clone())).await
-            {
-                Ok(dl::DownloadEnd::Completed(size)) => {
-                    downloaded_total += size;
-                    if primary.is_none() {
-                        primary = Some(dest.clone());
-                    }
-                }
-                Ok(dl::DownloadEnd::Paused(size)) => {
+            // 会出现「UI 已暂停、底层还在下」），中止也不会留下半个损坏的图片文件。
+            // 候选逐个试：某些变体在 CDN 上是死的（403），换同图的另一个变体即可
+            let mut last_err = String::from("没有可用的图片地址");
+            let mut saved = false;
+            for (cand_index, url) in candidates.iter().enumerate() {
+                if flag_set(&pause) {
                     let task = {
                         let mut task = snapshot.lock().unwrap();
                         task.status = "paused".into();
                         task.message = "已暂停".into();
-                        task.downloaded = downloaded_total + size;
+                        task.downloaded = downloaded_total;
                         task.speed_bps = 0.0;
                         task.clone()
                     };
                     emit_task(&app, &task);
                     return;
                 }
-                Err(e) => {
-                    let _ = tokio::fs::remove_file(&dest).await;
-                    done("failed", &format!("图片下载失败：{e}"), "");
-                    return;
+                match dl::download_resumable(
+                    &client.http,
+                    url,
+                    &dest,
+                    &opts,
+                    progress.clone(),
+                    Some(pause.clone()),
+                )
+                .await
+                {
+                    Ok(dl::DownloadEnd::Completed(size)) => {
+                        downloaded_total += size;
+                        if primary.is_none() {
+                            primary = Some(dest.clone());
+                        }
+                        saved = true;
+                        break;
+                    }
+                    Ok(dl::DownloadEnd::Paused(size)) => {
+                        let task = {
+                            let mut task = snapshot.lock().unwrap();
+                            task.status = "paused".into();
+                            task.message = "已暂停".into();
+                            task.downloaded = downloaded_total + size;
+                            task.speed_bps = 0.0;
+                            task.clone()
+                        };
+                        emit_task(&app, &task);
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = tokio::fs::remove_file(&dest).await;
+                        last_err = format!("{e}");
+                        if cand_index + 1 < candidates.len() {
+                            xhs_core::login::debug_log(&format!(
+                                "图片第 {} 张的候选 {} 失败（{last_err}），换下一个变体：{}",
+                                index + 1,
+                                cand_index + 1,
+                                xhs_core::error::truncate(url, 120)
+                            ));
+                        }
+                    }
                 }
+            }
+            if !saved {
+                // 全部候选都失败：把真正试过的地址记进日志，便于复盘
+                xhs_core::login::debug_log(&format!(
+                    "图片下载失败（已试 {} 个变体）：{}",
+                    candidates.len(),
+                    candidates
+                        .iter()
+                        .map(|u| xhs_core::error::truncate(u, 160))
+                        .collect::<Vec<_>>()
+                        .join(" | ")
+                ));
+                done("failed", &format!("图片下载失败：{last_err}"), "");
+                return;
             }
         }
         {
@@ -1106,6 +1154,16 @@ fn pick_video(videos: &[(String, String)], quality: &str) -> (String, String) {
 
 fn url_ext(url: &str) -> String {
     let path = url.split(['?', '#']).next().unwrap_or(url);
+    // CDN 变体把格式写在 `!规格` 里（如 `!nc_n_webp_mw_1`），路径上没有扩展名；
+    // 不解析这一层就只能一律存成 .jpg —— 实际内容是 webp（实测）
+    if let Some((_, suffix)) = path.rsplit_once('!') {
+        let low = suffix.to_ascii_lowercase();
+        for ext in ["avif", "webp", "heic", "png", "jpeg", "jpg"] {
+            if low.contains(ext) {
+                return ext.to_string();
+            }
+        }
+    }
     match path.rsplit_once('.') {
         Some((_, ext)) if ext.len() <= 5 => ext.to_ascii_lowercase(),
         _ => "jpg".to_string(),
@@ -1381,18 +1439,29 @@ const EXTRACT_JS: &str = r#"(function () {
       var list = arr(note.imageList);
       for (var i = 0; i < list.length && i < 80; i++) {
         var pic = unwrap(list[i]) || {};
-        var best = '';
+        // 每张图给一串候选（首选在前）：实测同图的不同变体有的在 CDN 上是死的
+        // （视频封面 `!nc_n_webp_mw` 403、它的 `_1` 版本正常），只发一个地址会整条失败
+        var alts = [];
+        var addAlt = function (u) {
+          u = str(u);
+          if (u && alts.indexOf(u) < 0) alts.push(u);
+        };
         var infos = arr(pic.infoList);
+        var scenes = [];
         for (var j = 0; j < infos.length; j++) {
           var infoItem = unwrap(infos[j]) || {};
-          if (infoItem.imageScene === 'WB_DFT' && infoItem.url) {
-            best = infoItem.url;
-            break;
-          }
+          if (!infoItem.url) continue;
+          scenes.push({ scene: String(infoItem.imageScene || ''), url: String(infoItem.url) });
         }
-        if (!best && infos.length) best = str(infos[0]);
-        if (!best) best = str(pic.urlDefault) || str(pic.urlPre);
-        if (best) pics.push(best);
+        // WB_DFT（尺寸最大）优先，其次 WB_PRV，其余变体垫后
+        scenes.sort(function (a, b) {
+          var rank = function (s) { return s === 'WB_DFT' ? 0 : (s === 'WB_PRV' ? 1 : 2); };
+          return rank(a.scene) - rank(b.scene);
+        });
+        for (var j = 0; j < scenes.length; j++) addAlt(scenes[j].url);
+        addAlt(pic.urlDefault);
+        addAlt(pic.urlPre);
+        if (alts.length) pics.push(alts);
       }
       var videos = [];
       var video = unwrap(note.video) || {};
@@ -1588,6 +1657,34 @@ async fn webview_fetch(app: &tauri::AppHandle, url: &str) -> Result<serde_json::
     webview_fetch_inner(app, url, false).await
 }
 
+/// 取数地址 → 期望的页面类型（与抽取脚本上报的 kind 一一对应）。
+/// 空串 = 不限类型（不认识的地址就不拦）。
+fn expected_page_kind(url: &str) -> &'static str {
+    let path = url.split('?').next().unwrap_or(url);
+    if path.contains("/search_result") || path.contains("/search/") {
+        return "search";
+    }
+    if path.contains("/user/profile/") {
+        return "user";
+    }
+    if let Some(idx) = path
+        .find("/explore/")
+        .or_else(|| path.find("/discovery/item/"))
+    {
+        let tail = path[idx..].trim_end_matches('/').rsplit('/').next().unwrap_or("");
+        // /explore/{id} 才是笔记页；裸 /explore 是推荐流
+        return if tail.len() >= 20 && tail.chars().all(|c| c.is_ascii_alphanumeric()) {
+            "note"
+        } else {
+            "feed"
+        };
+    }
+    if path.trim_end_matches('/').ends_with("/explore") {
+        return "feed";
+    }
+    ""
+}
+
 /// `allow_login_window`：登录流程自己要借这个窗口读资料，那时不能拦。
 async fn webview_fetch_inner(
     app: &tauri::AppHandle,
@@ -1614,8 +1711,14 @@ async fn webview_fetch_inner(
     let parsed: tauri::Url = url.parse().map_err(|e| format!("地址无效：{e}"))?;
     window.navigate(parsed).map_err(err)?;
 
+    // 这次要的是哪类页面：轮询时只有同类型的 ready 才算数。
+    // 不校验就会读到**上一个页面**的 ready —— 实测取笔记时导航还没落地，
+    // 抽取先把用户主页读成 ready（kind=user），装进 NoteBundle 就成了
+    // "页面里没有笔记数据（可能已被删除或仅自己可见）"
+    let expect = expected_page_kind(url);
     let started = std::time::Instant::now();
     let mut last_page = String::new();
+    let mut stale_kind_logged = false;
     while started.elapsed() < Duration::from_secs(30) {
         tokio::time::sleep(Duration::from_millis(700)).await;
         let Some(value) = extract_from_page(&window).await else { continue };
@@ -1624,7 +1727,16 @@ async fn webview_fetch_inner(
             last_page = page.split('#').next().unwrap_or(page).to_string();
         }
         if value.get("ready").and_then(|v| v.as_bool()).unwrap_or(false) {
-            return Ok(value);
+            let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+            if expect.is_empty() || kind == expect {
+                return Ok(value);
+            }
+            if !stale_kind_logged {
+                stale_kind_logged = true;
+                xhs_core::login::debug_log(&format!(
+                    "取数：读到的还是上一个页面（要 {expect}，读到 {kind}），继续等导航落地"
+                ));
+            }
         }
         if let Some(e) = value.get("error").and_then(|v| v.as_str()) {
             xhs_core::login::debug_log(&format!("取数脚本异常：{e}"));
@@ -1878,7 +1990,8 @@ struct NoteBundle {
     created_at: i64,
     user_id: String,
     nickname: String,
-    pics: Vec<String>,
+    /// 每张图一条候选链（首选在前，下载失败可回退到同图其它变体）
+    pics: Vec<Vec<String>>,
     videos: Vec<(String, String)>,
     duration: i64,
 }
@@ -1893,13 +2006,26 @@ impl NoteBundle {
         if note_id.is_empty() {
             return Err("页面里没有笔记数据（可能已被删除或仅自己可见）".into());
         }
-        let mut pics = Vec::new();
+        let mut pics: Vec<Vec<String>> = Vec::new();
         if let Some(arr) = value.get("images").and_then(|v| v.as_array()) {
             for item in arr {
-                if let Some(url) = item.as_str() {
-                    if !url.is_empty() {
-                        pics.push(https(url));
+                // 新格式：每个元素是同图的候选链（首选在前）；旧格式：单个字符串
+                let mut alts: Vec<String> = Vec::new();
+                match item {
+                    serde_json::Value::Array(list) => {
+                        for u in list {
+                            if let Some(s) = u.as_str() {
+                                if !s.is_empty() {
+                                    alts.push(https(s));
+                                }
+                            }
+                        }
                     }
+                    serde_json::Value::String(s) if !s.is_empty() => alts.push(https(s)),
+                    _ => {}
+                }
+                if !alts.is_empty() {
+                    pics.push(alts);
                 }
             }
         }

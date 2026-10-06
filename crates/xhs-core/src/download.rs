@@ -122,18 +122,22 @@ fn spawn_reporter(
     })
 }
 
-/// 按图片规格调整地址：large 去掉 CDN 的 `!规格` 后缀取原图，thumbnail 保留压缩图。
-/// 小红书图片直链形如 `…/1040g…!nd_dft_wlteh-webp_3`，`!` 后面是缩放/格式指令；
-/// 去掉后缀即原图（与网页"下载原图"一致）。
-pub fn image_variant(url: &str, spec: &str) -> String {
+/// 一张图的下载候选链（首选在前，失败按序回退）。
+///
+/// 为什么不再"取原图就剥掉 `!规格` 后缀"：这些直链**必须带后缀**——实测同一张图
+/// 剥掉后缀（`…!nc_n_webp_mw_1` → `…`）一律 403，后缀与路径里的签名是绑定的。
+/// 所以"原图"= 直接用抽取时的首选直链（抽取端已按 WB_DFT → WB_PRV 排好），
+/// "压缩图"= 把带 prv 的变体提前，地址本身照原样发。
+///
+/// 候选链还挡住另一类实测故障：同图的不同变体有的在 CDN 上是死的（如视频封面
+/// `!nc_n_webp_mw` 403，而它的 `_1` 版本正常），只发一个地址会让整条任务失败。
+pub fn image_candidates(pic: &[String], spec: &str) -> Vec<String> {
+    let mut list: Vec<String> = pic.iter().filter(|u| !u.is_empty()).cloned().collect();
+    list.dedup();
     if spec == "thumbnail" {
-        return url.to_string();
+        list.sort_by_key(|u| if u.contains("prv") { 0 } else { 1 });
     }
-    match url.rsplit_once('!') {
-        // 只有 `!` 出现在路径段里才算规格指令（query 里不会有）
-        Some((base, suffix)) if !suffix.contains('/') && !suffix.contains('?') => base.to_string(),
-        _ => url.to_string(),
-    }
+    list
 }
 
 /// 下载结束形态：完整落盘，或因暂停而中止（进度保留在 .part，等待续传）。
@@ -297,15 +301,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn image_variant_strips_scale_directive() {
-        let url = "https://sns-webpic-qc.xhscdn.com/202510/1040g00831abc!nd_dft_wlteh-webp_3";
-        assert_eq!(
-            image_variant(url, "large"),
-            "https://sns-webpic-qc.xhscdn.com/202510/1040g00831abc"
-        );
-        assert_eq!(image_variant(url, "thumbnail"), url);
-        // 无规格指令的地址原样返回
-        let plain = "https://sns-webpic-qc.xhscdn.com/202510/1040g00831abc.jpg";
-        assert_eq!(image_variant(plain, "large"), plain);
+    fn image_candidates_never_strip_the_cdn_suffix() {
+        let dft = "https://sns-webpic-qc.xhscdn.com/202610061950/1e2f/spectrum/1040g0k!nc_n_webp_mw_1".to_string();
+        let prv = "https://sns-webpic-qc.xhscdn.com/202610061950/68e8/spectrum/1040g0k!nc_n_webp_prv_1".to_string();
+        let pic = vec![dft.clone(), prv.clone()];
+
+        // 原图档：首选在前，且**不许剥掉 !后缀**（剥了一律 403，实测）
+        let large = image_candidates(&pic, "large");
+        assert_eq!(large, vec![dft.clone(), prv.clone()]);
+        assert!(large.iter().all(|u| u.contains('!')));
+
+        // 压缩图档：带 prv 的变体提前，地址本身原样
+        let thumb = image_candidates(&pic, "thumbnail");
+        assert_eq!(thumb.first().map(String::as_str), Some(prv.as_str()));
+        assert_eq!(thumb.len(), 2);
+
+        // 空串过滤 + 去重
+        let messy = vec!["".to_string(), dft.clone(), dft.clone()];
+        assert_eq!(image_candidates(&messy, "large"), vec![dft]);
     }
 }
