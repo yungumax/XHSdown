@@ -78,7 +78,8 @@ pub async fn app_status(
     // 登录态：让浏览器读一次「我的主页」——登录态存在浏览器数据目录里，
     // 所以跨重启也能恢复。超时或失败一律当未登录，不卡界面。
     let mut login = LoginInfo::default();
-    let check = tokio::time::timeout(Duration::from_secs(25), browser_login_check(&app)).await;
+    // 给足 40 秒：页面加载慢时（风控/网络）也能等到结果，不要提前放弃
+    let check = tokio::time::timeout(Duration::from_secs(40), browser_login_check(&app)).await;
     match check {
         Ok(Ok(Some((uid, name, avatar)))) => {
             let client = state.client();
