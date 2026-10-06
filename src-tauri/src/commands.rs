@@ -338,7 +338,8 @@ pub async fn probe_source(
                 .collect();
             let exhausted = true;
             let note = if entries.is_empty() {
-                "这个作者没有可解析的笔记（或仅对粉丝可见）".to_string()
+                "没读到这个作者的笔记：列表可能还在加载、或被短时限流。稍等片刻重试一次；也可以直接粘贴单条笔记链接（在 App 里分享复制）试试"
+                    .to_string()
             } else {
                 // 网页端只内嵌最新一批笔记；更早的要走带签名的翻页接口
                 format!(
@@ -1656,7 +1657,32 @@ async fn fetch_user(
     for (index, url) in candidates.iter().enumerate() {
         match webview_fetch(app, url).await {
             Ok(value) => {
-                if let Ok(bundle) = UserBundle::from_web(&value) {
+                if let Ok(mut bundle) = UserBundle::from_web(&value) {
+                    // 主页笔记是异步加载的：列表为空时原地多读几次（不导航），
+                    // 免得"页面明明有笔记、程序却说 0 条"（实测踩过）
+                    if bundle.cards.is_empty() {
+                        if let Some(window) = app.get_webview_window("xhs-work") {
+                            for _ in 0..4 {
+                                tokio::time::sleep(Duration::from_millis(1500)).await;
+                                let Some(retry_value) = extract_from_page(&window).await else {
+                                    continue;
+                                };
+                                let Ok(retry) = UserBundle::from_web(&retry_value) else {
+                                    continue;
+                                };
+                                if retry.cards.len() > bundle.cards.len() {
+                                    bundle = retry;
+                                    if !bundle.cards.is_empty() {
+                                        break;
+                                    }
+                                }
+                            }
+                            xhs_core::login::debug_log(&format!(
+                                "主页笔记：重读后 {} 条",
+                                bundle.cards.len()
+                            ));
+                        }
+                    }
                     return Ok(bundle);
                 }
             }
