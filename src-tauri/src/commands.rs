@@ -2989,10 +2989,17 @@ const PAGE_BAR_JS: &str = r#"(function () {
         try { navigator.clipboard.writeText(url); } catch (e) {}
         input.blur();
       });
-      btn('解析', '把当前地址送到软件里解析', function () {
-        var url = location.href.split('#')[0];
-        location.replace('#xhsdownparse=' + encodeURIComponent(url));
+      btn('开始解析', '在本页滚动收集笔记（数字会实时增长）', function () {
+        location.replace('#xhsdowncollect=start');
       });
+      btn('完成解析', '停止收集并把整份列表送进软件', function () {
+        location.replace('#xhsdowncollect=stop');
+      });
+      var count = document.createElement('span');
+      count.id = 'xhsdown-count';
+      count.style.cssText = 'flex:none;font:11px/1 sans-serif;color:#a2a6ab;min-width:64px;text-align:right;';
+      count.textContent = '';
+      bar.appendChild(count);
       btn('收起', '收起地址栏（收回到左下角小方块）', function () { setOpen(false); });
       (document.documentElement || document.body).appendChild(bar);
       requestAnimationFrame(function () {
@@ -3004,6 +3011,55 @@ const PAGE_BAR_JS: &str = r#"(function () {
 
   ensure();
 
+  // 数一数当前页面已经加载了多少条（与软件算法一致：主页笔记要递归展平）
+  var countCards = function () {
+    try {
+      var st = window.__INITIAL_STATE__ || {};
+      var unwrapAll = function (v) {
+        var d = 0;
+        while (v && typeof v === 'object' && v.__v_isRef === true && d < 6) {
+          v = v._value !== undefined ? v._value : v.value;
+          d += 1;
+        }
+        return v;
+      };
+      var arrOf = function (v) {
+        v = unwrapAll(v);
+        return Array.isArray(v) ? v : [];
+      };
+      var flattenCount = function (value) {
+        var n = 0;
+        var walk = function (node, depth) {
+          if (depth > 4) return;
+          var list = arrOf(node);
+          for (var i = 0; i < list.length; i++) {
+            var item = unwrapAll(list[i]);
+            if (Array.isArray(item)) { walk(item, depth + 1); continue; }
+            if (!item || typeof item !== 'object') continue;
+            var keys = Object.keys(item);
+            var numericOnly = keys.length > 0 && keys.every(function (k) { return /^[0-9]+$/.test(k); });
+            if (numericOnly && !item.id && !item.noteId && !item.noteCard) {
+              walk(keys.map(function (k) { return item[k]; }), depth + 1);
+              continue;
+            }
+            n += 1;
+          }
+        };
+        walk(value, 0);
+        return n;
+      };
+      var here = location.href;
+      var u = unwrapAll(st.user) || {};
+      if (here.indexOf('/user/profile/') >= 0) return flattenCount(u.notes);
+      var search = unwrapAll(st.search) || {};
+      if (here.indexOf('/search_result') >= 0) return arrOf(search.feeds).length;
+      var feed = unwrapAll(st.feed) || {};
+      return arrOf(feed.feeds).length;
+    } catch (e) {
+      return 0;
+    }
+  };
+
   // 全局只留一个定时器：脚本被反复注入时不会叠加出一堆互斗的定时器
   if (!window.__xhsdownBarTimer) {
     window.__xhsdownBarTimer = setInterval(function () {
@@ -3013,50 +3069,130 @@ const PAGE_BAR_JS: &str = r#"(function () {
         if (input && document.activeElement !== input) {
           input.value = location.href.split('#')[0];
         }
+        var count = document.getElementById('xhsdown-count');
+        if (count) {
+          var n = countCards();
+          count.textContent = n > 0 ? '已加载 ' + n + ' 条' : '';
+        }
       } catch (e) {}
     }, 800);
   }
-})();"#;
+})();
+"#;
 
-/// 网页显示期间：定期注入地址栏，并接收页面里「解析」按钮送来的地址
+/// 网页显示期间：注入地址栏、处理页面里的按钮信号、按需滚动收集。
+/// 页面里的「开始解析 / 完成解析」通过 URL 片段发信号过来（远程页面没有 IPC 通道）。
 fn spawn_page_bar(app: tauri::AppHandle) {
     tokio::spawn(async move {
         let mut last_url = String::new();
         let mut last_inject = std::time::Instant::now() - Duration::from_secs(600);
+        let mut collecting = false;
+        let mut collected: Vec<PostEntry> = Vec::new();
+        let mut stale: u32 = 0;
+
+        let clear_hash = |window: &tauri::WebviewWindow| {
+            let _ = window.eval("history.replaceState(null,'',location.pathname+location.search)");
+        };
+        let emit_done = |app: &tauri::AppHandle, collected: &[PostEntry], auto: bool| {
+            if collected.is_empty() {
+                xhs_core::login::debug_log("网页收集：没有收集到内容");
+                return;
+            }
+            xhs_core::login::debug_log(&format!(
+                "网页收集：完成，共 {} 条{auto_hint}",
+                collected.len(),
+                auto_hint = if auto { "（自动判定到底）" } else { "" }
+            ));
+            let _ = app.emit(
+                "collect://done",
+                serde_json::json!({ "items": collected, "auto": auto }),
+            );
+        };
+
         loop {
             tokio::time::sleep(Duration::from_millis(1200)).await;
             let Some(window) = app.get_webview_window("xhs-work") else {
                 break;
             };
             if !window.is_visible().unwrap_or(false) {
+                if collecting {
+                    emit_done(&app, &collected, false);
+                    collecting = false;
+                }
                 break;
             }
-            // 只在换页后重新注入（页面内的定时器会自己维持），避免反复注入打扰页面
+
             let url = window
                 .url()
                 .map(|u| u.to_string().split('#').next().unwrap_or("").to_string())
                 .unwrap_or_default();
             if url != last_url || last_inject.elapsed() > Duration::from_secs(5) {
-                last_url = url;
+                last_url = url.clone();
                 last_inject = std::time::Instant::now();
                 let _ = window.eval(PAGE_BAR_JS);
             }
-            // 页面里点了「解析」：地址被写进 #xhsdownparse=…，这里读出来送过去
-            if let Ok(url) = window.url() {
-                let text = url.to_string();
-                if let Some(idx) = text.find("xhsdownparse=") {
+
+            // 页面按钮信号
+            if let Ok(current) = window.url() {
+                let text = current.to_string();
+                if let Some(idx) = text.find("xhsdowncollect=") {
+                    let rest = &text[idx + "xhsdowncollect=".len()..];
+                    let value = rest.split('&').next().unwrap_or("").to_string();
+                    clear_hash(&window);
+                    if value == "start" {
+                        collecting = true;
+                        collected.clear();
+                        stale = 0;
+                        xhs_core::login::debug_log("网页收集：开始（可见模式，边滚边收集）");
+                        let _ = app.emit("collect://update", serde_json::json!({ "count": 0 }));
+                    } else if value == "stop" {
+                        collecting = false;
+                        emit_done(&app, &collected, false);
+                    }
+                } else if let Some(idx) = text.find("xhsdownparse=") {
                     let rest = &text[idx + "xhsdownparse=".len()..];
                     let payload = rest.split('&').next().unwrap_or("");
                     let target = percent_decode(payload);
-                    // 清掉标记，别留在地阽里
-                    let _ = window.eval(
-                        "history.replaceState(null,'',location.pathname+location.search)",
-                    );
+                    clear_hash(&window);
                     if !target.is_empty() {
                         xhs_core::login::debug_log(&format!("网页地址栏送解析：{target}"));
                         let _ = app.emit("web://to-parse", serde_json::json!({ "url": target }));
                     }
                 }
+            }
+
+            // 收集：滚动 → 抽取 → 合并；条数连续 3 轮不增长即判到底
+            if !collecting {
+                continue;
+            }
+            if stale >= 3 {
+                collecting = false;
+                emit_done(&app, &collected, true);
+                continue;
+            }
+            let _ = window.eval(SCROLL_BOTTOM_JS);
+            tokio::time::sleep(Duration::from_millis(1600)).await;
+            match extract_from_page(&window).await {
+                Some(value) => {
+                    let cards = UserBundle::cards_from_web(&value);
+                    let before = collected.len();
+                    for card in cards {
+                        let entry = card.entry("");
+                        if !collected.iter().any(|old| old.bid == entry.bid) {
+                            collected.push(entry);
+                        }
+                    }
+                    if collected.len() > before {
+                        stale = 0;
+                        let _ = app.emit(
+                            "collect://update",
+                            serde_json::json!({ "count": collected.len() }),
+                        );
+                    } else {
+                        stale += 1;
+                    }
+                }
+                None => stale += 1,
             }
         }
     });

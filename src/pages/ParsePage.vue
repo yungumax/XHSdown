@@ -5,6 +5,7 @@ import { animate, stagger } from "animejs";
 import * as api from "../api";
 import { KIND_LABELS, batchNaming, paddedSeq, pickDefaultQuality, singleNaming } from "../download-request.js";
 import StepHeader from "../components/StepHeader.vue";
+import { collected } from "../collect";
 
 const props = defineProps({
   login: { type: Object, required: true },
@@ -112,6 +113,40 @@ async function pasteFromClipboard() {
   }
   text.value = text.value.trim() ? `${text.value.trim()}\n${value}` : value;
 }
+
+/// 网页内收集完成：整份列表直接进"选择内容"页（不需要再解析一次）
+watch(
+  () => collected.value?.stamp,
+  async (stamp) => {
+    const payload = collected.value;
+    if (!stamp || !payload?.items?.length) return;
+    const entries = payload.items.map((item) => ({
+      ...item,
+      media_unknown: item.pics === 0 && !item.has_video,
+    }));
+    const probe = {
+      kind: "user",
+      bid: "",
+      mid: "",
+      title: `网页收集（${entries.length} 条）`,
+      author: "",
+      uid: "",
+      cover: "",
+      note: payload.auto ? "来源：网页内滚动收集（已到页面末尾）" : "来源：网页内滚动收集",
+      total: entries.length,
+      loaded: entries.length,
+      exhausted: true,
+      qualities: [],
+      items: entries,
+    };
+    const key = `web:${stamp}`;
+    items.value = [{ input: key, ok: true, error: "", probe, quality: "auto" }];
+    selected.value = new Set();
+    batchInput.value = key;
+    view.value = "select";
+    await nextTick();
+  },
+);
 
 /// 内容库送来的来源：填进输入框、直接解析一次。
 /// 用 stamp 判重（同一条点两次也要能重新解析），所以不"吃掉"这个值。

@@ -240,6 +240,20 @@ export async function webBarHide() {
   return invokeZh("web_bar_hide");
 }
 
+/** 网页内收集：进度（条数） */
+export async function onCollectUpdate(handler) {
+  if (!hasTauri) return () => {};
+  return listen("collect://update", (event) => handler(event.payload?.count || 0));
+}
+
+/** 网页内收集：完成（整份列表） */
+export async function onCollectDone(handler) {
+  if (!hasTauri) return () => {};
+  return listen("collect://done", (event) =>
+    handler(event.payload?.items || [], !!event.payload?.auto),
+  );
+}
+
 /** WEB 地址栏点「解析」：把当前网页地址送到解析页 */
 export async function onWebToParse(handler) {
   if (!hasTauri) return () => {};

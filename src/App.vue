@@ -3,6 +3,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { animate, stagger } from "animejs";
 
 import * as api from "./api";
+import { collectCount, collected } from "./collect";
 import TitleBar from "./components/TitleBar.vue";
 import Sidebar from "./components/Sidebar.vue";
 import LoginDialog from "./components/LoginDialog.vue";
@@ -114,6 +115,8 @@ async function webHide() {
 let unlistenTask = null;
 let unlistenLogin = null;
 let unlistenFromWeb = null;
+let unlistenCollect = null;
+let unlistenCollectDone = null;
 let toastTimer = null;
 
 const queue = computed(() => {
@@ -195,6 +198,21 @@ onMounted(async () => {
   unlistenFromWeb = await api.onWebToParse((url) => {
     if (url) openSource(url);
   });
+
+  // 网页内收集：进度与完成
+  unlistenCollect = await api.onCollectUpdate((count) => {
+    collectCount.value = count;
+    if (count > 0) showToast(`网页收集中：已收集 ${count} 条`);
+  });
+  unlistenCollectDone = await api.onCollectDone((items) => {
+    collectCount.value = 0;
+    if (!items.length) {
+      showToast("网页收集：没有收集到内容");
+      return;
+    }
+    collected.value = { items, stamp: Date.now() };
+    showToast(`网页收集完成：${items.length} 条，已送入解析结果`);
+  });
 });
 
 onUnmounted(() => {
@@ -202,6 +220,8 @@ onUnmounted(() => {
   if (unlistenTask) unlistenTask();
   if (unlistenLogin) unlistenLogin();
   if (unlistenFromWeb) unlistenFromWeb();
+  if (unlistenCollect) unlistenCollect();
+  if (unlistenCollectDone) unlistenCollectDone();
   clearTimeout(toastTimer);
 });
 
@@ -460,6 +480,7 @@ async function doLogout() {
       />
       <button class="wb-btn wide" title="复制当前地址" @click="webCopy">复制</button>
       <button class="wb-btn wide" title="把当前地址送到解析页" @click="webToParse">解析</button>
+      <span v-if="collectCount" class="wb-count num">收集中 {{ collectCount }} 条</span>
       <button class="wb-btn wide" title="收起网页窗口" @click="webHide">收起</button>
     </div>
 
@@ -604,6 +625,12 @@ async function doLogout() {
   background: var(--field);
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
+}
+
+.wb-count {
+  flex: none;
+  font-size: 11.5px;
+  color: var(--accent);
 }
 
 .wb-url:focus {
