@@ -253,15 +253,53 @@ impl XhsClient {
             .unwrap_or(html.len());
         let raw = html[json_start..end].trim_end().trim_end_matches(';').trim_end();
 
-        // 裸 undefined → null（只处理作为 JSON 值出现的位置，不碰字符串内容）
+        // 裸 JS 字面量 → null（只处理作为 JSON 值出现的位置，不碰字符串内容）：
+        // undefined / NaN / Infinity / -Infinity 都不是合法 JSON。
         // 注意替换串要写成 ${1}null：正则引擎会把 $1null 当成组名 "1null"（实测踩过）
         let re = regex::Regex::new(r"([:,\[]\s*)undefined").unwrap();
         let fixed = re.replace_all(raw, "${1}null");
-        serde_json::from_str(&fixed).map_err(|e| {
-            XhsError::Decode(format!(
-                "__INITIAL_STATE__ 解析失败：{e}；片段 {}",
-                crate::error::truncate(&fixed, 240)
-            ))
+        // 用  收边界（regex crate 不支持前瞻断言）
+        let re_ident = regex::Regex::new(r"([:,\[]\s*)(?:NaN|-?Infinity)").unwrap();
+        let fixed = re_ident.replace_all(&fixed, "${1}null");
+        // 状态里直接内嵌了 JS 构造器：`new Set([])` / `new Map(...)`（实测踩过）
+        let re_set = regex::Regex::new(r"new Set\(\s*(\[[^()]*\])?\s*\)").unwrap();
+        let fixed = re_set.replace_all(&fixed, "${1}");
+        let re_map = regex::Regex::new(r"new Map\(\s*(\{[^()]*\})?\s*\)").unwrap();
+        let fixed = re_map.replace_all(&fixed, "${1}");
+        // 先按上面的清洗结果解析；仍失败就用通用兜底（剩余的 new Xxx(...) 一律当 null），
+        // 并记一条日志——站点改版引入新的内嵌字面量时，这样最不容易整个页面读不出来
+        let parsed = match serde_json::from_str(&fixed) {
+            Ok(value) => Ok(value),
+            Err(first_err) => {
+                let re_ctor =
+                    regex::Regex::new(r"new\s+[A-Za-z_$][0-9A-Za-z_$]*\s*\([^()]*\)").unwrap();
+                let relaxed = re_ctor.replace_all(&fixed, "null");
+                match serde_json::from_str(&relaxed) {
+                    Ok(value) => {
+                        crate::login::debug_log(
+                            "状态里有未识别的 JS 字面量，已用通用兜底转换后解析成功",
+                        );
+                        Ok(value)
+                    }
+                    Err(_) => Err(first_err),
+                }
+            }
+        };
+        parsed.map_err(|e| {
+            // 把出错位置附近的内容截出来：站点改版引入新的非法字面量时能一眼看到
+            let msg = e.to_string();
+            let near = regex::Regex::new(r"column (\d+)")
+                .unwrap()
+                .captures(&msg)
+                .and_then(|c| c.get(1))
+                .and_then(|c| c.as_str().parse::<usize>().ok())
+                .map(|col| {
+                    let lo = col.saturating_sub(80);
+                    let hi = (col + 80).min(fixed.len());
+                    crate::error::truncate(&fixed[lo..hi], 200)
+                })
+                .unwrap_or_else(|| crate::error::truncate(&fixed, 200));
+            XhsError::Decode(format!("__INITIAL_STATE__ 解析失败：{e}；出错附近：{near}"))
         })
     }
 }
@@ -297,6 +335,16 @@ mod tests {
         assert!(value["b"].is_null());
         assert!(value["c"][1].is_null());
         assert_eq!(value["d"], "text undefined kept");
+    }
+
+    #[test]
+    fn parses_initial_state_with_js_constructors() {
+        // 小红书的状态里会内嵌 new Set([]) / new Map(...)（实测：selectedIds 字段）
+        let html = r#"<html><script>window.__INITIAL_STATE__={"ids":new Set([]),"m":new Map({}),"ok":1};</script></html>"#;
+        let value = XhsClient::parse_initial_state(html).unwrap();
+        assert!(value["ids"].is_array());
+        assert!(value["m"].is_object());
+        assert_eq!(value["ok"], 1);
     }
 
     #[test]
