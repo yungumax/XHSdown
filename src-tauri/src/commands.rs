@@ -153,10 +153,17 @@ pub fn update_settings(
     let slots_changed = old.max_concurrent_tasks != next.max_concurrent_tasks;
 
     if proxy_changed {
+        // 换会话时只搬访客 Cookie：登录凭据只活在浏览器窗口里（见 state.rs 的说明）
         let client = XhsClient::with_proxy(Some(&next.proxy)).map_err(err)?;
-        // 换会话不丢登录态：把现有 Cookie 搬过去
-        let cookies = state.client().export_cookies();
-        client.install_cookies(&cookies);
+        let guest: Vec<(String, String)> = state
+            .client()
+            .export_cookies()
+            .into_iter()
+            .filter(|(name, _)| {
+                matches!(name.as_str(), "a1" | "webId" | "xsecappid" | "webBuild" | "acw_tc")
+            })
+            .collect();
+        client.install_cookies(&guest);
         *state.client.write().unwrap() = Arc::new(client);
     }
     if slots_changed {
@@ -421,25 +428,6 @@ pub async fn probe_more(
         exhausted,
         note: String::new(),
     })
-}
-
-/// 简单重试包装：网络抖一下不至于让整个来源解析失败。
-async fn retry<T, F, Fut>(times: usize, mut f: F) -> xhs_core::Result<T>
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = xhs_core::Result<T>>,
-{
-    let mut last = Err(xhs_core::XhsError::Unavailable("未执行".into()));
-    for attempt in 0..=times {
-        if attempt > 0 {
-            tokio::time::sleep(Duration::from_millis(600)).await;
-        }
-        last = f().await;
-        if last.is_ok() {
-            return last;
-        }
-    }
-    last
 }
 
 // ───────────────────────── 下载任务 ─────────────────────────
@@ -1398,20 +1386,6 @@ struct NoteBundle {
 }
 
 impl NoteBundle {
-    fn from_core(note: xhs_core::api::NoteData) -> Self {
-        Self {
-            note_id: note.note_id,
-            title: note.title,
-            desc: note.desc,
-            created_at: note.created_at,
-            user_id: note.user_id,
-            nickname: note.nickname,
-            pics: note.pics,
-            videos: note.videos,
-            duration: note.duration,
-        }
-    }
-
     fn from_web(value: &serde_json::Value) -> Result<Self, String> {
         let note_id = value
             .get("noteId")
@@ -1532,14 +1506,14 @@ impl UserBundle {
 /// 取一条笔记：先试 reqwest（Cookie 可用时更快），失败就借浏览器会话（可靠）。
 async fn fetch_note(
     app: &tauri::AppHandle,
-    client: &XhsClient,
+    _client: &XhsClient,
     url: &str,
-    retries: usize,
+    _retries: usize,
 ) -> Result<NoteBundle, String> {
-    if let Ok(note) = retry(retries, || client.note_detail(url)).await {
-        return Ok(NoteBundle::from_core(note));
-    }
-    xhs_core::login::debug_log("笔记：reqwest 路径失败，改用浏览器会话取数");
+    // 只走浏览器会话。**不要**用复制的 Cookie 让 reqwest 去请求：
+    // 小红书风控会把"同一会话来自另一个客户端"判成劫持，直接把会话作废——
+    // 连带把浏览器里的登录态一起杀掉（实测：登录后 9 秒内会话就没了）。
+    xhs_core::login::debug_log("笔记：走浏览器会话取数（不使用复制的 Cookie）");
     let value = webview_fetch(app, url).await?;
     NoteBundle::from_web(&value)
 }
@@ -1548,32 +1522,12 @@ async fn fetch_note(
 /// `page_url` 必须带上原始链接里的 token（搜索来源的主页没它会被拒）。
 async fn fetch_user(
     app: &tauri::AppHandle,
-    client: &XhsClient,
+    _client: &XhsClient,
     uid: &str,
     page_url: &str,
 ) -> Result<UserBundle, String> {
-    if let Ok((info, notes)) = retry(1, || client.user_profile(uid)).await {
-        let cards: Vec<CardBundle> = notes
-            .iter()
-            .map(|n| CardBundle {
-                id: n.note_id.clone(),
-                token: n.xsec_token.clone(),
-                title: n.title.clone(),
-                is_video: n.has_video(),
-                created_at: n.created_at,
-            })
-            .collect();
-        return Ok(UserBundle {
-            uid: info.uid,
-            nickname: info.nickname,
-            avatar: info.avatar,
-            notes_count: info.notes_count,
-            cards,
-        });
-    }
-    xhs_core::login::debug_log("主页：reqwest 路径失败，改用浏览器会话取数");
-    // 先按原链接（带 token）取；失败再试裸链接——token 有时会过期/失效，
-    // 而裸链接在登录态下多数也能打开（反之亦然）
+    // 同上：只走浏览器会话，绝不用复制的 Cookie 发请求（会被判劫持、作废会话）
+    xhs_core::login::debug_log("主页：走浏览器会话取数（不使用复制的 Cookie）");
     let bare = format!("https://www.xiaohongshu.com/user/profile/{uid}");
     let mut candidates: Vec<String> = Vec::new();
     if !page_url.trim().is_empty() && page_url.contains("xsec_token=") {
@@ -2138,13 +2092,14 @@ async fn finish_login(
 ) -> Result<LoginInfo, String> {
     let settings = state.settings_snapshot();
     if let Some(window) = app.get_webview_window("xhs-work") {
+        // 只记录一份备份（诊断用），**不装到 reqwest 客户端**：
+        // 用复制的 Cookie 发请求会被风控判成会话劫持，进而作废登录态（实测踩过）
         let cookies = harvest_webview_cookies(&window);
-        if !cookies.is_empty() {
-            let client = XhsClient::with_proxy(Some(&settings.proxy)).map_err(err)?;
-            client.install_cookies(&cookies);
-            *state.client.write().unwrap() = Arc::new(client);
-            state.save_cookies();
-        }
+        xhs_core::login::debug_log(&format!(
+            "登录凭据：浏览器侧 {} 个 Cookie（不复制给 reqwest 使用）",
+            cookies.len()
+        ));
+        let _ = &settings;
     }
     let client = state.client();
     let face = inline_avatar(&client, &avatar).await;

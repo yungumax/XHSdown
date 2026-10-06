@@ -249,15 +249,10 @@ impl AppState {
 
         let client = XhsClient::with_proxy(Some(&settings.proxy)).map_err(|e| e.to_string())?;
 
-        // 恢复登录态：cookies.json 是网页登录收割的会话凭据（仅用于快速路径）
-        let cookies: xhs_core::client::DomainCookies =
-            std::fs::read_to_string(settings.cookies_path())
-                .ok()
-                .and_then(|text| serde_json::from_str(&text).ok())
-                .unwrap_or_default();
-        if !cookies.is_empty() {
-            client.install_cookies(&cookies.web);
-        }
+        // 注意：**不把 cookies.json 装到 reqwest 客户端**。
+        // 小红书风控会把"同一会话来自另一个客户端"判成劫持并作废会话，
+        // 连带杀掉浏览器里的登录态（实测：登录后 9 秒内会话失效）。
+        // 登录态只活在浏览器窗口里，reqwest 只做匿名请求与 CDN 下载。
 
         let slots = Arc::new(Semaphore::new(settings.max_concurrent_tasks.max(1)));
         Ok(Self {
