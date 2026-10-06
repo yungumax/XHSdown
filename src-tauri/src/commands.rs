@@ -1281,39 +1281,78 @@ async fn webview_fetch_inner(
     ))
 }
 
-/// 从页面 DOM 取账号资料。
-/// 为什么不读内部状态：实测登录后 `user.userPageData` 是空对象——资料是页面加载后
-/// 异步取回的，初始状态里没有；但页面本身一定会渲染昵称（文档标题）与头像图。
+/// 读当前页面上的账号资料（登录者是本人）。
+///
+/// 为什么不只读 DOM：小红书把"我的资料"放在全局状态里（`user.userPageData` /
+/// `user.userInfo`，可能是 Vue ref），当前页面（推荐流等）通常已经带着它——
+/// 直接读就不用导航到主页，既快又不会打扰站点（实测导航过去常被短时限流）。
+/// 状态里没有时再退回 DOM：文档标题即昵称、头像图在 sns-avatar CDN。
 const IDENTITY_DOM_JS: &str = r#"(function () {
   var report = function (out) {
     try {
       location.replace('#xhsdownid=' + Date.now() + '~' + encodeURIComponent(JSON.stringify(out)));
     } catch (e) {}
   };
-  try {
-    var out = { ready: true };
-    var raw = (document.title || '').trim();
-    // 站点默认标题（还没加载出真昵称）→ 标成未就绪，让调用方稍后再试
-    if (raw === '小红书' || raw.indexOf('你的生活兴趣社区') >= 0) {
-      report({ ready: false, pageUrl: location.href });
-      return;
+  var unwrap = function (v) {
+    var d = 0;
+    while (v && typeof v === 'object' && v.__v_isRef === true && d < 6) {
+      v = v._value !== undefined ? v._value : v.value;
+      d += 1;
     }
-    out.title = raw.replace(/\s*[-—|]\s*小红书.*$/, '').trim();
-    var imgs = document.querySelectorAll('img');
-    for (var i = 0; i < imgs.length && i < 400; i++) {
-      var src = imgs[i].getAttribute('src') || '';
-      if (src.indexOf('sns-avatar') >= 0 || src.indexOf('avatar') >= 0) {
-        out.avatar = src;
-        break;
+    return v;
+  };
+  var str = function (v) {
+    v = unwrap(v);
+    if (typeof v === 'string') return v;
+    if (v && typeof v === 'object') {
+      var c = ['url', 'imageUrl', 'urlDefault', 'src', 'image'];
+      for (var i = 0; i < c.length; i++) {
+        var t = unwrap(v[c[i]]);
+        if (typeof t === 'string') return t;
       }
     }
-    var um = location.href.match(/profile\/([0-9a-f]{24})/);
-    if (um) out.uid = um[1];
-    if (!out.uid) {
-      var links = document.querySelectorAll('a[href*="/user/profile/"]');
-      for (var j = 0; j < links.length && j < 200; j++) {
-        var m = (links[j].getAttribute('href') || '').match(/profile\/([0-9a-f]{24})/);
-        if (m) { out.uid = m[1]; break; }
+    return '';
+  };
+  try {
+    var out = { ready: true };
+    var st = window.__INITIAL_STATE__ || {};
+    var pu = unwrap(st.user) || {};
+    var page = unwrap(pu.userPageData);
+    if (!page || typeof page !== 'object' || Array.isArray(page)) page = {};
+    var info = unwrap(pu.userInfo);
+    if (!info || typeof info !== 'object' || Array.isArray(info)) info = {};
+    var pick = function (o, keys) {
+      for (var i = 0; i < keys.length; i++) {
+        var t = str(o[keys[i]]);
+        if (t) return t;
+      }
+      return '';
+    };
+    out.name =
+      pick(page, ['nickname', 'nickName', 'nick_name', 'name']) ||
+      pick(info, ['nickname', 'nickName', 'nick_name', 'name']);
+    out.uid = pick(page, ['id', 'userId', 'user_id']) || pick(info, ['id', 'userId', 'user_id']);
+    out.avatar =
+      pick(page, ['headImage', 'image', 'avatar', 'images', 'avatarUrl']) ||
+      pick(info, ['headImage', 'image', 'avatar', 'images', 'avatarUrl']);
+    // 状态里没有就退回 DOM
+    if (!out.name) {
+      var raw = (document.title || '').trim();
+      var generic = raw === '小红书' || raw.indexOf('你的生活兴趣社区') >= 0;
+      if (!generic) out.name = raw.replace(/\s*[-—|]\s*小红书.*$/, '').trim();
+    }
+    if (!out.name) {
+      var el = document.querySelector('[class*="user-name"], [class*="nickname"], [class*="user-nickname"]');
+      if (el) {
+        var t = (el.textContent || '').trim();
+        if (t && t.length <= 30 && t.indexOf('小红书') < 0) out.name = t;
+      }
+    }
+    if (!out.avatar) {
+      var imgs = document.querySelectorAll('img');
+      for (var i = 0; i < imgs.length && i < 400; i++) {
+        var src = imgs[i].getAttribute('src') || '';
+        if (src.indexOf('sns-avatar') >= 0) { out.avatar = src; break; }
       }
     }
     report(out);
@@ -1342,7 +1381,7 @@ async fn read_identity(window: &tauri::WebviewWindow) -> Option<(String, String,
             continue; // 标题还是站点默认的：稍后再试
         }
         let uid = value.get("uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-        let name = value.get("title").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let name = value.get("name").and_then(|v| v.as_str()).unwrap_or_default().to_string();
         let avatar = value.get("avatar").and_then(|v| v.as_str()).unwrap_or_default().to_string();
         return Some((uid, name, avatar));
     }
@@ -1357,23 +1396,40 @@ async fn read_identity(window: &tauri::WebviewWindow) -> Option<(String, String,
 async fn browser_login_check(
     app: &tauri::AppHandle,
 ) -> Result<Option<(String, String, String)>, String> {
-    let value = match webview_fetch_inner(app, "https://www.xiaohongshu.com/user/profile/me", true).await
-    {
-        Ok(value) => value,
-        Err(e) => {
-            // "需要登录"就是没登录，不算错误
-            xhs_core::login::debug_log(&format!("登录检测：{e}"));
-            return Ok(None);
+    // 先看当前页面（多数时候已经带着登录者资料，不用导航，快且不打扰站点）
+    let value = {
+        let mut found: Option<serde_json::Value> = None;
+        if let Some(window) = app.get_webview_window("xhs-work") {
+            for _ in 0..3 {
+                let _ = window.eval(IDENTITY_DOM_JS);
+                if let Some((uid, name, avatar)) = read_identity(&window).await {
+                    if !name.is_empty() {
+                        found = Some(serde_json::json!({
+                            "kind": "user", "uid": uid, "nickname": name, "avatar": avatar,
+                        }));
+                        break;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(600)).await;
+            }
+        }
+        match found {
+            Some(value) => value,
+            None => {
+                // 当前页面读不到就导航到「我的主页」读一次
+                match webview_fetch_inner(app, "https://www.xiaohongshu.com/user/profile/me", true)
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(e) => {
+                        xhs_core::login::debug_log(&format!("登录检测：{e}"));
+                        return Ok(None);
+                    }
+                }
+            }
         }
     };
 
-    let kind = value.get("kind").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    if kind != "user" {
-        xhs_core::login::debug_log(&format!(
-            "登录检测：拿到的不是主页数据（kind={kind:?}），继续等待"
-        ));
-        return Ok(None);
-    }
     let mut uid = value.get("uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let mut name = value.get("nickname").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let mut avatar = value.get("avatar").and_then(|v| v.as_str()).unwrap_or_default().to_string();
@@ -1704,6 +1760,7 @@ async fn login_watch(app: tauri::AppHandle) {
     //   异步资料永远加载不出来，还把站点惹到限速——实测页面报"未连接到服务器"）
     let mut entered = false;
     let mut last_full_fetch = std::time::Instant::now() - Duration::from_secs(600);
+    let mut backoff = Duration::from_secs(5);
 
     loop {
         if started.elapsed() > Duration::from_secs(600) {
@@ -1733,40 +1790,43 @@ async fn login_watch(app: tauri::AppHandle) {
                 continue;
             }
             entered = true;
-            xhs_core::login::debug_log("登录页已跳走，开始读取账号资料");
+            // 登录已完成：先把窗口藏起来——接下来要读资料/可能导航到主页，
+            // 用户不必看着登录窗被程序翻来翻去（读操作都在隐藏窗口里做）
+            let _ = window.hide();
+            xhs_core::login::debug_log("登录页已跳走，开始读取账号资料（窗口已隐藏）");
         }
 
         // 阶段 1：完整取数（含导航）最多每 20 秒一次；其余时间只读当前页面，
         // 让页面的异步资料有机会加载完
         let now = std::time::Instant::now();
-        // 先看当前页面上是什么：是"我的主页"就直接读（原地等待异步资料），
-        // 不是主页（停在推荐流等）就每 8 秒导航过去读一次
-        let on_page = extract_from_page(&window).await;
-        let on_profile = on_page
-            .as_ref()
-            .map(|v| v.get("kind").and_then(|x| x.as_str()) == Some("user"))
-            .unwrap_or(false);
-        let value = if on_profile {
-            on_page
-        } else if now.duration_since(last_full_fetch) >= Duration::from_secs(8) {
+        // 优先在当前页面读账号资料（登录者的资料就在全局状态里，不需要任何导航）
+        let _ = window.eval(IDENTITY_DOM_JS);
+        let mut value = match read_identity(&window).await {
+            Some((uid, name, avatar)) if !name.is_empty() => Some(serde_json::json!({
+                "kind": "user", "uid": uid, "nickname": name, "avatar": avatar,
+            })),
+            _ => None,
+        };
+        // 当前页面读不到（例如状态还没热）：退回到「我的主页」读，
+        // 带退避（5s→10s→20s→40s），避免频繁打扰站点被限流
+        if value.is_none() && now.duration_since(last_full_fetch) >= backoff {
             last_full_fetch = now;
             match webview_fetch_inner(&app, "https://www.xiaohongshu.com/user/profile/me", true)
                 .await
             {
-                Ok(value) => Some(value),
+                Ok(v) => {
+                    backoff = Duration::from_secs(5);
+                    value = Some(v);
+                }
                 Err(e) => {
-                    xhs_core::login::debug_log(&format!("读我的主页失败（{e}），稍后重试"));
-                    None
+                    backoff = (backoff * 2).min(Duration::from_secs(40));
+                    xhs_core::login::debug_log(&format!(
+                        "读我的主页失败（{e}），{} 秒后重试",
+                        backoff.as_secs()
+                    ));
                 }
             }
-        } else {
-            let page = window.url().map(|u| u.to_string()).unwrap_or_default();
-            xhs_core::login::debug_log(&format!(
-                "当前页面不是主页（{}），稍后导航过去读",
-                xhs_core::error::truncate(&page, 90)
-            ));
-            None
-        };
+        }
 
         let Some(value) = value else { continue };
         let name = value
