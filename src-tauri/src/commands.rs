@@ -750,6 +750,11 @@ async fn run_task(app: tauri::AppHandle, req: DownloadReq, id: String) {
         emit_task(&app_done, &task);
     };
 
+    // 熔断闸门：当前会话正被站点限流时就别逐条撞墙了（任务直接给出明确原因）
+    if let Err(reason) = note_block_gate(&app) {
+        done("failed", &reason, "");
+        return;
+    }
     // 取详情（重试几次，拿最新的图片/视频地址）
     let fetch_url = if req.page_url.is_empty() {
         format!("https://www.xiaohongshu.com/explore/{}", req.bid)
@@ -1763,6 +1768,9 @@ async fn webview_fetch_inner(
     let mut stale_kind_logged = false;
     // 浏览器地址每次变化都记一笔：导航有没有落地、被弹到哪儿，全看这条日志
     let mut last_live = before_url.clone();
+    // 目标地址是否真的落地过：落过又被弹走 = 站点级风控（不是链接坏）
+    let target_url = url.split('#').next().unwrap_or(url).to_string();
+    let mut reached_target = false;
     while started.elapsed() < Duration::from_secs(30) {
         tokio::time::sleep(Duration::from_millis(700)).await;
 
@@ -1779,11 +1787,21 @@ async fn webview_fetch_inner(
             ));
             last_live = live_url.clone();
         }
+        if !live_url.is_empty() && live_url == target_url {
+            reached_target = true;
+        }
         if !live_url.is_empty() && live_url != before_url {
             if live_url.contains("/explore") && !live_url.contains("/explore/") && expect == "note" {
-                return Err(
-                    "这个链接已失效：页面跳回了首页（token 过期、来源不匹配或已被使用过）".into(),
-                );
+                // 落地过又被弹走：token/链接都是好的（浏览器里同一地址能开），
+                // 是这台会话被站点定向限流了——别再逐条撞墙
+                let msg = if reached_target {
+                    format!(
+                        "{NOTE_BLOCK_HINT}：笔记页刚打开就被弹回首页，而主页/解析仍正常。请等几分钟再试，或先用网页窗口手动打开一条笔记确认能正常浏览"
+                    )
+                } else {
+                    "这个链接已失效：页面跳回了首页（token 过期或已被使用过）".to_string()
+                };
+                return Err(msg);
             }
             if live_url.contains("/404") || live_url.contains("/login") {
                 let kind = if live_url.contains("/404") { "404/不可见" } else { "登录页" };
@@ -2280,13 +2298,20 @@ async fn fetch_note(
     for (index, cand) in candidates.iter().enumerate() {
         match webview_fetch(app, cand).await {
             Ok(value) => match NoteBundle::from_web(&value) {
-                Ok(bundle) => return Ok(bundle),
+                Ok(bundle) => {
+                    note_block_mark(app, false);
+                    return Ok(bundle);
+                }
                 Err(e) => last_err = e,
             },
             Err(e) => last_err = e,
         }
+        // 风控挡下：换形态也没用（实测六种形态全被弹回），立即停手并记一笔熔断
+        if last_err.contains(NOTE_BLOCK_HINT) {
+            note_block_mark(app, true);
+            return Err(last_err);
+        }
         if index + 1 < candidates.len() {
-            // 站点对 token 与来源上下文很敏感（写错来源会被弹回首页），逐个形态试
             xhs_core::login::debug_log(&format!(
                 "笔记取数候选 {} 失败（{last_err}），换下一个地址形态",
                 index + 1
@@ -2294,6 +2319,37 @@ async fn fetch_note(
         }
     }
     Err(last_err)
+}
+
+/// 熔断闸门：连续两条笔记被风控挡住后，冷却期内不再逐条硬试
+/// （逐条硬试的代价是拿会话去撞墙，站点只会把限制拉得更久）。
+fn note_block_gate(app: &tauri::AppHandle) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let guard = state.note_block.lock().unwrap();
+    let (at, count) = *guard;
+    if count >= 2 && at.elapsed() < Duration::from_secs(300) {
+        let left = (300 - at.elapsed().as_secs()).max(1);
+        return Err(format!(
+            "{NOTE_BLOCK_HINT}：已暂停继续尝试，约 {left} 秒后再试；也可以先在网页窗口里手动打开一条笔记确认能正常浏览"
+        ));
+    }
+    Ok(())
+}
+
+/// 记一笔熔断状态：被挡（blocked=true）累加次数，取数成功则清零
+fn note_block_mark(app: &tauri::AppHandle, blocked: bool) {
+    let state = app.state::<AppState>();
+    let mut guard = state.note_block.lock().unwrap();
+    if blocked {
+        let count = if guard.0.elapsed() < Duration::from_secs(300) {
+            guard.1 + 1
+        } else {
+            1
+        };
+        *guard = (std::time::Instant::now(), count);
+    } else {
+        *guard = (std::time::Instant::now() - Duration::from_secs(3600), 0);
+    }
 }
 
 /// 从笔记链接里拆出 id 与 token（token 缺省为空串）。
@@ -2311,36 +2367,26 @@ fn split_note_url(url: &str) -> (String, String) {
     (id, token)
 }
 
-/// 一条笔记的候选地址链：原样 → 换来源上下文（token 与来源相关）→ 移动版路径 → 裸链接。
-/// 顺序即优先级；配合取数里的"被弹回首页就快速失败"，每个失败候选只多花一两秒。
+/// 站点把这台会话的"笔记详情"请求挡下时的提示前缀（批量下载的熔断器认它）
+const NOTE_BLOCK_HINT: &str = "小红书短时限制了笔记详情请求（风控）";
+
+/// 一条笔记的候选地址链：原样 → 移动版路径。
+///
+/// 实测结论（别再往下加形态）：同一 token 换 `xsec_source`、换 `/discovery/item/` 路径、
+/// 甚至裸链接，在浏览器里都能正常打开；而 App 里被弹回首页时**六种形态无一幸免**——
+/// 被弹是"会话被风控"这个层面的问题，不是链接形态问题。多试形态只会拿会话去撞墙，
+/// 所以这里只留"原样"和一个移动版兜底。
 fn note_url_candidates(url: &str) -> Vec<String> {
     let (id, token) = split_note_url(url);
     let mut out: Vec<String> = vec![url.to_string()];
-    let push = |out: &mut Vec<String>, candidate: String| {
-        if !out.iter().any(|existing| existing == &candidate) {
-            out.push(candidate);
-        }
-    };
-    if !id.is_empty() && !id.chars().all(|c| c.is_ascii_alphanumeric()) {
-        return out;
-    }
-    if !token.is_empty() {
-        for source in ["pc_user", "pc_search", "pc_feed", "pc_homefeed"] {
-            push(
-                &mut out,
-                format!(
-                    "https://www.xiaohongshu.com/explore/{id}?xsec_token={token}&xsec_source={source}"
-                ),
-            );
-        }
-        push(
-            &mut out,
-            format!(
-                "https://www.xiaohongshu.com/discovery/item/{id}?xsec_token={token}&xsec_source=pc_user"
-            ),
+    if !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric()) && !token.is_empty() {
+        let variant = format!(
+            "https://www.xiaohongshu.com/discovery/item/{id}?xsec_token={token}&xsec_source=pc_user"
         );
+        if !out.iter().any(|existing| existing == &variant) {
+            out.push(variant);
+        }
     }
-    push(&mut out, format!("https://www.xiaohongshu.com/explore/{id}"));
     out
 }
 
@@ -4475,21 +4521,19 @@ pub fn export_diagnostics(state: State<'_, AppState>) -> Result<String, String> 
 mod tests {
     use super::*;
 
-    /// 候选阶梯：原样 → 换来源 → 移动版路径 → 裸链接，且不重复
+    /// 候选阶梯保持精简：原样 → 移动版路径。
+    /// （实测：被风控时六种形态无一幸免，多列形态只会拿会话去撞墙）
     #[test]
-    fn note_url_candidates_cover_sources_and_paths() {
+    fn note_url_candidates_keep_it_minimal() {
         let url = "https://www.xiaohongshu.com/explore/6a1f0000000000000000abcd?xsec_token=ABtok=&xsec_source=pc_search";
         let list = note_url_candidates(url);
+        assert_eq!(list.len(), 2, "原样 + 移动版各一条");
         assert_eq!(list[0], url);
-        assert!(list.iter().any(|u| u.contains("xsec_source=pc_user")));
-        assert!(list.iter().any(|u| u.contains("/discovery/item/")));
-        assert!(list
-            .iter()
-            .any(|u| u == "https://www.xiaohongshu.com/explore/6a1f0000000000000000abcd"));
-        let mut sorted = list.clone();
-        sorted.sort();
-        sorted.dedup();
-        assert_eq!(sorted.len(), list.len(), "候选不应重复");
+        assert!(list[1].contains("/discovery/item/"));
+        // 没有 token 时只有一个候选（换路径没有意义）
+        let bare =
+            note_url_candidates("https://www.xiaohongshu.com/explore/6a1f0000000000000000abcd");
+        assert_eq!(bare.len(), 1);
     }
 
     #[test]
