@@ -29,6 +29,10 @@ pub struct BatchCache {
     pub uid: String,
     pub items: Vec<PostEntry>,
     pub exhausted: bool,
+    /// 来源页面地址：继续解析时要回到这一页滚动加载
+    pub url: String,
+    /// 连续"条数没增长"的轮数：够 3 轮就认为拉到底了
+    pub stale: u32,
 }
 
 /// 一条命名模板预设。

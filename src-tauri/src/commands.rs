@@ -307,6 +307,8 @@ pub async fn probe_source(
                 uid: note.user_id.clone(),
                 items: probe.items.clone(),
                 exhausted: true,
+                url: fetch_url.clone(),
+                stale: 0,
             };
             state.cache_batch(key.clone(), cache.clone());
             if raw_input.trim() != key {
@@ -347,7 +349,9 @@ pub async fn probe_source(
             let cache = BatchCache {
                 uid: String::new(),
                 items: probe.items.clone(),
-                exhausted: true,
+                exhausted: false,
+                url: url.clone(),
+                stale: 0,
             };
             state.cache_batch("search:last".to_string(), cache);
             Ok(probe)
@@ -385,7 +389,9 @@ pub async fn probe_source(
             let cache = BatchCache {
                 uid: String::new(),
                 items: probe.items.clone(),
-                exhausted: true,
+                exhausted: false,
+                url: "https://www.xiaohongshu.com/explore".to_string(),
+                stale: 0,
             };
             let key = "feed:explore".to_string();
             state.cache_batch(key, cache);
@@ -396,7 +402,8 @@ pub async fn probe_source(
             let user = fetch_user(&app, &client, &uid, &page_url).await?;
             let entries: Vec<PostEntry> =
                 user.cards.iter().map(|card| card.entry(&user.nickname)).collect();
-            let exhausted = true;
+            // 主页可以边滚边加载，所以这里不算"到底"；继续解析时再滚
+            let exhausted = false;
             let note = if entries.is_empty() {
                 "没读到这个作者的笔记：列表可能还在加载、或被短时限流。稍等片刻重试一次；也可以直接粘贴单条笔记链接（在 App 里分享复制）试试"
                     .to_string()
@@ -428,13 +435,15 @@ pub async fn probe_source(
                 items: entries,
             };
             xhs_core::login::debug_log(&format!(
-                "probe user={uid} 本页 {} 条",
+                "probe user={uid} 本页 {} 条（可继续解析滚动加载）",
                 probe.items.len()
             ));
             let cache = BatchCache {
                 uid: user.uid.clone(),
                 items: probe.items.clone(),
                 exhausted,
+                url: page_url.clone(),
+                stale: 0,
             };
             let key = format!("user:{uid}");
             state.cache_batch(key.clone(), cache.clone());
@@ -457,13 +466,13 @@ fn input_key(target: SourceTarget) -> String {
 
 #[tauri::command]
 pub async fn probe_more(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     input: String,
-    _want: usize,
+    want: usize,
 ) -> Result<ProbeMore, String> {
-    // 小红书网页端的翻页接口要 x-s 签名，桌面端拿不到：
-    // 主页解析只给最新一批，这里如实返回 exhausted，由界面隐藏「继续解析」。
     let client = state.client();
+    // 输入可能是任意链接形态，归一成缓存键
     let key = match parse_input(&input) {
         Ok(target) => input_key(target),
         Err(e) if e.to_string().contains("NEED_RESOLVE:") => {
@@ -477,17 +486,101 @@ pub async fn probe_more(
         }
         Err(_) => input.trim().to_string(),
     };
-    let (loaded, uid, exhausted) = {
+
+    let (url, mut items, mut exhausted, mut stale) = {
         let batches = state.batches.lock().unwrap();
-        match batches.get(&key) {
-            Some(cache) => (cache.items.len(), cache.uid.clone(), cache.exhausted),
-            None => (0, String::new(), true),
-        }
+        let Some(cache) = batches.get(&key) else {
+            return Err("这个来源的解析缓存已过期，请回到输入页重新解析".into());
+        };
+        (
+            cache.url.clone(),
+            cache.items.clone(),
+            cache.exhausted,
+            cache.stale,
+        )
     };
-    let _ = uid;
+
+    if exhausted {
+        return Ok(ProbeMore {
+            items: Vec::new(),
+            loaded: items.len(),
+            total: 0,
+            exhausted: true,
+            note: String::new(),
+        });
+    }
+
+    // 回到来源页面（用户可能已经翻到别的页）——隐式导航，不打扰用户
+    let settings = state.settings_snapshot();
+    let window = ensure_work_window(&app, &settings).await?;
+    let current = window
+        .url()
+        .map(|u| u.to_string().split('#').next().unwrap_or("").to_string())
+        .unwrap_or_default();
+    if current != url {
+        let _ = window.hide();
+        if let Ok(parsed) = url.parse::<tauri::Url>() {
+            let _ = window.navigate(parsed);
+        }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
+    // 滚到底 + 抽取：条数不再增长连续 3 轮即认为到底（参考 DYdown 的判定）
+    let mut rounds = 0;
+    let mut added: Vec<PostEntry> = Vec::new();
+    while rounds < 8 && !exhausted {
+        rounds += 1;
+        let _ = window.eval(SCROLL_BOTTOM_JS);
+        tokio::time::sleep(Duration::from_millis(1300)).await;
+        let Some(value) = extract_from_page(&window).await else {
+            stale += 1;
+            if stale >= 3 {
+                exhausted = true;
+            }
+            continue;
+        };
+        let cards = UserBundle::cards_from_web(&value);
+        if cards.len() > items.len() {
+            // 页面状态是"累积"的：整份替换即可（多的就是新滚出来的）
+            let fresh: Vec<PostEntry> = cards.iter().map(|card| card.entry("")).collect();
+            for entry in fresh {
+                if !items.iter().any(|old| old.bid == entry.bid) {
+                    items.push(entry.clone());
+                    added.push(entry);
+                }
+            }
+            stale = 0;
+            if added.len() >= want.max(1) {
+                break;
+            }
+        } else {
+            stale += 1;
+            if stale >= 3 {
+                exhausted = true;
+            }
+        }
+    }
+
+    xhs_core::login::debug_log(&format!(
+        "继续解析：{key} 新增 {} 条（累计 {}，{}）",
+        added.len(),
+        items.len(),
+        if exhausted { "已到底" } else { "还有更多" }
+    ));
+
+    // 写回缓存
+    {
+        let mut batches = state.batches.lock().unwrap();
+        if let Some(cache) = batches.get_mut(&key) {
+            cache.items = items.clone();
+            cache.exhausted = exhausted;
+            cache.stale = stale;
+        }
+    }
+
     Ok(ProbeMore {
-        items: Vec::new(),
-        loaded,
+        items: added,
+        loaded: items.len(),
         total: 0,
         exhausted,
         note: String::new(),
@@ -1051,6 +1144,34 @@ async fn ensure_work_window(
     .map_err(err)?;
     Ok(window)
 }
+
+/// 滚到底 + 点「加载更多」（参考 DYdown 的做法）：
+/// 无限列表要靠滚动触发下一页请求；有些页面还用"点击加载更多"按钮。
+const SCROLL_BOTTOM_JS: &str = r#"(function () {
+  try {
+    var all = document.querySelectorAll('*');
+    for (var i = 0; i < all.length; i++) {
+      var e = all[i];
+      try {
+        var st = getComputedStyle(e);
+        if ((st.overflowY === 'auto' || st.overflowY === 'scroll') && e.scrollHeight > e.clientHeight + 50) {
+          e.scrollTop = e.scrollHeight - e.clientHeight;
+        }
+      } catch (x) {}
+    }
+    try { window.scrollTo(0, (document.body || document.documentElement).scrollHeight); } catch (x) {}
+    // 只认文本明确的按钮，避免误点关注/收藏
+    var btns = document.querySelectorAll('button, div[role="button"], span');
+    for (var j = 0; j < btns.length; j++) {
+      var t = (btns[j].textContent || '').trim();
+      if (t.length < 16 && (t.indexOf('加载更多') >= 0 || t.indexOf('点击加载') >= 0 || t.indexOf('查看更多') >= 0)) {
+        btns[j].click();
+        break;
+      }
+    }
+    return 1;
+  } catch (e) { return 0; }
+})();"#;
 
 /// 页面提取脚本：把当前页的关键数据（笔记详情 / 用户主页）打包写进 URL 片段。
 /// webview 里的远程页面没有 Tauri IPC，URL 片段是唯一能把值带回 Rust 的通道。
@@ -2353,18 +2474,46 @@ async fn login_selftest(app: tauri::AppHandle, settings: Settings, probe_url: St
         match parse_input(&probe_url) {
             Ok(SourceTarget::User { uid, token, url }) => {
                 let page_url = user_fetch_url(&uid, &token, &url);
+                let _ = (&client, &uid);
                 xhs_core::login::debug_log(&format!(
                     "自检·主页链接：uid={uid} 带token={} 取数地址={page_url}",
                     token.is_some()
                 ));
-                match fetch_user(&app, &client, &uid, &page_url).await {
-                    Ok(user) => xhs_core::login::debug_log(&format!(
-                        "自检·主页结果：昵称={:?} uid={:?} 笔记={} 总数={}",
-                        user.nickname,
-                        user.uid,
-                        user.cards.len(),
-                        user.notes_count
-                    )),
+                // 先解析首屏，再连跑几轮"继续解析"：验证滚动加载能把整列拉出来
+                match probe_source(app.clone(), app.state::<AppState>(), url.clone()).await {
+                    Ok(first) => {
+                        let mut total = first.items.len();
+                        xhs_core::login::debug_log(&format!("自检·主页首屏：{total} 条"));
+                        for round in 1..=8 {
+                            match probe_more(
+                                app.clone(),
+                                app.state::<AppState>(),
+                                url.clone(),
+                                20,
+                            )
+                            .await
+                            {
+                                Ok(more) => {
+                                    total += more.items.len();
+                                    xhs_core::login::debug_log(&format!(
+                                        "自检·主页滚动：第 {round} 轮 新增 {} 累计 {} {}",
+                                        more.items.len(),
+                                        total,
+                                        if more.exhausted { "（已到底）" } else { "" }
+                                    ));
+                                    if more.exhausted {
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    xhs_core::login::debug_log(&format!(
+                                        "自检·主页滚动：第 {round} 轮失败 {e}"
+                                    ));
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     Err(e) => xhs_core::login::debug_log(&format!("自检·主页失败：{e}")),
                 }
             }
