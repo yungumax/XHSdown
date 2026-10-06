@@ -1877,15 +1877,46 @@ const QR_KEEPER_JS: &str = r#"(function () {
   window.__xhsdownQrClicks = 0;
   window.__xhsdownQrReloads = 0;
   window.__xhsdownQrLastClick = 0;
-  var report = function (expired) {
-    try {
-      location.replace(
-        '#xhsdownqr=' + window.__xhsdownQrClicks + ',' + window.__xhsdownQrReloads + ',' + (expired ? 1 : 0)
-      );
-    } catch (e) {}
+  window.__xhsdownQrLastReload = 0;
+  window.__xhsdownQrLastReport = '';
+  var report = function (state) {
+    // 只在状态变化时才写 URL：每 2.5 秒改一次地址栏会打扰页面自己的逻辑
+    if (state === window.__xhsdownQrLastReport) return;
+    window.__xhsdownQrLastReport = state;
+    try { location.replace('#xhsdownqr=' + state); } catch (e) {}
+  };
+  var bodyText = function () {
+    return (document.body.innerText || '');
   };
   var tick = function () {
-    var expired = (document.body.innerText || '').indexOf('二维码已过期') >= 0;
+    var text = bodyText();
+    var expired = text.indexOf('二维码已过期') >= 0;
+    // 正在扫码/等待手机确认时**绝不动**：这时候换码会让手机确认的是旧码，
+    // 页面会报 "fail to login"（实测踩过）
+    var scanning =
+      text.indexOf('扫描成功') >= 0 ||
+      text.indexOf('请在手机上确认') >= 0 ||
+      text.indexOf('确认登录') >= 0 ||
+      text.indexOf('已扫描') >= 0;
+    var failed =
+      text.indexOf('fail to login') >= 0 ||
+      text.indexOf('登录失败') >= 0 ||
+      text.indexOf('失败了') >= 0;
+
+    if (scanning) {
+      report(window.__xhsdownQrClicks + ',' + window.__xhsdownQrReloads + ',2');
+      return;
+    }
+
+    // 页面报错（多半是扫码与换码撞了）：隔一段时间重载一次拿全新页面
+    if (failed && Date.now() - window.__xhsdownQrLastReload > 60000) {
+      window.__xhsdownQrLastReload = Date.now();
+      window.__xhsdownQrReloads += 1;
+      report(window.__xhsdownQrClicks + ',' + window.__xhsdownQrReloads + ',1');
+      location.reload();
+      return;
+    }
+
     var target = null;
     if (expired) {
       var nodes = document.querySelectorAll('a, button, span, div, p');
@@ -1911,13 +1942,14 @@ const QR_KEEPER_JS: &str = r#"(function () {
       window.__xhsdownQrLastClick &&
       Date.now() - window.__xhsdownQrLastClick > 8000
     ) {
-      // 点了还没恢复：重载页面拿新二维码（最可靠的一手）
+      // 点了还没恢复：重载页面拿新二维码
       window.__xhsdownQrReloads += 1;
-      report(true);
+      window.__xhsdownQrLastReload = Date.now();
+      report(window.__xhsdownQrClicks + ',' + window.__xhsdownQrReloads + ',1');
       location.reload();
       return;
     }
-    report(expired);
+    report(window.__xhsdownQrClicks + ',' + window.__xhsdownQrReloads + ',' + (expired ? 1 : 0));
   };
   window.__xhsdownQrTick = tick;
   setInterval(function () {
