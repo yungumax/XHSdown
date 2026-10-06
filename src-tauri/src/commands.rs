@@ -1585,11 +1585,17 @@ fn log_qr_state(window: &tauri::WebviewWindow) {
     if last.as_deref() == Some(state.as_str()) {
         return;
     }
+    let stage = match state.rsplit(',').next().unwrap_or("0") {
+        "1" => "已过期",
+        "2" => "等手机确认",
+        "3" => "自动刷新已停止（页面反复报过期）",
+        _ => "正常",
+    };
     xhs_core::login::debug_log(&format!(
-        "登录页二维码：点击={} 重载={} 过期={}",
+        "登录页二维码：点击={} 重载={} 状态={}",
         state.split(',').next().unwrap_or("?"),
         state.split(',').nth(1).unwrap_or("?"),
-        if state.ends_with('1') { "是" } else { "否" }
+        stage
     ));
     *last = Some(state);
 }
@@ -1601,7 +1607,6 @@ fn log_qr_state(window: &tauri::WebviewWindow) {
 async fn login_watch(app: tauri::AppHandle) {
     let state = app.state::<AppState>();
     let started = std::time::Instant::now();
-    let mut checked_once = false;
     let mut last_left_login = false;
 
     loop {
@@ -1629,31 +1634,29 @@ async fn login_watch(app: tauri::AppHandle) {
         let just_left_login = left_login_page && last_left_login == false;
         last_left_login = left_login_page;
 
-        // 检测节奏：离开登录页立即查；否则 Cookie 有变化 / 每 5 秒查一次
+        // 检测节奏：**只在真有信号时才去请求主页**——
+        // Cookie 有变化（登录会写 Cookie）、或登录页已经离开 /login。
+        // 之前每 5 秒无条件查一次，未登录时那个请求会跳转到登录页，
+        // 等于在浏览器里反复加载登录页，把用户正在扫的二维码会话顶掉
+        // （实测：二维码每 3 秒"过期↔正常"来回跳，保活脚本被带着一直刷新）。
         let fingerprint = cookie_fingerprint(&window);
-        let (changed, due) = {
+        let changed = {
             let mut baseline = state.login_cookie_baseline.lock().unwrap();
-            let changed = match baseline.as_ref() {
+            match baseline.as_ref() {
                 Some(saved) => saved != &fingerprint,
                 None => {
                     *baseline = Some(fingerprint.clone());
-                    true
+                    false
                 }
-            };
-            let last = *state.last_login_check.lock().unwrap();
-            let due = last
-                .map(|t| t.elapsed() > Duration::from_secs(5))
-                .unwrap_or(true);
-            (changed, due)
+            }
         };
-        if checked_once && !changed && !due && !just_left_login {
+        if !changed && !just_left_login {
             continue;
         }
         if just_left_login {
             xhs_core::login::debug_log("登录页已跳走，立即检测登录状态");
         }
         *state.last_login_check.lock().unwrap() = Some(std::time::Instant::now());
-        checked_once = true;
 
         match browser_login_check(&app).await {
             Ok(Some((uid, name, avatar))) => {
@@ -1877,86 +1880,75 @@ const QR_KEEPER_JS: &str = r#"(function () {
   window.__xhsdownQrClicks = 0;
   window.__xhsdownQrReloads = 0;
   window.__xhsdownQrLastClick = 0;
-  window.__xhsdownQrLastReload = 0;
   window.__xhsdownQrLastReport = '';
+  window.__xhsdownQrExpiredSeen = 0;
+  var MAX_CLICKS = 5;
   var report = function (state) {
-    // 只在状态变化时才写 URL：每 2.5 秒改一次地址栏会打扰页面自己的逻辑
+    // 只在状态变化时才写 URL：每 2.5 秒改一次地址栏会打扰页面自身逻辑
     if (state === window.__xhsdownQrLastReport) return;
     window.__xhsdownQrLastReport = state;
     try { location.replace('#xhsdownqr=' + state); } catch (e) {}
   };
-  var bodyText = function () {
-    return (document.body.innerText || '');
-  };
   var tick = function () {
-    var text = bodyText();
+    var text = document.body.innerText || '';
     var expired = text.indexOf('二维码已过期') >= 0;
-    // 正在扫码/等待手机确认时**绝不动**：这时候换码会让手机确认的是旧码，
+    // 正在扫码/等待手机确认时**绝不动**：这时换码会让手机确认的是旧码，
     // 页面会报 "fail to login"（实测踩过）
     var scanning =
       text.indexOf('扫描成功') >= 0 ||
       text.indexOf('请在手机上确认') >= 0 ||
       text.indexOf('确认登录') >= 0 ||
       text.indexOf('已扫描') >= 0;
-    var failed =
-      text.indexOf('fail to login') >= 0 ||
-      text.indexOf('登录失败') >= 0 ||
-      text.indexOf('失败了') >= 0;
-
     if (scanning) {
+      window.__xhsdownQrExpiredSeen = 0;
       report(window.__xhsdownQrClicks + ',' + window.__xhsdownQrReloads + ',2');
       return;
     }
 
-    // 页面报错（多半是扫码与换码撞了）：隔一段时间重载一次拿全新页面
-    if (failed && Date.now() - window.__xhsdownQrLastReload > 60000) {
-      window.__xhsdownQrLastReload = Date.now();
-      window.__xhsdownQrReloads += 1;
+    // 过期判定要"连续两次成立"：页面偶发地在过期/正常之间横跳，
+    // 只认一次就会把二维码刷个不停（实测踩过）
+    window.__xhsdownQrExpiredSeen = expired ? window.__xhsdownQrExpiredSeen + 1 : 0;
+    var stable = window.__xhsdownQrExpiredSeen >= 2;
+
+    if (!stable) {
+      report(window.__xhsdownQrClicks + ',' + window.__xhsdownQrReloads + ',0');
+      return;
+    }
+    // 点击有冷却，且有次数上限：反复横跳时停下来，别把用户晾在"刷码"里
+    if (window.__xhsdownQrClicks >= MAX_CLICKS) {
+      report(window.__xhsdownQrClicks + ',' + window.__xhsdownQrReloads + ',3');
+      return;
+    }
+    if (Date.now() - window.__xhsdownQrLastClick < 15000) {
       report(window.__xhsdownQrClicks + ',' + window.__xhsdownQrReloads + ',1');
-      location.reload();
       return;
     }
 
-    var target = null;
-    if (expired) {
-      var nodes = document.querySelectorAll('a, button, span, div, p');
-      var leaf = null;
-      var first = null;
-      for (var i = 0; i < nodes.length; i++) {
-        var el = nodes[i];
-        var t = (el.textContent || '').replace(/\s+/g, '');
-        if (t === '点击刷新' || t === '刷新二维码') {
-          if (!first) first = el;
-          // 优先点最内层元素：外层容器点了不生效（事件挂在叶子节点上）
-          if (!leaf && el.children.length === 0) leaf = el;
-        }
+    var nodes = document.querySelectorAll('a, button, span, div, p');
+    var leaf = null;
+    var first = null;
+    for (var i = 0; i < nodes.length; i++) {
+      var el = nodes[i];
+      var t = (el.textContent || '').replace(/\s+/g, '');
+      if (t === '点击刷新' || t === '刷新二维码') {
+        if (!first) first = el;
+        // 优先点最内层元素：外层容器点了不生效（事件挂在叶子节点上）
+        if (!leaf && el.children.length === 0) leaf = el;
       }
-      target = leaf || first;
     }
+    var target = leaf || first;
     if (target) {
       target.click();
       window.__xhsdownQrClicks += 1;
       window.__xhsdownQrLastClick = Date.now();
-    } else if (
-      expired &&
-      window.__xhsdownQrLastClick &&
-      Date.now() - window.__xhsdownQrLastClick > 8000
-    ) {
-      // 点了还没恢复：重载页面拿新二维码
-      window.__xhsdownQrReloads += 1;
-      window.__xhsdownQrLastReload = Date.now();
-      report(window.__xhsdownQrClicks + ',' + window.__xhsdownQrReloads + ',1');
-      location.reload();
-      return;
     }
-    report(window.__xhsdownQrClicks + ',' + window.__xhsdownQrReloads + ',' + (expired ? 1 : 0));
+    report(window.__xhsdownQrClicks + ',' + window.__xhsdownQrReloads + ',1');
   };
   window.__xhsdownQrTick = tick;
   setInterval(function () {
     try { tick(); } catch (e) {}
   }, 2500);
-  // 窗口被切走时系统会降频（页面定时器几乎停摆）：
-  // 回到前台/重新可见时立刻补一次刷新，用户看到的就是"新码"
+  // 窗口被切走时系统会降频：回到前台/可见时立刻补一次检查
   window.addEventListener('focus', function () { try { tick(); } catch (e) {} });
   document.addEventListener('visibilitychange', function () {
     if (!document.hidden) { try { tick(); } catch (e) {} }
