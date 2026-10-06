@@ -994,16 +994,19 @@ const EXTRACT_JS: &str = r#"(function () {
     return v;
   };
   var str = function (v) {
+    v = unwrap(v);
     if (typeof v === 'string') return v;
     if (v && typeof v === 'object') {
       var c = ['url', 'imageUrl', 'urlDefault', 'src', 'image'];
       for (var i = 0; i < c.length; i++) {
-        if (typeof v[c[i]] === 'string') return v[c[i]];
+        var t = unwrap(v[c[i]]);
+        if (typeof t === 'string') return t;
       }
     }
     return '';
   };
   var pick = function (o, keys) {
+    o = unwrap(o);
     if (!o || typeof o !== 'object') return '';
     for (var i = 0; i < keys.length; i++) {
       var t = str(o[keys[i]]);
@@ -1011,6 +1014,20 @@ const EXTRACT_JS: &str = r#"(function () {
     }
     return '';
   };
+  var mergeInto = function (target, source) {
+    source = unwrap(source);
+    if (!source || typeof source !== 'object') return target;
+    var keys = Object.keys(source);
+    for (var i = 0; i < keys.length; i++) {
+      if (target[keys[i]] === undefined) target[keys[i]] = source[keys[i]];
+    }
+    return target;
+  };
+  var arr = function (v) {
+    v = unwrap(v);
+    return Array.isArray(v) ? v : [];
+  };
+
   try {
     var st = window.__INITIAL_STATE__ || null;
     if (!st) {
@@ -1019,36 +1036,39 @@ const EXTRACT_JS: &str = r#"(function () {
     }
 
     // ── 笔记详情页 ──
-    var map = unwrap(st.noteDetailMap) || {};
+    // 真实路径可能在 st.noteDetailMap，也可能在 st.note.noteDetailMap（两种都试）
+    var noteRoot = unwrap(st.note) || {};
+    var map = unwrap(st.noteDetailMap) || unwrap(noteRoot.noteDetailMap) || {};
     var ids = Object.keys(map);
     if (ids.length) {
-      var note = (unwrap(map[ids[0]]) || {}).note || {};
-      note = unwrap(note) || {};
+      var note = unwrap(unwrap(map[ids[0]]) || {}) || {};
+      note = unwrap(note.note) || note;
       var pics = [];
-      var list = unwrap(note.imageList) || [];
+      var list = arr(note.imageList);
       for (var i = 0; i < list.length && i < 80; i++) {
         var pic = unwrap(list[i]) || {};
         var best = '';
-        var infos = unwrap(pic.infoList) || [];
+        var infos = arr(pic.infoList);
         for (var j = 0; j < infos.length; j++) {
-          var info = unwrap(infos[j]) || {};
-          if (info.imageScene === 'WB_DFT' && info.url) {
-            best = info.url;
+          var infoItem = unwrap(infos[j]) || {};
+          if (infoItem.imageScene === 'WB_DFT' && infoItem.url) {
+            best = infoItem.url;
             break;
           }
         }
-        if (!best && infos.length) best = str(unwrap(infos[0])) || '';
-        if (!best) best = str(pic.urlDefault) || str(pic.urlPre) || '';
+        if (!best && infos.length) best = str(infos[0]);
+        if (!best) best = str(pic.urlDefault) || str(pic.urlPre);
         if (best) pics.push(best);
       }
       var videos = [];
-      var streams = unwrap(unwrap(unwrap(note.video) || {}).media || {}) || {};
-      streams = unwrap(streams.stream) || {};
+      var video = unwrap(note.video) || {};
+      var media = unwrap(video.media) || {};
+      var streams = unwrap(media.stream) || {};
       var codecs = ['h264', 'h265', 'av1'];
       for (var c = 0; c < codecs.length && !videos.length; c++) {
-        var arr = unwrap(streams[codecs[c]]) || [];
-        for (var k = 0; k < arr.length; k++) {
-          var it = unwrap(arr[k]) || {};
+        var streamArr = arr(streams[codecs[c]]);
+        for (var k = 0; k < streamArr.length; k++) {
+          var it = unwrap(streamArr[k]) || {};
           var meta = unwrap(it.videoMeta) || {};
           if (it.masterUrl) {
             videos.push({ url: it.masterUrl, height: meta.height || 0, duration: meta.duration || 0 });
@@ -1062,7 +1082,7 @@ const EXTRACT_JS: &str = r#"(function () {
         title: note.title || '',
         desc: String(note.desc || '').slice(0, 20000),
         time: note.time || 0,
-        userId: nu.userId || '', nickname: nu.nickname || '', avatar: str(nu.image) || '',
+        userId: nu.userId || '', nickname: nu.nickname || '', avatar: str(nu.image),
         images: pics, videos: videos
       });
       return;
@@ -1074,21 +1094,58 @@ const EXTRACT_JS: &str = r#"(function () {
     if (typeof page !== 'object' || Array.isArray(page)) page = {};
     var info = unwrap(pu.userInfo) || {};
     if (typeof info !== 'object' || Array.isArray(info)) info = {};
-    var merged = {};
-    var mk = Object.keys(info);
-    for (var mi = 0; mi < mk.length; mi++) merged[mk[mi]] = info[mk[mi]];
-    var pk = Object.keys(page);
-    for (var pi = 0; pi < pk.length; pi++) merged[pk[pi]] = page[pk[pi]];
+    var merged = mergeInto(mergeInto({}, info), page);
 
+    // 访问的是谁：URL 里的 uid 最可靠（/user/profile/{uid}），/me 没有就用状态里的
+    var urlUid = '';
+    var um = location.href.match(/profile\/([0-9a-f]{24})/);
+    if (um) urlUid = um[1];
+    var stateUid = pick(merged, ['id', 'userId', 'user_id', 'userid']);
+
+    // 昵称：标题优先（非通用标题即为目标昵称），否则取状态
+    var rawTitle = (document.title || '').trim();
+    var genericTitle = rawTitle === '小红书' || rawTitle.indexOf('你的生活兴趣社区') >= 0;
+    var titleName = genericTitle ? '' : rawTitle.replace(/\s*[-—|]\s*小红书.*$/, '').trim();
+    var nameEl = document.querySelector(
+      '[class*="user-name"], [class*="nickname"], [class*="user-nickname"]'
+    );
+    var domName = '';
+    if (nameEl) {
+      var nt = (nameEl.textContent || '').trim();
+      if (nt && nt.length <= 30 && nt.indexOf('小红书') < 0) domName = nt;
+    }
+    // 状态里的昵称只在"状态 uid 与链接 uid 一致"（或本来就没有 uid，如 /me）时采用，
+    // 否则可能把登录者自己的昵称显示成访问对象的（实测：状态里的 userPageData 可能是"我"）
+    var stateUidMatches = !urlUid || (!!stateUid && stateUid === urlUid);
+    var stateName = stateUidMatches
+      ? pick(merged, ['nickname', 'nickName', 'nick_name', 'name', 'userName'])
+      : '';
+    var nameOut = titleName || stateName || domName;
+
+    // 头像
+    var avatarOut = pick(merged, ['headImage', 'image', 'avatar', 'images', 'avatarUrl', 'imageb']);
+    if (!avatarOut) {
+      var imgs = document.querySelectorAll('img');
+      for (var ii = 0; ii < imgs.length && ii < 400; ii++) {
+        var isrc = imgs[ii].getAttribute('src') || '';
+        if (isrc.indexOf('sns-avatar') >= 0) {
+          avatarOut = isrc;
+          break;
+        }
+      }
+    }
+
+    // 笔记列表：页面把**访问对象**的主页笔记放在 user.notes 里（实测）
     var cards = [];
-    var notesArr = unwrap(pu.notes) || [];
-    if (!Array.isArray(notesArr)) notesArr = [];
-    for (var n = 0; n < notesArr.length && n < 300; n++) {
-      var card = unwrap(notesArr[n]) || {};
+    var noteList = arr(pu.notes);
+    for (var n = 0; n < noteList.length && n < 300; n++) {
+      var card = unwrap(noteList[n]) || {};
       var nc = unwrap(card.noteCard) || {};
       var cu = unwrap(nc.user) || {};
+      var cid = card.id || '';
+      if (!cid) continue;
       cards.push({
-        id: card.id || '',
+        id: cid,
         token: card.xsecToken || cu.xsecToken || '',
         title: nc.displayTitle || '',
         type: nc.type || '',
@@ -1096,56 +1153,24 @@ const EXTRACT_JS: &str = r#"(function () {
       });
     }
 
-    // DOM 兜底：文档标题即昵称；头像图有专用 CDN 域名；主页链接带 uid
-    var rawTitle = (document.title || '').trim();
-    var genericTitle = rawTitle === '小红书' || rawTitle.indexOf('你的生活兴趣社区') >= 0;
-    var domName = genericTitle ? '' : rawTitle.replace(/\s*[-—|]\s*小红书.*$/, '').trim();
-    var domAvatar = '';
-    var imgs = document.querySelectorAll('img');
-    for (var ii = 0; ii < imgs.length && ii < 400; ii++) {
-      var isrc = imgs[ii].getAttribute('src') || '';
-      if (isrc.indexOf('sns-avatar') >= 0) {
-        domAvatar = isrc;
-        break;
-      }
-    }
-    // 页头渲染出的昵称元素（标题还没更新时的兜底）
-    var domNameEl = '';
-    var nameEl = document.querySelector(
-      '[class*="user-name"], [class*="nickname"], [class*="user-nickname"], h1'
-    );
-    if (nameEl) {
-      var nt = (nameEl.textContent || '').trim();
-      if (nt && nt.length <= 30 && nt.indexOf('小红书') < 0) domNameEl = nt;
-    }
-    // uid 只认 URL 里的：页面上的主页链接可能是别人的（实测把陌生人 uid 当成了本人）
-    var domUid = '';
-    var um = location.href.match(/profile\/([0-9a-f]{24})/);
-    if (um) {
-      domUid = um[1];
-    }
-
-    var uidOut = pick(merged, ['id', 'userId', 'user_id', 'userid']) || domUid || '';
-    var nameOut =
-      pick(merged, ['nickname', 'nickName', 'nick_name', 'name', 'userName']) ||
-      domName ||
-      domNameEl ||
-      '';
-    var avatarOut = pick(merged, ['headImage', 'image', 'avatar', 'images', 'avatarUrl', 'imageb']) || domAvatar || '';
-    var countOut = 0;
-    var rawCount = merged.notes !== undefined ? merged.notes : merged.noteCount;
-    if (typeof rawCount === 'number') countOut = rawCount;
-    else if (typeof rawCount === 'string' && rawCount) countOut = parseInt(rawCount, 10) || 0;
-
-    // 就绪判定：主页**必须有昵称**才算。笔记列表会先于资料返回，那时交卷就会得到
-    // "已登录但昵称头像全空"的假状态（实测踩过两次）；昵称总会有，继续等即可。
+    // 就绪判定：页面自己说"主页抓取完成"（userFetchingStatus=resolved）、或已拿到笔记，
+    // 且必须有昵称——笔记列表会先于资料到达，只认昵称会得到"有列表没资料"的半成品
+    var fetchStatus = String(unwrap(pu.userFetchingStatus) || '');
     if (!nameOut) {
       report({ ready: false, pageUrl: location.href });
       return;
     }
+    if (fetchStatus !== 'resolved' && cards.length === 0) {
+      report({ ready: false, pageUrl: location.href });
+      return;
+    }
+    var countRaw = unwrap(merged.notes) !== undefined ? unwrap(merged.notes) : unwrap(merged.noteCount);
+    var countOut = typeof countRaw === 'number' ? countRaw : 0;
     report({
       ready: true, kind: 'user', pageUrl: location.href,
-      uid: uidOut, nickname: nameOut, avatar: avatarOut,
+      uid: urlUid || stateUid,
+      nickname: nameOut,
+      avatar: avatarOut,
       desc: String(pick(merged, ['desc', 'description']) || '').slice(0, 3000),
       notesCount: countOut,
       notes: cards
@@ -1225,6 +1250,13 @@ async fn webview_fetch_inner(
                 xhs_core::error::truncate(&last_page, 120)
             ));
         }
+    }
+    // 页面跳回首页（/explore 裸页）通常意味着链接里的 token 已失效或被用过
+    if last_page.contains("/explore") && !last_page.contains("/explore/") {
+        return Err(
+            "这个链接已失效：页面跳回了首页（token 过期或已被使用过）。请在 App 里重新分享这条内容、或在用户主页解析出的列表里直接勾选下载"
+                .into(),
+        );
     }
     Err(format!(
         "页面读取超时（最后停在 {}）——可能是网络慢或被风控",
@@ -1732,48 +1764,63 @@ const PAGE_SNAPSHOT_JS: &str = r#"(function () {
       location.replace('#xhsdownselftest=' + encodeURIComponent(JSON.stringify(out)));
     } catch (e) {}
   };
-  // Vue 响应式对象带循环引用，直接 stringify 会抛错：逐字段取值
+  // 状态字段可能是 Vue ref，先解包
+  var unwrap = function (v) {
+    var d = 0;
+    while (v && typeof v === 'object' && v.__v_isRef === true && d < 6) {
+      v = v._value !== undefined ? v._value : v.value;
+      d += 1;
+    }
+    return v;
+  };
   var prim = function (v) {
     if (v === null || v === undefined) return null;
-    if (typeof v === 'string') return v.slice(0, 80);
+    if (typeof v === 'string') return v.slice(0, 60);
     if (typeof v === 'number' || typeof v === 'boolean') return v;
+    if (Array.isArray(v)) return '[' + v.length + ' 项]';
     return '[' + Object.prototype.toString.call(v).slice(8, -1) + ']';
   };
   var fields = function (obj, limit) {
     var out = {};
-    if (!obj || typeof obj !== 'object') return out;
-    var keys = Object.keys(obj).slice(0, limit || 24);
+    var o = unwrap(obj);
+    if (!o || typeof o !== 'object') return out;
+    var keys = Object.keys(o).slice(0, limit || 20);
     for (var i = 0; i < keys.length; i++) {
-      try { out[keys[i]] = prim(obj[keys[i]]); } catch (e) { out[keys[i]] = '?'; }
+      try { out[keys[i]] = prim(unwrap(o[keys[i]])); } catch (e) { out[keys[i]] = '?'; }
     }
     return out;
   };
+  var safe = function (v) {
+    try { return JSON.stringify(unwrap(v)).slice(0, 300); } catch (e) { return '[circular]'; }
+  };
   try {
     var out = { url: location.href, title: document.title };
-    out.text = (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 300);
-    var imgs = document.querySelectorAll('img');
-    out.imgs = [];
-    for (var i = 0; i < imgs.length && i < 8; i++) {
-      out.imgs.push((imgs[i].getAttribute('src') || '').slice(0, 70));
-    }
-    var links = document.querySelectorAll('a');
-    out.profileLinks = [];
-    for (var j = 0; j < links.length && j < 300; j++) {
-      var href = links[j].getAttribute('href') || '';
-      if (href.indexOf('/user/profile/') >= 0) {
-        out.profileLinks.push(href.slice(0, 50));
-        if (out.profileLinks.length >= 4) break;
+    var st = window.__INITIAL_STATE__ || {};
+    var pu = unwrap(st.user) || {};
+    out.userFields = fields(pu, 18);
+    out.notesLen = ((unwrap(pu.notes) || []).length);
+    out.noteQueriesType = Object.prototype.toString.call(unwrap(pu.noteQueries));
+    out.noteQueriesKeys = Object.keys(unwrap(pu.noteQueries) || {}).slice(0, 6);
+    out.noteQueriesSample = safe(pu.noteQueries);
+    out.pageFields = fields(unwrap(pu.userPageData), 14);
+    // DOM：笔记卡片链接（主页网格里是 /user/profile/{uid}/{noteId} 或 /explore/{noteId}）
+    var links = document.querySelectorAll('a[href]');
+    var seen = {};
+    var noteLinks = [];
+    for (var i = 0; i < links.length && noteLinks.length < 8; i++) {
+      var href = links[i].getAttribute('href') || '';
+      var m = href.match(/(?:\/explore\/|\/user\/profile\/[0-9a-f]{24}\/)([0-9a-f]{24})/);
+      if (m && !seen[m[1]]) {
+        seen[m[1]] = 1;
+        noteLinks.push({
+          id: m[1],
+          href: href.slice(0, 60),
+          text: (links[i].textContent || '').replace(/\s+/g, ' ').trim().slice(0, 36),
+        });
       }
     }
-    var st = window.__INITIAL_STATE__ || {};
-    var u = st.user || {};
-    out.userFields = fields(u, 16);
-    out.pageType = Object.prototype.toString.call(u.userPageData);
-    out.pageFields = fields(u.userPageData, 20);
-    out.notesLen = (u.notes || []).length;
-    out.infoType = Object.prototype.toString.call(u.userInfo);
-    out.infoFields = fields(u.userInfo, 20);
-    out.otherKeys = Object.keys(st).slice(0, 20);
+    out.domNoteLinks = noteLinks;
+    out.domNoteLinkCount = links.length;
     report(out);
   } catch (e) {
     report({ error: String(e) });
