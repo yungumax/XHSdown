@@ -22,6 +22,14 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .manage(state)
+        // 主窗口一关就退出应用：取数窗口是隐藏的，如果等"所有窗口关闭"才退出，
+        // 用户关掉主窗口后进程会带着隐藏窗口继续留在后台（而且还占着 exe 不让更新）
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::Destroyed) && window.label() == "main" {
+                use tauri::Manager as _;
+                window.app_handle().exit(0);
+            }
+        })
         // 兜底：页面加载完成即显示窗口（正常路径是前端挂载后主动调用）
         .on_page_load(|window, payload| {
             if payload.event() == tauri::webview::PageLoadEvent::Finished {
