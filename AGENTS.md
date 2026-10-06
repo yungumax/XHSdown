@@ -26,22 +26,27 @@
   （实测：登录窗里 Cookie 齐全，程序自己请求仍被判未登录）。所以解析走隐藏的
   `xhs-fetch` 窗口（与登录窗共用浏览器数据目录），reqwest 只负责下载 CDN 直链
   （那些地址自带签名，不需要 Cookie）。入口：`webview_fetch()` / `fetch_note()` / `fetch_user()`。
-- **登录判定的唯一权威依据**：让浏览器去读 `/user/profile/me`，拿到真实资料
-  才算已登录（`browser_login_check()`）。页面里的 `loggedIn` 字段**对匿名访客也是
-  true**，用它判定会误报「已登录」（实测踩过）。
+- **登录判定**：让浏览器去读 `/user/profile/me` —— 未登录会被 302 到 `/login`
+  （`webview_fetch` 因此报「需要登录」），能正常渲染就算已登录（`browser_login_check()`）。
+  页面里的 `loggedIn` 字段**对匿名访客也是 true**，不能用来判定（实测踩过）；
+  资料字段也可能为空（异步加载），所以昵称/头像再退回 DOM：文档标题即昵称、
+  头像图在 `sns-avatar` CDN、页头头像链接 `/user/profile/{uid}` 就是本人 uid。
+  实测结果：`nickname=允骨 uid=618c64cd… notes=5`（自己的主页能读到笔记列表）。
 - **登录态存在 %APPDATA%\xhsdown\webview**（浏览器数据目录），跨重启保留；
   退出登录时删该目录，删不掉就留 `webview.logout` 标记下次启动清——否则会
   「点了退出登录、重启又自动登录回去」。
 - **访客指纹 Cookie**：无 `a1` / `webId` / `xsecappid` 时，连探索页都会被 302。
   `XhsClient::warmup()` 会补一组访客值——这组值只够过首页（reqwest 快路径用）。
+- **`__INITIAL_STATE__` 里的字段是 Vue ref，必须解包**：小红书把状态挂在 Vue 的
+  `ref` 上（`{__v_isRef:true, _rawValue, _value}`），直接读字段只会拿到包装壳
+  ——实测"登录后 userPageData 看着是空对象"就是这个原因，白排查了好几轮。
+  `EXTRACT_JS` 里的 `unwrap()` 会逐层剥 `_value`，**所有状态读取都要过它**。
 - **登录页二维码不会自动续期**：实测（在真实浏览器里盯了十几分钟）二维码图片从头到尾
   不变，过期后会显示「二维码已过期」（刷新元素是叶子节点
   `<div class="status-desc refresh">点击刷新</div>`，点它确实能换出新码——已验证）。
-  另外 **WebView2/Chromium 在窗口被遮挡时会把页面定时器降频到约 1 次/分钟**，
-  用户切到手机扫码时正好触发"页面停摆、二维码过期"。
-  所以 `QR_KEEPER_JS`（注入到登录窗）做三件事：每 2.5 秒检查并点击刷新、
-  窗口回到前台/可见时立刻补一次、点不动 8 秒后重载页面。改这段要连着
-  `windows` 遮挡行为一起考虑。
+  另外 **WebView2/Chromium 在窗口被遮挡时会把页面定时器降频（实测前端轮询静默 80+ 秒）**，
+  所以"等登录"这件事由**后端** `login_watch` 定时器做（不受降频影响），
+  检测到登录后用 `login://confirmed` 事件推给前端。
 - **登录页自检开关**：在数据目录放一个空的 `login_selftest` 文件再启动应用，
   它会自动开一个隐藏窗口打开官方登录页，把「二维码图片数 / 是否过期 / 刷新元素 /
   手机号输入框 / 保活脚本是否装上」写进 `xhs_debug.log`（前缀 `自检·注入前/后`），

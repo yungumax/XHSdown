@@ -14,28 +14,27 @@ const busy = ref(false);
 const status = ref("正在打开小红书官方登录窗口…");
 const windowOpen = ref(false);
 
-// 轮询代际：退出登录/关闭弹窗时 +1，旧循环发现代际变了自动终止——
-// 否则 webview 里残留的登录 Cookie 会让轮询把用户"重新登录"回去（实测踩过）
-const gen = ref(0);
+// 后端轮询：界面窗口被登录窗遮挡时，前端定时器会被系统降频到近乎停摆
+//（实测静默 80+ 秒），所以"等登录"这件事交给后端 Rust 定时器做，
+// 检测到登录后由后端推 login://confirmed 事件过来。
 let alive = true;
+let unlisten = null;
 
-// 已登录 → 未登录的瞬间（退出登录）终止进行中的轮询
 watch(
   () => props.login.logged_in,
   (on, was) => {
-    if (was && !on) stop();
+    if (was && !on) stop(); // 退出登录
   }
 );
 
 onUnmounted(() => {
   alive = false;
-  gen.value += 1;
+  if (unlisten) unlisten();
 });
 
 function stop() {
-  gen.value += 1;
-  busy.value = false;
   status.value = "";
+  busy.value = false;
 }
 
 /** 打开官方登录窗口（已开着就聚焦） */
@@ -50,67 +49,40 @@ async function openWindow() {
   }
 }
 
-/** 轮询登录状态：一旦识别出登录，就自动完成绑定并关闭弹窗 */
-async function waitForLogin() {
-  if (busy.value) return;
-  busy.value = true;
-  const mine = ++gen.value;
-  status.value = "请在小窗里完成登录（手机号验证码 / 账号密码 / 扫码都可以），登录成功后此处会自动完成绑定。";
-  try {
-    await openWindow();
-    const limit = 150; // 150 × 2s = 5 分钟
-    for (let i = 0; i < limit; i++) {
-      await new Promise((r) => setTimeout(r, 2000));
-      if (!alive || mine !== gen.value) return;
-      try {
-        const info = await api.webLoginCookies();
-        if (!alive || mine !== gen.value) return;
-        emit("web-confirmed", info);
-        return;
-      } catch (error) {
-        const text = String(error);
-        if (text.includes("登录窗口已关闭")) {
-          windowOpen.value = false;
-          status.value = "登录窗口已关闭。点下方按钮重新打开，或直接在此关闭。";
-          return;
-        }
-        // 「还没登录」是预期状态，不打扰；其它错误（超时、风控、页面异常）早点显示出来
-        if (!text.includes("还没有检测到登录状态") && i >= 1) status.value = text;
-        if (i === limit - 1) status.value = text;
-      }
-    }
-    status.value = "等待超时。可以关掉登录窗口重开一次，或点下方「重新打开登录窗口」。";
-  } finally {
-    if (alive && mine === gen.value) busy.value = false;
-  }
+/** 开始等待登录：开窗 + 后端轮询 + 监听成功事件 */
+async function startWaiting() {
+  await openWindow();
+  await api.webLoginWatch().catch((error) => {
+    status.value = String(error);
+  });
+  status.value =
+    "请在小窗里完成登录（手机号 + 短信验证码最稳，也可扫码）。登录成功后此处会自动完成绑定。";
 }
 
-/** 手动查一次（自动轮询之外的手动兜底） */
+/** 手动查一次（后端轮询之外的手动兜底） */
 async function checkNow() {
   if (busy.value) return;
-  const mine = ++gen.value;
   busy.value = true;
   status.value = "正在检测登录状态…";
   try {
     const info = await api.webLoginCookies();
-    if (!alive || mine !== gen.value) return;
+    if (!alive) return;
     emit("web-confirmed", info);
   } catch (error) {
     status.value = String(error);
   } finally {
-    if (alive && mine === gen.value) busy.value = false;
+    if (alive) busy.value = false;
   }
 }
 
 /** 重新加载登录页：二维码/页面卡住时的恢复手段（关掉重开 = 全新页面） */
 async function reloadLogin() {
-  stop();
   try {
     await api.webLoginClose();
   } catch {}
   await new Promise((r) => setTimeout(r, 400));
   status.value = "已重新加载登录页…";
-  waitForLogin();
+  await startWaiting();
 }
 
 async function closeAll() {
@@ -127,8 +99,13 @@ const idText = computed(() => {
   return id.length > 16 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
 });
 
-onMounted(() => {
-  if (!props.login.logged_in) waitForLogin();
+onMounted(async () => {
+  if (props.login.logged_in) return;
+  unlisten = await api.onLoginConfirmed((info) => {
+    if (!alive) return;
+    emit("web-confirmed", info);
+  });
+  await startWaiting();
 });
 </script>
 

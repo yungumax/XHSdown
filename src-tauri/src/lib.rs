@@ -91,6 +91,7 @@ pub fn run() {
             commands::cancel_download,
             commands::web_login_open,
             commands::web_login_cookies,
+            commands::web_login_watch,
             commands::web_login_close,
             commands::logout,
             commands::choose_output_dir,

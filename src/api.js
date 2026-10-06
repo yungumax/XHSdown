@@ -196,6 +196,18 @@ export async function webLoginCookies() {
   return invokeZh("web_login_cookies");
 }
 
+/** 网页登录：让后端开始轮询登录状态（后端定时器不受窗口遮挡降频影响） */
+export async function webLoginWatch() {
+  if (!hasTauri) return;
+  return invokeZh("web_login_watch");
+}
+
+/** 登录成功事件（后端检测到登录后推送 LoginInfo） */
+export async function onLoginConfirmed(handler) {
+  if (!hasTauri) return () => {};
+  return listen("login://confirmed", (event) => handler(event.payload));
+}
+
 /** 网页登录：关闭内嵌窗口 */
 export async function webLoginClose() {
   if (!hasTauri) return;

@@ -972,78 +972,174 @@ const EXTRACT_JS: &str = r#"(function () {
       location.replace('#xhsdownid=' + Date.now() + '~' + encodeURIComponent(JSON.stringify(out)));
     } catch (e) {}
   };
+  // 小红书把状态字段包在 Vue 的 ref 里（{__v_isRef:true,_value:…}），必须逐层剥开，
+  // 否则读到的永远是包装壳（实测踩过：登录后 userPageData 看着是空对象，其实是 ref）
+  var unwrap = function (v) {
+    var depth = 0;
+    while (v && typeof v === 'object' && v.__v_isRef === true && depth < 6) {
+      v = v._value !== undefined ? v._value : v.value;
+      depth += 1;
+    }
+    return v;
+  };
+  var str = function (v) {
+    if (typeof v === 'string') return v;
+    if (v && typeof v === 'object') {
+      var c = ['url', 'imageUrl', 'urlDefault', 'src', 'image'];
+      for (var i = 0; i < c.length; i++) {
+        if (typeof v[c[i]] === 'string') return v[c[i]];
+      }
+    }
+    return '';
+  };
+  var pick = function (o, keys) {
+    if (!o || typeof o !== 'object') return '';
+    for (var i = 0; i < keys.length; i++) {
+      var t = str(o[keys[i]]);
+      if (t) return t;
+    }
+    return '';
+  };
   try {
     var st = window.__INITIAL_STATE__ || null;
-    if (!st) { report({ ready: false, pageUrl: location.href }); return; }
-    var map = st.noteDetailMap || {};
+    if (!st) {
+      report({ ready: false, pageUrl: location.href });
+      return;
+    }
+
+    // ── 笔记详情页 ──
+    var map = unwrap(st.noteDetailMap) || {};
     var ids = Object.keys(map);
     if (ids.length) {
-      var note = (map[ids[0]] || {}).note || {};
+      var note = (unwrap(map[ids[0]]) || {}).note || {};
+      note = unwrap(note) || {};
       var pics = [];
-      var list = note.imageList || [];
+      var list = unwrap(note.imageList) || [];
       for (var i = 0; i < list.length && i < 80; i++) {
-        var pic = list[i] || {};
+        var pic = unwrap(list[i]) || {};
         var best = '';
-        var infos = pic.infoList || [];
+        var infos = unwrap(pic.infoList) || [];
         for (var j = 0; j < infos.length; j++) {
-          if (infos[j] && infos[j].imageScene === 'WB_DFT' && infos[j].url) { best = infos[j].url; break; }
+          var info = unwrap(infos[j]) || {};
+          if (info.imageScene === 'WB_DFT' && info.url) {
+            best = info.url;
+            break;
+          }
         }
-        if (!best && infos.length && infos[0].url) best = infos[0].url;
-        if (!best) best = pic.urlDefault || pic.urlPre || '';
+        if (!best && infos.length) best = str(unwrap(infos[0])) || '';
+        if (!best) best = str(pic.urlDefault) || str(pic.urlPre) || '';
         if (best) pics.push(best);
       }
       var videos = [];
-      var streams = (((note.video || {}).media || {}).stream) || {};
+      var streams = unwrap(unwrap(unwrap(note.video) || {}).media || {}) || {};
+      streams = unwrap(streams.stream) || {};
       var codecs = ['h264', 'h265', 'av1'];
       for (var c = 0; c < codecs.length && !videos.length; c++) {
-        var arr = streams[codecs[c]] || [];
+        var arr = unwrap(streams[codecs[c]]) || [];
         for (var k = 0; k < arr.length; k++) {
-          var it = arr[k] || {};
-          var meta = it.videoMeta || {};
-          if (it.masterUrl) videos.push({ url: it.masterUrl, height: meta.height || 0, duration: meta.duration || 0 });
+          var it = unwrap(arr[k]) || {};
+          var meta = unwrap(it.videoMeta) || {};
+          if (it.masterUrl) {
+            videos.push({ url: it.masterUrl, height: meta.height || 0, duration: meta.duration || 0 });
+          }
         }
       }
-      var u = note.user || {};
+      var nu = unwrap(note.user) || {};
       report({
         ready: true, kind: 'note', pageUrl: location.href,
         noteId: note.noteId || ids[0],
         title: note.title || '',
         desc: String(note.desc || '').slice(0, 20000),
         time: note.time || 0,
-        userId: u.userId || '', nickname: u.nickname || '', avatar: u.image || '',
+        userId: nu.userId || '', nickname: nu.nickname || '', avatar: str(nu.image) || '',
         images: pics, videos: videos
       });
       return;
     }
-    var pu = st.user || {};
-    var page = pu.userPageData;
-    if (page && typeof page === 'object' && !Array.isArray(page)) {
-      var cards = [];
-      var notes = pu.notes || [];
-      for (var n = 0; n < notes.length && n < 300; n++) {
-        var card = notes[n] || {};
-        var nc = card.noteCard || {};
-        cards.push({
-          id: card.id || '', token: card.xsecToken || '',
-          title: nc.displayTitle || '', type: nc.type || '',
-          time: card.time || nc.time || 0
-        });
-      }
-      report({
-        ready: true, kind: 'user', pageUrl: location.href,
-        uid: page.id || page.userId || '', nickname: page.nickname || '',
-        avatar: page.headImage || page.image || '',
-        desc: String(page.desc || '').slice(0, 3000),
-        notesCount: page.notes || 0,
-        notes: cards
+
+    // ── 用户主页 ──
+    var pu = unwrap(st.user) || {};
+    var page = unwrap(pu.userPageData) || {};
+    if (typeof page !== 'object' || Array.isArray(page)) page = {};
+    var info = unwrap(pu.userInfo) || {};
+    if (typeof info !== 'object' || Array.isArray(info)) info = {};
+    var merged = {};
+    var mk = Object.keys(info);
+    for (var mi = 0; mi < mk.length; mi++) merged[mk[mi]] = info[mk[mi]];
+    var pk = Object.keys(page);
+    for (var pi = 0; pi < pk.length; pi++) merged[pk[pi]] = page[pk[pi]];
+
+    var cards = [];
+    var notesArr = unwrap(pu.notes) || [];
+    if (!Array.isArray(notesArr)) notesArr = [];
+    for (var n = 0; n < notesArr.length && n < 300; n++) {
+      var card = unwrap(notesArr[n]) || {};
+      var nc = unwrap(card.noteCard) || {};
+      var cu = unwrap(nc.user) || {};
+      cards.push({
+        id: card.id || '',
+        token: card.xsecToken || cu.xsecToken || '',
+        title: nc.displayTitle || '',
+        type: nc.type || '',
+        time: card.time || nc.time || 0
       });
+    }
+
+    // DOM 兜底：文档标题即昵称；头像图有专用 CDN 域名；主页链接带 uid
+    var rawTitle = (document.title || '').trim();
+    var genericTitle = rawTitle === '小红书' || rawTitle.indexOf('你的生活兴趣社区') >= 0;
+    var domName = genericTitle ? '' : rawTitle.replace(/\s*[-—|]\s*小红书.*$/, '').trim();
+    var domAvatar = '';
+    var imgs = document.querySelectorAll('img');
+    for (var ii = 0; ii < imgs.length && ii < 400; ii++) {
+      var isrc = imgs[ii].getAttribute('src') || '';
+      if (isrc.indexOf('sns-avatar') >= 0) {
+        domAvatar = isrc;
+        break;
+      }
+    }
+    var domUid = '';
+    var um = location.href.match(/profile\/([0-9a-f]{24})/);
+    if (um) {
+      domUid = um[1];
+    }
+    if (!domUid) {
+      var alinks = document.querySelectorAll('a[href*="/user/profile/"]');
+      for (var ai = 0; ai < alinks.length && ai < 300; ai++) {
+        var am = (alinks[ai].getAttribute('href') || '').match(/profile\/([0-9a-f]{24})/);
+        if (am) {
+          domUid = am[1];
+          break;
+        }
+      }
+    }
+
+    var uidOut = pick(merged, ['id', 'userId', 'user_id', 'userid']) || domUid || '';
+    var nameOut = pick(merged, ['nickname', 'nickName', 'nick_name', 'name', 'userName']) || domName || '';
+    var avatarOut = pick(merged, ['headImage', 'image', 'avatar', 'images', 'avatarUrl', 'imageb']) || domAvatar || '';
+    var countOut = 0;
+    var rawCount = merged.notes !== undefined ? merged.notes : merged.noteCount;
+    if (typeof rawCount === 'number') countOut = rawCount;
+    else if (typeof rawCount === 'string' && rawCount) countOut = parseInt(rawCount, 10) || 0;
+
+    // 就绪判定：拿到真实身份或笔记列表才算（避免用"还在加载"的空壳当结果）
+    if (!uidOut && !nameOut && cards.length === 0) {
+      report({ ready: false, pageUrl: location.href });
       return;
     }
-    report({ ready: false, pageUrl: location.href });
+    report({
+      ready: true, kind: 'user', pageUrl: location.href,
+      uid: uidOut, nickname: nameOut, avatar: avatarOut,
+      desc: String(pick(merged, ['desc', 'description']) || '').slice(0, 3000),
+      notesCount: countOut,
+      notes: cards
+    });
+    return;
   } catch (e) {
     report({ error: String(e), pageUrl: location.href });
   }
-})();"#;
+})();
+"#;
 
 /// 在当前页面注入提取脚本并把片段读回来。
 async fn extract_from_page(window: &tauri::WebviewWindow) -> Option<serde_json::Value> {
@@ -1102,28 +1198,126 @@ async fn webview_fetch(app: &tauri::AppHandle, url: &str) -> Result<serde_json::
     ))
 }
 
-/// 让浏览器去读「我的主页」：拿到真实资料才算已登录。
-/// 这是登录判定的唯一权威依据——页面里的 loggedIn 字段对匿名访客也为 true（实测踩过）。
+/// 从页面 DOM 取账号资料。
+/// 为什么不读内部状态：实测登录后 `user.userPageData` 是空对象——资料是页面加载后
+/// 异步取回的，初始状态里没有；但页面本身一定会渲染昵称（文档标题）与头像图。
+const IDENTITY_DOM_JS: &str = r#"(function () {
+  var report = function (out) {
+    try {
+      location.replace('#xhsdownid=' + Date.now() + '~' + encodeURIComponent(JSON.stringify(out)));
+    } catch (e) {}
+  };
+  try {
+    var out = { ready: true };
+    var raw = (document.title || '').trim();
+    // 站点默认标题（还没加载出真昵称）→ 标成未就绪，让调用方稍后再试
+    if (raw === '小红书' || raw.indexOf('你的生活兴趣社区') >= 0) {
+      report({ ready: false, pageUrl: location.href });
+      return;
+    }
+    out.title = raw.replace(/\s*[-—|]\s*小红书.*$/, '').trim();
+    var imgs = document.querySelectorAll('img');
+    for (var i = 0; i < imgs.length && i < 400; i++) {
+      var src = imgs[i].getAttribute('src') || '';
+      if (src.indexOf('sns-avatar') >= 0 || src.indexOf('avatar') >= 0) {
+        out.avatar = src;
+        break;
+      }
+    }
+    var um = location.href.match(/profile\/([0-9a-f]{24})/);
+    if (um) out.uid = um[1];
+    if (!out.uid) {
+      var links = document.querySelectorAll('a[href*="/user/profile/"]');
+      for (var j = 0; j < links.length && j < 200; j++) {
+        var m = (links[j].getAttribute('href') || '').match(/profile\/([0-9a-f]{24})/);
+        if (m) { out.uid = m[1]; break; }
+      }
+    }
+    report(out);
+  } catch (e) {
+    report({ error: String(e) });
+  }
+})();"#;
+
+/// 读取 IDENTITY_DOM_JS 写回的资料。
+async fn read_identity(window: &tauri::WebviewWindow) -> Option<(String, String, String)> {
+    for _ in 0..24 {
+        tokio::time::sleep(Duration::from_millis(220)).await;
+        let Ok(url) = window.url() else { continue };
+        let text = url.to_string();
+        let Some(idx) = text.find("xhsdownid=") else { continue };
+        let rest = &text[idx + "xhsdownid=".len()..];
+        let Some(tilde) = rest.find('~') else { continue };
+        let payload = rest[tilde + 1..].split('&').next().unwrap_or("");
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&percent_decode(payload)) else {
+            continue;
+        };
+        if value.get("error").is_some() {
+            return None;
+        }
+        if !value.get("ready").and_then(|v| v.as_bool()).unwrap_or(false) {
+            continue; // 标题还是站点默认的：稍后再试
+        }
+        let uid = value.get("uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let name = value.get("title").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let avatar = value.get("avatar").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        return Some((uid, name, avatar));
+    }
+    None
+}
+
+/// 让浏览器去读「我的主页」，判断当前是否已登录并尽量取回账号资料。
+///
+/// 判定依据是**页面有没有被踢到登录页**：未登录时 /user/profile/me 会 302 到 /login
+/// （`webview_fetch` 会因此返回"需要登录"错误），登录成功则正常渲染。
+/// 资料字段不能作为判据——登录后 userPageData 仍可能是空对象（实测踩过）。
 async fn browser_login_check(
     app: &tauri::AppHandle,
 ) -> Result<Option<(String, String, String)>, String> {
     let value = match webview_fetch(app, "https://www.xiaohongshu.com/user/profile/me").await {
         Ok(value) => value,
         Err(e) => {
-            // "需要登录"是正常状态（就是没登录），不该当错误抛给界面
+            // "需要登录"就是没登录，不算错误
             xhs_core::login::debug_log(&format!("登录检测：{e}"));
             return Ok(None);
         }
     };
-    if value.get("kind").and_then(|v| v.as_str()) != Some("user") {
-        return Ok(None);
+
+    let mut uid = value.get("uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let mut name = value.get("nickname").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let mut avatar = value.get("avatar").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+
+    // 状态里没资料就退回 DOM（文档标题=昵称、头像图、主页链接里的 uid）
+    if uid.is_empty() || name.is_empty() {
+        if let Some(window) = app.get_webview_window("xhs-fetch") {
+            // 资料异步到达：最多重试 3 轮（每轮内部轮询 ~5 秒）
+            for _ in 0..3 {
+                let _ = window.eval(IDENTITY_DOM_JS);
+                if let Some((_u, _n, _a)) = read_identity(&window).await {
+                    break;
+                }
+            }
+            let _ = window.eval(IDENTITY_DOM_JS);
+            if let Some((dom_uid, dom_name, dom_avatar)) = read_identity(&window).await {
+                if uid.is_empty() {
+                    uid = dom_uid;
+                }
+                if name.is_empty() {
+                    name = dom_name;
+                }
+                if avatar.is_empty() {
+                    avatar = dom_avatar;
+                }
+            }
+        }
     }
-    let uid = value.get("uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let name = value.get("nickname").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let avatar = value.get("avatar").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    if uid.is_empty() && name.is_empty() {
-        return Ok(None);
-    }
+
+    xhs_core::login::debug_log(&format!(
+        "登录检测：已登录（昵称={:?} uid={:?} 头像={}）",
+        name,
+        uid,
+        if avatar.is_empty() { "无" } else { "有" }
+    ));
     Ok(Some((uid, name, avatar)))
 }
 
@@ -1357,9 +1551,212 @@ fn state_of_qr_log() -> &'static std::sync::Mutex<Option<String>> {
     LAST.get_or_init(|| std::sync::Mutex::new(None))
 }
 
+/// 读取登录窗上的二维码状态上报并记日志（只在数值变化时记）。
+fn log_qr_state(window: &tauri::WebviewWindow) {
+    let Ok(url) = window.url() else { return };
+    let text = url.to_string();
+    let Some(idx) = text.find("xhsdownqr=") else { return };
+    let rest = &text[idx + "xhsdownqr=".len()..];
+    let state = rest.split('&').next().unwrap_or("").to_string();
+    if state.is_empty() {
+        return;
+    }
+    let mut last = state_of_qr_log().lock().unwrap();
+    if last.as_deref() == Some(state.as_str()) {
+        return;
+    }
+    xhs_core::login::debug_log(&format!(
+        "登录页二维码：点击={} 重载={} 过期={}",
+        state.split(',').next().unwrap_or("?"),
+        state.split(',').nth(1).unwrap_or("?"),
+        if state.ends_with('1') { "是" } else { "否" }
+    ));
+    *last = Some(state);
+}
+
+/// 后端登录轮询：定时检查登录页，检测到登录就完成绑定并向前端发事件。
+///
+/// 为什么放后端：界面窗口被登录窗遮挡时，WebView2 会把页面定时器降频到近乎停摆
+/// （实测：前端轮询静默 80+ 秒），登录成功了界面也收不到通知。Rust 侧定时器不受影响。
+async fn login_watch(app: tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    let started = std::time::Instant::now();
+    let mut checked_once = false;
+
+    loop {
+        if started.elapsed() > Duration::from_secs(600) {
+            xhs_core::login::debug_log("登录轮询：超过 10 分钟，停止");
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+
+        // 登录窗被关掉（用户取消/完成绑定）就停
+        let Some(window) = app.get_webview_window("web-login") else {
+            xhs_core::login::debug_log("登录轮询：登录窗已关闭，停止");
+            break;
+        };
+
+        // 二维码保活也交给后端：定时器不降频，二维码不会停在过期态
+        let _ = window.eval(QR_KEEPER_JS);
+        log_qr_state(&window);
+
+        // 检测节奏：Cookie 有变化、或距上次检测满 12 秒、或还没查过
+        let fingerprint = cookie_fingerprint(&window);
+        let (changed, due) = {
+            let mut baseline = state.login_cookie_baseline.lock().unwrap();
+            let changed = match baseline.as_ref() {
+                Some(saved) => saved != &fingerprint,
+                None => {
+                    *baseline = Some(fingerprint.clone());
+                    true
+                }
+            };
+            let last = *state.last_login_check.lock().unwrap();
+            let due = last
+                .map(|t| t.elapsed() > Duration::from_secs(12))
+                .unwrap_or(true);
+            (changed, due)
+        };
+        if checked_once && !changed && !due {
+            continue;
+        }
+        *state.last_login_check.lock().unwrap() = Some(std::time::Instant::now());
+        checked_once = true;
+
+        match browser_login_check(&app).await {
+            Ok(Some((uid, name, avatar))) => {
+                xhs_core::login::debug_log(&format!(
+                    "检测到登录：昵称={:?} uid={:?}",
+                    name, uid
+                ));
+                match finish_login(&app, &state, uid, name, avatar).await {
+                    Ok(login) => {
+                        let _ = app.emit("login://confirmed", login);
+                        break;
+                    }
+                    Err(e) => {
+                        xhs_core::login::debug_log(&format!("登录收尾失败：{e}"));
+                    }
+                }
+            }
+            Ok(None) => {
+                xhs_core::login::debug_log("登录检测：仍未登录");
+            }
+            Err(e) => {
+                xhs_core::login::debug_log(&format!("登录检测出错：{e}"));
+            }
+        }
+    }
+
+    state.login_watch_running.store(false, Ordering::SeqCst);
+}
+
+#[tauri::command]
+pub async fn web_login_watch(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
+    if state.login_watch_running.swap(true, Ordering::SeqCst) {
+        return Ok(()); // 已经在跑
+    }
+    let app2 = app.clone();
+    tokio::spawn(async move { login_watch(app2).await });
+    Ok(())
+}
+
+/// 诊断转储脚本（仅自检用）：把页面里"账号资料可能藏身的位置"全打出来。
+const DUMP_PROFILE_JS: &str = r#"(function () {
+  var out = { url: location.href, title: document.title };
+  try {
+    var st = window.__INITIAL_STATE__ || {};
+    var u = st.user || {};
+    out.loggedIn = u.loggedIn;
+    out.userKeys = Object.keys(u);
+    var info = u.userInfo;
+    out.userInfoType = Object.prototype.toString.call(info);
+    if (info && typeof info === 'object') {
+      out.userInfoKeys = Object.keys(info).slice(0, 24);
+      out.userInfoSample = JSON.stringify(info).slice(0, 300);
+    }
+    var page = u.userPageData;
+    out.pageType = Object.prototype.toString.call(page);
+    if (page && typeof page === 'object') {
+      out.pageKeys = Object.keys(page).slice(0, 24);
+      out.pageSample = JSON.stringify(page).slice(0, 300);
+    }
+  } catch (e) { out.err = String(e); }
+  var m = location.href.match(/profile\/([0-9a-f]{24})/);
+  if (m) out.urlUid = m[1];
+  var links = document.querySelectorAll('a[href*="/user/profile/"]');
+  var uids = {};
+  for (var i = 0; i < links.length && i < 40; i++) {
+    var mm = (links[i].getAttribute('href') || '').match(/profile\/([0-9a-f]{24})/);
+    if (mm) uids[mm[1]] = 1;
+  }
+  out.linkUids = Object.keys(uids).slice(0, 5);
+  var h = document.querySelector('h1, .user-name, .name, .user-nickname');
+  out.domName = h ? (h.textContent || '').trim().slice(0, 40) : null;
+  var av = document.querySelector('img.avatar, .user-avatar img, img[class*=avatar]');
+  out.domAvatar = av ? (av.getAttribute('src') || '').slice(0, 100) : null;
+  location.replace('#xhsdownselftest=' + encodeURIComponent(JSON.stringify(out)));
+})();"#;
+
+/// 页面快照（仅自检用）：标题、正文开头、图片、链接、状态字段全打出来。
+const PAGE_SNAPSHOT_JS: &str = r#"(function () {
+  var report = function (out) {
+    try {
+      location.replace('#xhsdownselftest=' + encodeURIComponent(JSON.stringify(out)));
+    } catch (e) {}
+  };
+  // Vue 响应式对象带循环引用，直接 stringify 会抛错：逐字段取值
+  var prim = function (v) {
+    if (v === null || v === undefined) return null;
+    if (typeof v === 'string') return v.slice(0, 80);
+    if (typeof v === 'number' || typeof v === 'boolean') return v;
+    return '[' + Object.prototype.toString.call(v).slice(8, -1) + ']';
+  };
+  var fields = function (obj, limit) {
+    var out = {};
+    if (!obj || typeof obj !== 'object') return out;
+    var keys = Object.keys(obj).slice(0, limit || 24);
+    for (var i = 0; i < keys.length; i++) {
+      try { out[keys[i]] = prim(obj[keys[i]]); } catch (e) { out[keys[i]] = '?'; }
+    }
+    return out;
+  };
+  try {
+    var out = { url: location.href, title: document.title };
+    out.text = (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 300);
+    var imgs = document.querySelectorAll('img');
+    out.imgs = [];
+    for (var i = 0; i < imgs.length && i < 8; i++) {
+      out.imgs.push((imgs[i].getAttribute('src') || '').slice(0, 70));
+    }
+    var links = document.querySelectorAll('a');
+    out.profileLinks = [];
+    for (var j = 0; j < links.length && j < 300; j++) {
+      var href = links[j].getAttribute('href') || '';
+      if (href.indexOf('/user/profile/') >= 0) {
+        out.profileLinks.push(href.slice(0, 50));
+        if (out.profileLinks.length >= 4) break;
+      }
+    }
+    var st = window.__INITIAL_STATE__ || {};
+    var u = st.user || {};
+    out.userFields = fields(u, 16);
+    out.pageType = Object.prototype.toString.call(u.userPageData);
+    out.pageFields = fields(u.userPageData, 20);
+    out.notesLen = (u.notes || []).length;
+    out.infoType = Object.prototype.toString.call(u.userInfo);
+    out.infoFields = fields(u.userInfo, 20);
+    out.otherKeys = Object.keys(st).slice(0, 20);
+    report(out);
+  } catch (e) {
+    report({ error: String(e) });
+  }
+})();"#;
+
 /// 登录页自检：隐藏窗口打开官方登录页，探测「二维码状态 + 保活脚本是否生效」并写日志。
 /// 由数据目录里的 login_selftest 标记文件触发（平时不跑），用于远程诊断。
 async fn login_selftest(app: tauri::AppHandle, settings: Settings) {
+    // 探针一：登录页（二维码状态）
     let dir = crate::state::webview_dir(&settings);
     let _ = std::fs::create_dir_all(&dir);
     let window = match tauri::WebviewWindowBuilder::new(
@@ -1386,7 +1783,6 @@ async fn login_selftest(app: tauri::AppHandle, settings: Settings) {
         "自检·注入前：{}",
         read_selftest(&window).await.unwrap_or_else(|| "未取到".into())
     ));
-
     let _ = window.eval(QR_KEEPER_JS);
     tokio::time::sleep(Duration::from_secs(5)).await;
     let _ = window.eval(LOGIN_SELFTEST_JS);
@@ -1394,8 +1790,51 @@ async fn login_selftest(app: tauri::AppHandle, settings: Settings) {
         "自检·注入后：{}",
         read_selftest(&window).await.unwrap_or_else(|| "未取到".into())
     ));
-
     let _ = window.close();
+
+    // 探针三：转储资料可能藏身的位置（主页 + 推荐流页头）
+    for url in [
+        "https://www.xiaohongshu.com/user/profile/me",
+        "https://www.xiaohongshu.com/user/profile/58c8014a6a6a690dbb0c84c1",
+    ] {
+        if let Ok(window) = ensure_fetch_window(&app, &settings).await {
+            if let Ok(parsed) = url.parse::<tauri::Url>() {
+                let _ = window.navigate(parsed);
+            }
+            // 页面加载 + hydration 需要时间：反复注入直到拿到结果
+            let mut dump = None;
+            for _ in 0..6 {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let _ = window.eval(PAGE_SNAPSHOT_JS);
+                if let Some(text) = read_selftest(&window).await {
+                    dump = Some(text);
+                    break;
+                }
+            }
+            xhs_core::login::debug_log(&format!(
+                "自检·转储[{url}]：{}",
+                dump.unwrap_or_else(|| "未取到".into())
+            ));
+        }
+    }
+
+    // 探针二：/user/profile/me —— 登录判定的权威来源，把原始数据打出来
+    match webview_fetch(&app, "https://www.xiaohongshu.com/user/profile/me").await {
+        Ok(value) => {
+            let summary = serde_json::json!({
+                "kind": value.get("kind"),
+                "uid": value.get("uid"),
+                "nickname": value.get("nickname"),
+                "notesCount": value.get("notesCount"),
+                "pageUrl": value.get("pageUrl"),
+                "notes": value.get("notes").and_then(|v| v.as_array()).map(|a| a.len()),
+            });
+            xhs_core::login::debug_log(&format!("自检·我的主页：{summary}"));
+        }
+        Err(e) => {
+            xhs_core::login::debug_log(&format!("自检·我的主页：读取失败 {e}"));
+        }
+    }
 }
 
 /// 读取自检脚本写进 URL 片段的结果。
@@ -1643,25 +2082,7 @@ pub async fn web_login_cookies(app: tauri::AppHandle, state: State<'_, AppState>
     // 顺手把过期的二维码刷掉（过期后自动点刷新，点不动就重载页面）
     if let Some(window) = app.get_webview_window("web-login") {
         let _ = window.eval(QR_KEEPER_JS);
-        if let Ok(url) = window.url() {
-            let text = url.to_string();
-            if let Some(idx) = text.find("xhsdownqr=") {
-                let rest = &text[idx + "xhsdownqr=".len()..];
-                let state = rest.split('&').next().unwrap_or("").to_string();
-                if !state.is_empty() {
-                    let mut last = state_of_qr_log().lock().unwrap();
-                    if last.as_deref() != Some(state.as_str()) {
-                        xhs_core::login::debug_log(&format!(
-                            "登录页二维码：点击={} 重载={} 过期={}",
-                            state.split(',').next().unwrap_or("?"),
-                            state.split(',').nth(1).unwrap_or("?"),
-                            if state.ends_with('1') { "是" } else { "否" }
-                        ));
-                        *last = Some(state);
-                    }
-                }
-            }
-        }
+        log_qr_state(&window);
     }
 
     // 便宜预检：Cookies 没变化、且距上次权威检测不到 12 秒 → 直接回答"还没登录"，

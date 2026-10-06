@@ -219,6 +219,8 @@ pub struct AppState {
     pub login_cookie_baseline: Mutex<Option<String>>,
     /// 上一次做权威登录检测的时间
     pub last_login_check: Mutex<Option<std::time::Instant>>,
+    /// 后端登录轮询是否在跑（同一时刻只允许一个）
+    pub login_watch_running: AtomicBool,
 }
 
 /// 浏览器数据目录：登录窗口与取数窗口共用同一个目录，
@@ -268,6 +270,7 @@ impl AppState {
             fetch_lock: tokio::sync::Mutex::new(()),
             login_cookie_baseline: Mutex::new(None),
             last_login_check: Mutex::new(None),
+            login_watch_running: AtomicBool::new(false),
         })
     }
 
