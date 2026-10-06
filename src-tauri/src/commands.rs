@@ -1098,20 +1098,11 @@ const EXTRACT_JS: &str = r#"(function () {
         break;
       }
     }
+    // uid 只认 URL 里的：页面上的主页链接可能是别人的（实测把陌生人 uid 当成了本人）
     var domUid = '';
     var um = location.href.match(/profile\/([0-9a-f]{24})/);
     if (um) {
       domUid = um[1];
-    }
-    if (!domUid) {
-      var alinks = document.querySelectorAll('a[href*="/user/profile/"]');
-      for (var ai = 0; ai < alinks.length && ai < 300; ai++) {
-        var am = (alinks[ai].getAttribute('href') || '').match(/profile\/([0-9a-f]{24})/);
-        if (am) {
-          domUid = am[1];
-          break;
-        }
-      }
     }
 
     var uidOut = pick(merged, ['id', 'userId', 'user_id', 'userid']) || domUid || '';
@@ -1122,8 +1113,10 @@ const EXTRACT_JS: &str = r#"(function () {
     if (typeof rawCount === 'number') countOut = rawCount;
     else if (typeof rawCount === 'string' && rawCount) countOut = parseInt(rawCount, 10) || 0;
 
-    // 就绪判定：拿到真实身份或笔记列表才算（避免用"还在加载"的空壳当结果）
-    if (!uidOut && !nameOut && cards.length === 0) {
+    // 就绪判定：昵称来自状态/真标题、或已有笔记列表、或状态给出了 uid 才算。
+    // 光靠"页面上有主页链接"不行——那可能是别人的 uid（实测踩过）
+    var stateUid = pick(merged, ['id', 'userId', 'user_id', 'userid']);
+    if (!nameOut && !stateUid && cards.length === 0) {
       report({ ready: false, pageUrl: location.href });
       return;
     }
@@ -1286,9 +1279,21 @@ async fn browser_login_check(
     let mut uid = value.get("uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let mut name = value.get("nickname").and_then(|v| v.as_str()).unwrap_or_default().to_string();
     let mut avatar = value.get("avatar").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let notes = value
+        .get("notes")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
 
-    // 状态里没资料就退回 DOM（文档标题=昵称、头像图、主页链接里的 uid）
-    if uid.is_empty() || name.is_empty() {
+    // 判定门槛：必须拿到真昵称或笔记列表。空壳一律当作"还没好"继续等——
+    // 否则会出现"已登录但没有昵称没有头像"的假成功（实测踩过）。
+    if name.is_empty() && notes == 0 {
+        xhs_core::login::debug_log("登录检测：页面还没就绪（无昵称/无笔记），继续等待");
+        return Ok(None);
+    }
+
+    // 状态里没资料就退回 DOM（文档标题=昵称、头像图）
+    if name.is_empty() || avatar.is_empty() {
         if let Some(window) = app.get_webview_window("xhs-fetch") {
             // 资料异步到达：最多重试 3 轮（每轮内部轮询 ~5 秒）
             for _ in 0..3 {
@@ -1582,6 +1587,7 @@ async fn login_watch(app: tauri::AppHandle) {
     let state = app.state::<AppState>();
     let started = std::time::Instant::now();
     let mut checked_once = false;
+    let mut last_left_login = false;
 
     loop {
         if started.elapsed() > Duration::from_secs(600) {
@@ -1600,7 +1606,15 @@ async fn login_watch(app: tauri::AppHandle) {
         let _ = window.eval(QR_KEEPER_JS);
         log_qr_state(&window);
 
-        // 检测节奏：Cookie 有变化、或距上次检测满 12 秒、或还没查过
+        // 登录完成的强信号：登录页不再停留在 /login（成功后会跳到推荐流）
+        let page_url = window.url().map(|u| u.to_string()).unwrap_or_default();
+        let left_login_page = page_url.parse::<String>().is_ok()
+            && !page_url.contains("/login")
+            && page_url.contains("xiaohongshu.com");
+        let just_left_login = left_login_page && last_left_login == false;
+        last_left_login = left_login_page;
+
+        // 检测节奏：离开登录页立即查；否则 Cookie 有变化 / 每 5 秒查一次
         let fingerprint = cookie_fingerprint(&window);
         let (changed, due) = {
             let mut baseline = state.login_cookie_baseline.lock().unwrap();
@@ -1613,12 +1627,15 @@ async fn login_watch(app: tauri::AppHandle) {
             };
             let last = *state.last_login_check.lock().unwrap();
             let due = last
-                .map(|t| t.elapsed() > Duration::from_secs(12))
+                .map(|t| t.elapsed() > Duration::from_secs(5))
                 .unwrap_or(true);
             (changed, due)
         };
-        if checked_once && !changed && !due {
+        if checked_once && !changed && !due && !just_left_login {
             continue;
+        }
+        if just_left_login {
+            xhs_core::login::debug_log("登录页已跳走，立即检测登录状态");
         }
         *state.last_login_check.lock().unwrap() = Some(std::time::Instant::now());
         checked_once = true;
@@ -1660,43 +1677,6 @@ pub async fn web_login_watch(app: tauri::AppHandle, state: State<'_, AppState>) 
     tokio::spawn(async move { login_watch(app2).await });
     Ok(())
 }
-
-/// 诊断转储脚本（仅自检用）：把页面里"账号资料可能藏身的位置"全打出来。
-const DUMP_PROFILE_JS: &str = r#"(function () {
-  var out = { url: location.href, title: document.title };
-  try {
-    var st = window.__INITIAL_STATE__ || {};
-    var u = st.user || {};
-    out.loggedIn = u.loggedIn;
-    out.userKeys = Object.keys(u);
-    var info = u.userInfo;
-    out.userInfoType = Object.prototype.toString.call(info);
-    if (info && typeof info === 'object') {
-      out.userInfoKeys = Object.keys(info).slice(0, 24);
-      out.userInfoSample = JSON.stringify(info).slice(0, 300);
-    }
-    var page = u.userPageData;
-    out.pageType = Object.prototype.toString.call(page);
-    if (page && typeof page === 'object') {
-      out.pageKeys = Object.keys(page).slice(0, 24);
-      out.pageSample = JSON.stringify(page).slice(0, 300);
-    }
-  } catch (e) { out.err = String(e); }
-  var m = location.href.match(/profile\/([0-9a-f]{24})/);
-  if (m) out.urlUid = m[1];
-  var links = document.querySelectorAll('a[href*="/user/profile/"]');
-  var uids = {};
-  for (var i = 0; i < links.length && i < 40; i++) {
-    var mm = (links[i].getAttribute('href') || '').match(/profile\/([0-9a-f]{24})/);
-    if (mm) uids[mm[1]] = 1;
-  }
-  out.linkUids = Object.keys(uids).slice(0, 5);
-  var h = document.querySelector('h1, .user-name, .name, .user-nickname');
-  out.domName = h ? (h.textContent || '').trim().slice(0, 40) : null;
-  var av = document.querySelector('img.avatar, .user-avatar img, img[class*=avatar]');
-  out.domAvatar = av ? (av.getAttribute('src') || '').slice(0, 100) : null;
-  location.replace('#xhsdownselftest=' + encodeURIComponent(JSON.stringify(out)));
-})();"#;
 
 /// 页面快照（仅自检用）：标题、正文开头、图片、链接、状态字段全打出来。
 const PAGE_SNAPSHOT_JS: &str = r#"(function () {

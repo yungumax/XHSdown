@@ -162,7 +162,7 @@ function onDrag(event) {
         alt=""
       />
       <Icon v-else name="login" class="glyph" />
-      <span class="label">{{ login.logged_in ? login.uname : "未登录" }}</span>
+      <span class="label">{{ login.logged_in ? login.uname || "已登录" : "未登录" }}</span>
       <Icon name="chevronDown" class="caret" />
     </button>
 
