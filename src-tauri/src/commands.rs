@@ -2471,6 +2471,108 @@ pub async fn web_login_open(app: tauri::AppHandle, state: State<'_, AppState>) -
     Ok(())
 }
 
+/// 注入到网页里的浮动地址栏（后退/前进/刷新/地址/复制/解析/收起）。
+/// 为什么用注入而不是窗口内嵌工具条：Tauri 的 add_child 需要 unstable 特性，
+/// 而注入只影响页面本身，不引入第二个浏览器环境（多环境会丢登录态，实测踩过）。
+/// 幂等：重复注入只在页面里补一条，不会叠出多条。
+const PAGE_BAR_JS: &str = r#"(function () {
+  var hidden = function () {
+    try { return sessionStorage.getItem('xhsdownBarHidden') === '1'; } catch (e) { return false; }
+  };
+  if (hidden()) return;
+  var build = function () {
+    if (document.getElementById('xhsdown-bar')) return;
+    var bar = document.createElement('div');
+    bar.id = 'xhsdown-bar';
+    bar.style.cssText = 'position:fixed;left:0;right:0;top:0;height:34px;z-index:2147483000;display:flex;align-items:center;gap:6px;padding:0 10px;background:#17181a;color:#e8e9ea;border-bottom:1px solid #282a2d;font:12px/1 "Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;box-sizing:border-box;';
+    var btn = function (label, title, fn) {
+      var b = document.createElement('button');
+      b.textContent = label;
+      b.title = title;
+      b.style.cssText = 'height:22px;min-width:26px;padding:0 8px;color:#a2a6ab;background:#1e2022;border:1px solid #282a2d;border-radius:6px;cursor:pointer;font:inherit;';
+      b.onclick = function (e) { e.stopPropagation(); e.preventDefault(); fn(); };
+      bar.appendChild(b);
+    };
+    btn('◀', '后退', function () { history.back(); });
+    btn('▶', '前进', function () { history.forward(); });
+    btn('⟳', '刷新', function () { location.reload(); });
+    var input = document.createElement('input');
+    input.id = 'xhsdown-url';
+    input.spellcheck = false;
+    input.style.cssText = 'flex:1;min-width:0;height:22px;padding:0 8px;color:#e8e9ea;background:#131416;border:1px solid #282a2d;border-radius:6px;font:inherit;';
+    input.value = location.href.split('#')[0];
+    input.addEventListener('keydown', function (e) {
+      e.stopPropagation();
+      if (e.key === 'Enter') {
+        var v = input.value.trim();
+        if (v) location.href = v;
+      }
+    });
+    bar.appendChild(input);
+    btn('复制', '复制当前地址', function () {
+      var url = location.href.split('#')[0];
+      input.value = url;
+      input.select();
+      try { document.execCommand('copy'); } catch (e) {}
+      try { navigator.clipboard.writeText(url); } catch (e) {}
+      input.blur();
+    });
+    btn('解析', '把当前地址送到软件里解析', function () {
+      var url = location.href.split('#')[0];
+      location.replace('#xhsdownparse=' + encodeURIComponent(url));
+    });
+    btn('收起', '收起地址栏', function () {
+      var el = document.getElementById('xhsdown-bar');
+      if (el) el.remove();
+      try { sessionStorage.setItem('xhsdownBarHidden', '1'); } catch (e) {}
+    });
+    (document.body || document.documentElement).appendChild(bar);
+  };
+  build();
+  // SPA 换页后地址会变（页面也可能把我们的条清掉）：定时补上并同步显示
+  setInterval(function () {
+    try {
+      if (hidden()) return;
+      build();
+      var input = document.getElementById('xhsdown-url');
+      if (input && document.activeElement !== input) input.value = location.href.split('#')[0];
+    } catch (e) {}
+  }, 800);
+})();"#;
+
+/// 网页显示期间：定期注入地址栏，并接收页面里「解析」按钮送来的地址
+fn spawn_page_bar(app: tauri::AppHandle) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+            let Some(window) = app.get_webview_window("xhs-work") else {
+                break;
+            };
+            if !window.is_visible().unwrap_or(false) {
+                break;
+            }
+            let _ = window.eval(PAGE_BAR_JS);
+            // 页面里点了「解析」：地址被写进 #xhsdownparse=…，这里读出来送过去
+            if let Ok(url) = window.url() {
+                let text = url.to_string();
+                if let Some(idx) = text.find("xhsdownparse=") {
+                    let rest = &text[idx + "xhsdownparse=".len()..];
+                    let payload = rest.split('&').next().unwrap_or("");
+                    let target = percent_decode(payload);
+                    // 清掉标记，别留在地阽里
+                    let _ = window.eval(
+                        "history.replaceState(null,'',location.pathname+location.search)",
+                    );
+                    if !target.is_empty() {
+                        xhs_core::login::debug_log(&format!("网页地址栏送解析：{target}"));
+                        let _ = app.emit("web://to-parse", serde_json::json!({ "url": target }));
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// 地址栏状态：当前网页地址 + 窗口是否可见（主界面的网页工具栏据此显示）
 #[tauri::command]
 pub fn web_bar_state(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
@@ -2572,6 +2674,8 @@ pub async fn open_web_home(app: tauri::AppHandle, state: State<'_, AppState>) ->
     let _ = window.set_focus();
     // 显示期间把当前地址同步到窗口标题（后端定时器，不受界面降频影响）
     spawn_title_sync(app.clone());
+    // 并在网页里注入浮动地址栏（后退/前进/刷新/地址/复制/解析）
+    spawn_page_bar(app.clone());
     Ok(())
 }
 
