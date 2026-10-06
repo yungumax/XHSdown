@@ -1036,12 +1036,24 @@ const EXTRACT_JS: &str = r#"(function () {
       return;
     }
 
+    // 先按**当前网址**判断页面类型，再读对应的数据。
+    // 不能"状态里有什么就读什么"：小红书是单页应用，状态会残留上一次看过的
+    // 笔记/主页数据（实测：在推荐流页面上读到了残留的笔记，登录流程一直等不到昵称）
+    var here = location.href;
+    var urlNote = here.match(/(?:\/explore\/|\/discovery\/item\/)([0-9a-f]{24})/);
+    var isNotePage = !!urlNote;
+    var isProfilePage = here.indexOf("/user/profile/") >= 0;
+    if (!isNotePage && !isProfilePage) {
+      report({ ready: false, pageUrl: here });
+      return;
+    }
+
     // ── 笔记详情页 ──
     // 真实路径可能在 st.noteDetailMap，也可能在 st.note.noteDetailMap（两种都试）
     var noteRoot = unwrap(st.note) || {};
     var map = unwrap(st.noteDetailMap) || unwrap(noteRoot.noteDetailMap) || {};
     var ids = Object.keys(map);
-    if (ids.length) {
+    if (isNotePage && ids.length) {
       var note = unwrap(unwrap(map[ids[0]]) || {}) || {};
       note = unwrap(note.note) || note;
       var pics = [];
@@ -1090,6 +1102,10 @@ const EXTRACT_JS: &str = r#"(function () {
     }
 
     // ── 用户主页 ──
+    if (!isProfilePage) {
+      report({ ready: false, pageUrl: here });
+      return;
+    }
     var pu = unwrap(st.user) || {};
     var page = unwrap(pu.userPageData) || {};
     if (typeof page !== 'object' || Array.isArray(page)) page = {};
@@ -1723,29 +1739,33 @@ async fn login_watch(app: tauri::AppHandle) {
         // 阶段 1：完整取数（含导航）最多每 20 秒一次；其余时间只读当前页面，
         // 让页面的异步资料有机会加载完
         let now = std::time::Instant::now();
-        let full = now.duration_since(last_full_fetch) >= Duration::from_secs(20);
-        let value = if full {
+        // 先看当前页面上是什么：是"我的主页"就直接读（原地等待异步资料），
+        // 不是主页（停在推荐流等）就每 8 秒导航过去读一次
+        let on_page = extract_from_page(&window).await;
+        let on_profile = on_page
+            .as_ref()
+            .map(|v| v.get("kind").and_then(|x| x.as_str()) == Some("user"))
+            .unwrap_or(false);
+        let value = if on_profile {
+            on_page
+        } else if now.duration_since(last_full_fetch) >= Duration::from_secs(8) {
             last_full_fetch = now;
             match webview_fetch_inner(&app, "https://www.xiaohongshu.com/user/profile/me", true)
                 .await
             {
                 Ok(value) => Some(value),
                 Err(e) => {
-                    xhs_core::login::debug_log(&format!("读资料失败（{e}），稍后重试"));
+                    xhs_core::login::debug_log(&format!("读我的主页失败（{e}），稍后重试"));
                     None
                 }
             }
         } else {
-            let value = extract_from_page(&window).await;
-            if value.is_none() {
-                // 页面还没就绪（或停在错误页）：记一次，便于远程排查
-                let page = window.url().map(|u| u.to_string()).unwrap_or_default();
-                xhs_core::login::debug_log(&format!(
-                    "读当前页面暂无数据（{}）",
-                    xhs_core::error::truncate(&page, 100)
-                ));
-            }
-            value
+            let page = window.url().map(|u| u.to_string()).unwrap_or_default();
+            xhs_core::login::debug_log(&format!(
+                "当前页面不是主页（{}），稍后导航过去读",
+                xhs_core::error::truncate(&page, 90)
+            ));
+            None
         };
 
         let Some(value) = value else { continue };
