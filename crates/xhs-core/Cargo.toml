@@ -1,0 +1,15 @@
+[package]
+name = "xhs-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "XHSdown 核心库：小红书网页会话、来源解析与下载引擎"
+
+[dependencies]
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+regex.workspace = true
+futures.workspace = true

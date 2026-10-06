@@ -1,0 +1,299 @@
+//! 应用运行期状态：登录会话、任务表、可持久化的设置、批量来源缓存。
+
+use crate::types::{LoginInfo, PostEntry, TaskUpdate};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex, RwLock};
+use tokio::sync::Semaphore;
+use xhs_core::XhsClient;
+
+pub const DEFAULT_MAX_CONCURRENT_TASKS: usize = 2;
+/// 文件夹层级的默认模板：作者 → 年月。
+pub const DEFAULT_FOLDER_TEMPLATE: &str = "{author}/{year}-{month}";
+
+pub struct TaskEntry {
+    pub snapshot: Arc<Mutex<TaskUpdate>>,
+    pub abort: Option<tokio::task::AbortHandle>,
+    /// 原始下载请求：暂停后「继续」需要重跑流水线
+    pub req: crate::types::DownloadReq,
+    /// 暂停开关：置 true 后下载循环停在下一个分块（进度留在 .part）
+    pub pause: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// 批量来源（用户主页）的增量加载缓存：
+/// 小红书网页端只内嵌最新一批笔记（无翻页接口），缓存主要供重命名用。
+#[derive(Debug, Clone)]
+pub struct BatchCache {
+    pub uid: String,
+    pub items: Vec<PostEntry>,
+    pub exhausted: bool,
+}
+
+/// 一条命名模板预设。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+
+pub struct NamingPreset {
+    pub name: String,
+    pub template: String,
+}
+
+/// 用户可配置项，全部持久化到 settings.json。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Settings {
+    pub output_dir: PathBuf,
+    /// 文件夹层级模板：用 `/` 分层，为空表示不建层级。
+    pub folder_template: String,
+    pub max_concurrent_tasks: usize,
+    /// 兼容字段：小红书媒体是小文件，分片参数不参与实际行为
+    pub chunk_concurrency: usize,
+    pub chunk_mb: u64,
+    pub keep_temp: bool,
+    pub naming_template: String,
+    pub naming_presets: Vec<NamingPreset>,
+    pub folder_presets: Vec<NamingPreset>,
+    /// skip / overwrite / auto
+    pub rename_conflict: String,
+    /// large（原图）/ thumbnail（压缩图）
+    pub image_format: String,
+    /// auto / hd / sd
+    pub video_quality: String,
+    /// best / standard（保留兼容：小红书暂无纯音频内容）
+    pub audio_quality: String,
+    pub download_text: bool,
+    pub retry_count: u32,
+    pub speed_limit_mib: u32,
+    pub resume_on_start: bool,
+    pub parse_preset: String,
+    pub parse_batch: u32,
+    pub parse_batch_wait_ms: u32,
+    pub parse_rest_every: u32,
+    pub parse_rest_ms: u32,
+    pub log_level: String,
+    pub data_dir: String,
+    /// 启动时静默检查更新（不自动下载或安装）
+    pub update_check: bool,
+    /// 首启引导是否已完成（false 时启动显示引导页）
+    pub onboarded: bool,
+    pub proxy: String,
+    /// light / dark / system
+    pub theme: String,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            output_dir: default_data_root().join("downloads"),
+            folder_template: DEFAULT_FOLDER_TEMPLATE.to_string(),
+            max_concurrent_tasks: DEFAULT_MAX_CONCURRENT_TASKS,
+            chunk_concurrency: 4,
+            chunk_mb: 4,
+            keep_temp: false,
+            naming_template: "{index} {title}.{ext}".to_string(),
+            naming_presets: Vec::new(),
+            folder_presets: Vec::new(),
+            rename_conflict: "skip".to_string(),
+            image_format: "large".to_string(),
+            video_quality: "auto".to_string(),
+            audio_quality: "best".to_string(),
+            download_text: true,
+            retry_count: 3,
+            speed_limit_mib: 0,
+            resume_on_start: false,
+            parse_preset: "标准".to_string(),
+            parse_batch: 8,
+            parse_batch_wait_ms: 1000,
+            parse_rest_every: 100,
+            parse_rest_ms: 3000,
+            log_level: "info".to_string(),
+            data_dir: String::new(),
+            update_check: false,
+            onboarded: false,
+            proxy: String::new(),
+            theme: "system".to_string(),
+        }
+    }
+}
+
+/// 默认数据目录：%APPDATA%\xhsdown；拿不到 APPDATA 时退到 exe 旁的 _data。
+pub fn default_data_root() -> PathBuf {
+    if let Ok(appdata) = std::env::var("APPDATA") {
+        if !appdata.is_empty() {
+            return PathBuf::from(appdata).join("xhsdown");
+        }
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("_data").join("xhsdown")))
+        .unwrap_or_else(|| PathBuf::from("_data").join("xhsdown"))
+}
+
+impl Settings {
+    /// 数据根目录：设置了 data_dir 用它，否则默认目录。
+    pub fn data_root(&self) -> PathBuf {
+        let trimmed = self.data_dir.trim();
+        if !trimmed.is_empty() {
+            return PathBuf::from(trimmed);
+        }
+        default_data_root()
+    }
+
+    pub fn cookies_path(&self) -> PathBuf {
+        self.data_root().join("cookies.json")
+    }
+
+    pub fn settings_path(&self) -> PathBuf {
+        self.data_root().join("settings.json")
+    }
+
+    pub fn load() -> Self {
+        // 先读默认目录的设置（data_dir 本身也存那里）
+        let mut settings: Settings = std::fs::read_to_string(default_data_root().join("settings.json"))
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+        settings.clamp();
+        settings
+    }
+
+    pub fn save(&self) -> std::io::Result<()> {
+        let dir = self.data_root();
+        std::fs::create_dir_all(&dir)?;
+        std::fs::write(self.settings_path(), serde_json::to_string_pretty(self).unwrap())?;
+        Ok(())
+    }
+
+    /// 越界值拉回合法区间（老配置或手改 settings.json 后兜底）。
+    pub fn clamp(&mut self) {
+        self.max_concurrent_tasks = self.max_concurrent_tasks.clamp(1, 5);
+        self.retry_count = self.retry_count.min(10);
+        if !matches!(self.image_format.as_str(), "large" | "thumbnail") {
+            self.image_format = "large".to_string();
+        }
+        if !matches!(self.video_quality.as_str(), "auto" | "hd" | "sd") {
+            self.video_quality = "auto".to_string();
+        }
+        if !matches!(self.audio_quality.as_str(), "best" | "standard") {
+            self.audio_quality = "best".to_string();
+        }
+        if !matches!(self.rename_conflict.as_str(), "skip" | "overwrite" | "auto") {
+            self.rename_conflict = "skip".to_string();
+        }
+        if !matches!(self.theme.as_str(), "light" | "dark" | "system") {
+            self.theme = "system".to_string();
+        }
+        if self.parse_batch == 0 {
+            self.parse_batch = 8;
+        }
+        if self.naming_template.trim().is_empty() {
+            self.naming_template = "{index} {title}.{ext}".to_string();
+        }
+        // 旧默认（无序号）等价升迁为新的内置默认【批量带序号】：
+        // 渲染上单条 index=1、批量由旧到新，老用户打开即得到新默认行为
+        if self.naming_template == "{title}.{ext}" {
+            self.naming_template = "{index} {title}.{ext}".to_string();
+        }
+    }
+}
+
+pub struct AppState {
+    /// 用 RwLock 包一层，改代理或登出时可以整体换成新的会话
+    pub client: RwLock<Arc<XhsClient>>,
+    pub tasks: Mutex<HashMap<String, TaskEntry>>,
+    pub settings: Mutex<Settings>,
+    /// 并发下载槽位，会随设置变化重建
+    pub slots: RwLock<Arc<Semaphore>>,
+    pub counter: Mutex<u64>,
+    /// 批量来源的缓存，按来源输入索引
+    pub batches: Mutex<HashMap<String, BatchCache>>,
+    /// 会话里是否已经热过身（访问过首页、拿到访客 Cookie）
+    pub warmed: AtomicBool,
+    /// 缓存的登录态（None = 未登录）
+    pub login: RwLock<Option<LoginInfo>>,
+}
+
+impl AppState {
+    pub fn new() -> Result<Self, String> {
+        let settings = Settings::load();
+        let client = XhsClient::with_proxy(Some(&settings.proxy)).map_err(|e| e.to_string())?;
+
+        // 恢复登录态：cookies.json 是网页登录收割的会话凭据
+        let cookies: xhs_core::client::DomainCookies =
+            std::fs::read_to_string(settings.cookies_path())
+                .ok()
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .unwrap_or_default();
+        if !cookies.is_empty() {
+            client.install_cookies(&cookies.web);
+        }
+
+        let slots = Arc::new(Semaphore::new(settings.max_concurrent_tasks.max(1)));
+        Ok(Self {
+            client: RwLock::new(Arc::new(client)),
+            tasks: Mutex::new(HashMap::new()),
+            settings: Mutex::new(settings),
+            slots: RwLock::new(slots),
+            counter: Mutex::new(0),
+            batches: Mutex::new(HashMap::new()),
+            warmed: AtomicBool::new(false),
+            login: RwLock::new(None),
+        })
+    }
+
+    pub fn client(&self) -> Arc<XhsClient> {
+        self.client.read().unwrap().clone()
+    }
+
+    /// 启动期读设置用（与 settings_snapshot 同一实现，语义上更短）。
+    pub fn settings(&self) -> Settings {
+        self.settings.lock().unwrap().clone()
+    }
+
+    pub fn settings_snapshot(&self) -> Settings {
+        self.settings()
+    }
+
+    pub fn slots(&self) -> Arc<Semaphore> {
+        self.slots.read().unwrap().clone()
+    }
+
+    pub fn rebuild_slots(&self) {
+        let max = self.settings_snapshot().max_concurrent_tasks.max(1);
+        *self.slots.write().unwrap() = Arc::new(Semaphore::new(max));
+    }
+
+    /// 持久化当前会话 Cookie（网页登录收割后调用）。
+    pub fn save_cookies(&self) {
+        let settings = self.settings_snapshot();
+        let cookies = xhs_core::client::DomainCookies {
+            web: self.client().export_cookies(),
+        };
+        let _ = std::fs::create_dir_all(settings.data_root());
+        if let Ok(text) = serde_json::to_string_pretty(&cookies) {
+            let _ = std::fs::write(settings.cookies_path(), text);
+        }
+    }
+
+    pub fn cookies_saved(&self) -> bool {
+        self.settings_snapshot().cookies_path().exists()
+    }
+
+    pub fn next_task_id(&self) -> String {
+        let mut counter = self.counter.lock().unwrap();
+        *counter += 1;
+        format!("task-{counter}")
+    }
+
+    /// 缓存条目上限：超了丢最早的来源，防止长期占用。
+    pub fn cache_batch(&self, input: String, cache: BatchCache) {
+        let mut batches = self.batches.lock().unwrap();
+        if batches.len() >= 8 && !batches.contains_key(&input) {
+            if let Some(oldest) = batches.keys().next().cloned() {
+                batches.remove(&oldest);
+            }
+        }
+        batches.insert(input, cache);
+    }
+}
