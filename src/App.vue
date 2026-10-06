@@ -82,7 +82,11 @@ onMounted(async () => {
     login.value = status.login;
     outputDir.value = status.output_dir;
     version.value = status.version;
+    api.uiLog(
+      `启动登录态：${login.value.logged_in ? "已登录" : "未登录"} 昵称=${login.value.uname || "空"} 头像=${login.value.face ? "有" : "无"}`,
+    );
   } catch (error) {
+    api.uiLog(`启动取状态失败：${error}`);
     showToast(String(error));
   }
 
@@ -307,6 +311,9 @@ function clearFinished() {
 /** 网页登录收割成功：写登录态 + 刷新界面 */
 function onWebConfirmed(loginInfo) {
   login.value = loginInfo;
+  api.uiLog(
+    `登录事件收到：昵称=${loginInfo.uname || "空"} 头像=${loginInfo.face ? "有" : "无"}`,
+  );
   showToast(loginInfo.uname ? `已登录：${loginInfo.uname}` : "已登录小红书");
   showLogin.value = false;
 }

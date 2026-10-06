@@ -196,6 +196,16 @@ export async function webLoginCookies() {
   return invokeZh("web_login_cookies");
 }
 
+/** 界面日志：把关键状态写进后端调试日志（排查用） */
+export async function uiLog(text) {
+  if (!hasTauri) return;
+  try {
+    await invokeZh("ui_log", { text });
+  } catch {
+    // 日志失败不影响功能
+  }
+}
+
 /** 网页登录：让后端开始轮询登录状态（后端定时器不受窗口遮挡降频影响） */
 export async function webLoginWatch() {
   if (!hasTauri) return;

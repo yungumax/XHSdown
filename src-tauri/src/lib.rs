@@ -97,6 +97,7 @@ pub fn run() {
             commands::choose_output_dir,
             commands::open_path,
             commands::naming_variables,
+            commands::ui_log,
             commands::resume_pending,
             commands::library_folders,
             commands::preview_naming,

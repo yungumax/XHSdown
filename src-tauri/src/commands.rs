@@ -1285,10 +1285,13 @@ async fn browser_login_check(
         .map(|a| a.len())
         .unwrap_or(0);
 
-    // 判定门槛：必须拿到真昵称或笔记列表。空壳一律当作"还没好"继续等——
-    // 否则会出现"已登录但没有昵称没有头像"的假成功（实测踩过）。
-    if name.is_empty() && notes == 0 {
-        xhs_core::login::debug_log("登录检测：页面还没就绪（无昵称/无笔记），继续等待");
+    // 判定门槛：**必须拿到真昵称**。笔记列表单独不算——实测遇到过
+    // "笔记列表先到、资料还没渲染"的半就绪状态，那时收工就会得到
+    // "已登录但昵称头像全空"的假成功（正是用户看到的怪状态）。
+    if name.is_empty() {
+        xhs_core::login::debug_log(&format!(
+            "登录检测：已登录但资料未就绪（笔记 {notes} 条），继续等待"
+        ));
         return Ok(None);
     }
 
@@ -2596,6 +2599,12 @@ pub async fn check_updates() -> Result<UpdateCheck, String> {
 }
 
 // ───────────────────────── 命名预览 ─────────────────────────
+
+/// 界面日志：前端把关键状态写进同一个调试日志，排查时不用猜界面拿到了什么。
+#[tauri::command]
+pub fn ui_log(text: String) {
+    xhs_core::login::debug_log(&format!("[UI] {text}"));
+}
 
 #[tauri::command]
 pub fn naming_variables() -> Vec<NamingVar> {
