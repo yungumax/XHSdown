@@ -2480,62 +2480,108 @@ const PAGE_BAR_JS: &str = r#"(function () {
     try { return sessionStorage.getItem('xhsdownBarHidden') === '1'; } catch (e) { return false; }
   };
   if (hidden()) return;
-  var build = function () {
-    if (document.getElementById('xhsdown-bar')) return;
-    var bar = document.createElement('div');
-    bar.id = 'xhsdown-bar';
-    bar.style.cssText = 'position:fixed;left:0;right:0;top:0;height:34px;z-index:2147483000;display:flex;align-items:center;gap:6px;padding:0 10px;background:#17181a;color:#e8e9ea;border-bottom:1px solid #282a2d;font:12px/1 "Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;box-sizing:border-box;';
-    var btn = function (label, title, fn) {
-      var b = document.createElement('button');
-      b.textContent = label;
-      b.title = title;
-      b.style.cssText = 'height:22px;min-width:26px;padding:0 8px;color:#a2a6ab;background:#1e2022;border:1px solid #282a2d;border-radius:6px;cursor:pointer;font:inherit;';
-      b.onclick = function (e) { e.stopPropagation(); e.preventDefault(); fn(); };
-      bar.appendChild(b);
-    };
-    btn('◀', '后退', function () { history.back(); });
-    btn('▶', '前进', function () { history.forward(); });
-    btn('⟳', '刷新', function () { location.reload(); });
-    var input = document.createElement('input');
-    input.id = 'xhsdown-url';
-    input.spellcheck = false;
-    input.style.cssText = 'flex:1;min-width:0;height:22px;padding:0 8px;color:#e8e9ea;background:#131416;border:1px solid #282a2d;border-radius:6px;font:inherit;';
-    input.value = location.href.split('#')[0];
-    input.addEventListener('keydown', function (e) {
-      e.stopPropagation();
-      if (e.key === 'Enter') {
-        var v = input.value.trim();
-        if (v) location.href = v;
-      }
-    });
-    bar.appendChild(input);
-    btn('复制', '复制当前地址', function () {
-      var url = location.href.split('#')[0];
-      input.value = url;
-      input.select();
-      try { document.execCommand('copy'); } catch (e) {}
-      try { navigator.clipboard.writeText(url); } catch (e) {}
-      input.blur();
-    });
-    btn('解析', '把当前地址送到软件里解析', function () {
-      var url = location.href.split('#')[0];
-      location.replace('#xhsdownparse=' + encodeURIComponent(url));
-    });
-    btn('收起', '收起地址栏', function () {
-      var el = document.getElementById('xhsdown-bar');
-      if (el) el.remove();
-      try { sessionStorage.setItem('xhsdownBarHidden', '1'); } catch (e) {}
-    });
-    (document.body || document.documentElement).appendChild(bar);
+  var Z = '2147483000';
+  var open = false;
+  var hideTimer = null;
+
+  var ensure = function () {
+    var handle = document.getElementById('xhsdown-handle');
+    var bar = document.getElementById('xhsdown-bar');
+    // 小把手：不遮挡内容（左下角 20px 半透明方块），点它/悬停展开整条地址栏
+    if (!handle) {
+      handle = document.createElement('div');
+      handle.id = 'xhsdown-handle';
+      handle.textContent = '⌃';
+      handle.title = '地址栏（点击展开）';
+      handle.style.cssText = 'position:fixed;left:8px;bottom:10px;width:20px;height:20px;z-index:' + Z + ';display:flex;align-items:center;justify-content:center;background:#ff2442;color:#fff;border-radius:6px;font:11px/1 sans-serif;cursor:pointer;opacity:.4;transition:opacity .15s;box-shadow:0 2px 8px rgba(0,0,0,.28);';
+      handle.onmouseenter = function () {
+        handle.style.opacity = '1';
+        setOpen(true); // 鼠标碰到把手就展开（像全屏浏览器的地址栏）
+      };
+      handle.onmouseleave = function () { handle.style.opacity = '.4'; };
+      handle.onclick = function () { setOpen(true); };
+      (document.body || document.documentElement).appendChild(handle);
+    }
+    if (!bar) {
+      bar = document.createElement('div');
+      bar.id = 'xhsdown-bar';
+      bar.style.cssText = 'position:fixed;left:0;right:0;top:0;height:34px;z-index:' + Z + ';display:flex;align-items:center;gap:6px;padding:0 10px;background:#17181a;color:#e8e9ea;border-bottom:1px solid #282a2d;font:12px/1 "Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;box-sizing:border-box;transform:translateY(-102%);transition:transform .16s ease;';
+      var btn = function (label, title, fn) {
+        var b = document.createElement('button');
+        b.textContent = label;
+        b.title = title;
+        b.style.cssText = 'height:22px;min-width:26px;padding:0 8px;color:#a2a6ab;background:#1e2022;border:1px solid #282a2d;border-radius:6px;cursor:pointer;font:inherit;';
+        b.onclick = function (e) { e.stopPropagation(); e.preventDefault(); fn(); };
+        bar.appendChild(b);
+      };
+      btn('◀', '后退', function () { history.back(); });
+      btn('▶', '前进', function () { history.forward(); });
+      btn('⟳', '刷新', function () { location.reload(); });
+      var input = document.createElement('input');
+      input.id = 'xhsdown-url';
+      input.spellcheck = false;
+      input.style.cssText = 'flex:1;min-width:0;height:22px;padding:0 8px;color:#e8e9ea;background:#131416;border:1px solid #282a2d;border-radius:6px;font:inherit;';
+      input.value = location.href.split('#')[0];
+      input.addEventListener('keydown', function (e) {
+        e.stopPropagation();
+        if (e.key === 'Enter') {
+          var v = input.value.trim();
+          if (v) location.href = v;
+        }
+      });
+      bar.appendChild(input);
+      btn('复制', '复制当前地址', function () {
+        var url = location.href.split('#')[0];
+        input.value = url;
+        input.select();
+        try { document.execCommand('copy'); } catch (e) {}
+        try { navigator.clipboard.writeText(url); } catch (e) {}
+        input.blur();
+      });
+      btn('解析', '把当前地址送到软件里解析', function () {
+        var url = location.href.split('#')[0];
+        location.replace('#xhsdownparse=' + encodeURIComponent(url));
+      });
+      btn('收起', '收起地址栏（本次会话不再展开）', function () {
+        var el = document.getElementById('xhsdown-bar');
+        if (el) el.remove();
+        var h = document.getElementById('xhsdown-handle');
+        if (h) h.remove();
+        try { sessionStorage.setItem('xhsdownBarHidden', '1'); } catch (e) {}
+      });
+      bar.onmouseenter = function () { if (hideTimer) clearTimeout(hideTimer); };
+      bar.onmouseleave = function () { setOpen(false); };
+      (document.body || document.documentElement).appendChild(bar);
+    }
+    bar.style.transform = open ? 'translateY(0)' : 'translateY(-102%)';
+    return { bar: bar, handle: handle };
   };
-  build();
-  // SPA 换页后地址会变（页面也可能把我们的条清掉）：定时补上并同步显示
+
+  var setOpen = function (next) {
+    open = next;
+    var pair = ensure();
+    pair.bar.style.transform = open ? 'translateY(0)' : 'translateY(-102%)';
+    if (open) {
+      // 展开后没人用就自动收起，别一直挡着页面
+      if (hideTimer) clearTimeout(hideTimer);
+      hideTimer = setTimeout(function () {
+        var input = document.getElementById('xhsdown-url');
+        if (!input || document.activeElement !== input) setOpen(false);
+      }, 6000);
+    }
+  };
+
+  ensure();
+  // SPA 换页/页面重渲染后补回并同步地址显示
   setInterval(function () {
     try {
       if (hidden()) return;
-      build();
+      var pair = ensure();
       var input = document.getElementById('xhsdown-url');
+      var handle = pair.handle;
+      var bar = pair.bar;
       if (input && document.activeElement !== input) input.value = location.href.split('#')[0];
+      bar.onmouseenter = function () { if (hideTimer) clearTimeout(hideTimer); };
     } catch (e) {}
   }, 800);
 })();"#;
