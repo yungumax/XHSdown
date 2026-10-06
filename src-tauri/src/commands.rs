@@ -1237,6 +1237,22 @@ const EXTRACT_JS: &str = r#"(function () {
     v = unwrap(v);
     return Array.isArray(v) ? v : [];
   };
+  // 收集循环每轮全量抽取、跨轮按 id 合并，但整包 JSON 塞进 URL 片段在几千条时会撑爆
+  // （Chromium 单个 URL 约 2MB，中文 encodeURIComponent 还要再涨 3 倍）。
+  // 只回传"新增的那一段"，附 40 条重叠防止序号错位；首轮/换页后 prev=0，自然回全量。
+  // 标记按"整页地址"记账：单页应用里换到另一个主页时地址变了，prev 自动归零回全量
+  var delta = function (key, list) {
+    try {
+      var here = location.href.split('#')[0];
+      var old = window[key];
+      var prev = (old && old.url === here) ? old.n : 0;
+      window[key] = { url: here, n: list.length };
+      if (list.length > 400 && prev > 0 && list.length >= prev) {
+        return list.slice(Math.max(0, prev - 40));
+      }
+    } catch (e) {}
+    return list;
+  };
 
   try {
     var st = window.__INITIAL_STATE__ || null;
@@ -1268,7 +1284,7 @@ const EXTRACT_JS: &str = r#"(function () {
       var searchRoot = unwrap(st.search) || {};
       var searchFeeds = arr(searchRoot.feeds);
       var searchCards = [];
-      for (var si = 0; si < searchFeeds.length && si < 200; si++) {
+      for (var si = 0; si < searchFeeds.length; si++) {
         var sc = unwrap(searchFeeds[si]) || {};
         var snc = unwrap(sc.noteCard) || {};
         var scu = unwrap(snc.user) || {};
@@ -1289,7 +1305,7 @@ const EXTRACT_JS: &str = r#"(function () {
         pageUrl: here,
         uid: '', nickname: '搜索结果', avatar: '', desc: '',
         notesCount: searchCards.length,
-        notes: searchCards,
+        notes: delta('__xhsdownSearchN', searchCards),
       });
       return;
     }
@@ -1299,7 +1315,7 @@ const EXTRACT_JS: &str = r#"(function () {
       var feedRoot = unwrap(st.feed) || {};
       var feeds = arr(feedRoot.feeds);
       var feedCards = [];
-      for (var fi = 0; fi < feeds.length && fi < 200; fi++) {
+      for (var fi = 0; fi < feeds.length; fi++) {
         var fc = unwrap(feeds[fi]) || {};
         var fnc = unwrap(fc.noteCard) || {};
         var fcu = unwrap(fnc.user) || {};
@@ -1323,7 +1339,7 @@ const EXTRACT_JS: &str = r#"(function () {
         avatar: "",
         desc: "",
         notesCount: feedCards.length,
-        notes: feedCards,
+        notes: delta('__xhsdownFeedN', feedCards),
       });
       return;
     }
@@ -1438,9 +1454,9 @@ const EXTRACT_JS: &str = r#"(function () {
     var flatten = function (value) {
       var out = [];
       var walk = function (node, depth) {
-        if (depth > 4 || out.length >= 600) return;
+        if (depth > 4 || out.length >= 20000) return;
         var list = arr(node);
-        for (var i = 0; i < list.length && out.length < 600; i++) {
+        for (var i = 0; i < list.length && out.length < 20000; i++) {
           var item = unwrap(list[i]);
           if (Array.isArray(item)) {
             walk(item, depth + 1);
@@ -1471,7 +1487,9 @@ const EXTRACT_JS: &str = r#"(function () {
 
     var cards = [];
     var noteList = flatten(pu.notes);
-    for (var n = 0; n < noteList.length && n < 300; n++) {
+    // 这里**不能**再卡条数：滚动收集是"每轮全量抽取 + 跨轮合并"，
+    // 抽取上限一旦低于页面已加载数，合并数就再也不涨 → 被误判成"到底"停住（实测卡在 300）
+    for (var n = 0; n < noteList.length; n++) {
       var card = noteList[n];
       var nc = unwrap(card.noteCard) || {};
       var cu = unwrap(nc.user) || {};
@@ -1507,7 +1525,7 @@ const EXTRACT_JS: &str = r#"(function () {
       avatar: avatarOut,
       desc: String(pick(merged, ['desc', 'description']) || '').slice(0, 3000),
       notesCount: countOut,
-      notes: cards
+      notes: delta('__xhsdownUserN', cards)
     });
     return;
   } catch (e) {
@@ -3011,22 +3029,22 @@ const PAGE_BAR_JS: &str = r#"(function () {
 
   ensure();
 
-  // 数一数当前页面已经加载了多少条（与软件算法一致：主页笔记要递归展平）
+  // ref 解包 / 数组归一：计数与总数两处共用（原先是嵌在 countCards 里的）
+  var unwrapAll = function (v) {
+    var d = 0;
+    while (v && typeof v === 'object' && v.__v_isRef === true && d < 6) {
+      v = v._value !== undefined ? v._value : v.value;
+      d += 1;
+    }
+    return v;
+  };
+  var arrOf = function (v) {
+    v = unwrapAll(v);
+    return Array.isArray(v) ? v : [];
+  };
   var countCards = function () {
     try {
       var st = window.__INITIAL_STATE__ || {};
-      var unwrapAll = function (v) {
-        var d = 0;
-        while (v && typeof v === 'object' && v.__v_isRef === true && d < 6) {
-          v = v._value !== undefined ? v._value : v.value;
-          d += 1;
-        }
-        return v;
-      };
-      var arrOf = function (v) {
-        v = unwrapAll(v);
-        return Array.isArray(v) ? v : [];
-      };
       var flattenCount = function (value) {
         var n = 0;
         var walk = function (node, depth) {
@@ -3060,6 +3078,26 @@ const PAGE_BAR_JS: &str = r#"(function () {
     }
   };
 
+  // 主页自己写着"共多少条笔记"：一并显示，一眼看出是"到底了"还是"被站点挡住了"
+  var totalCards = function () {
+    try {
+      if (location.href.indexOf('/user/profile/') < 0) return 0;
+      var st = window.__INITIAL_STATE__ || {};
+      var u = unwrapAll(st.user) || {};
+      var num = function (v) {
+        v = unwrapAll(v);
+        if (typeof v === 'number' && isFinite(v)) return Math.floor(v);
+        if (typeof v === 'string' && /^[0-9]+$/.test(v)) return parseInt(v, 10);
+        return 0;
+      };
+      var page = unwrapAll(u.userPageData) || {};
+      var info = unwrapAll(u.userInfo) || {};
+      return num(page.notes) || num(page.noteCount) || num(info.notes) || num(info.noteCount);
+    } catch (e) {
+      return 0;
+    }
+  };
+
   // 全局只留一个定时器：脚本被反复注入时不会叠加出一堆互斗的定时器
   if (!window.__xhsdownBarTimer) {
     window.__xhsdownBarTimer = setInterval(function () {
@@ -3072,7 +3110,11 @@ const PAGE_BAR_JS: &str = r#"(function () {
         var count = document.getElementById('xhsdown-count');
         if (count) {
           var n = countCards();
-          count.textContent = n > 0 ? '已加载 ' + n + ' 条' : '';
+          var total = totalCards();
+          count.textContent =
+            n > 0
+              ? (total > n ? '已加载 ' + n + ' / 共 ' + total + ' 条' : '已加载 ' + n + ' 条')
+              : '';
         }
       } catch (e) {}
     }, 800);
@@ -3088,6 +3130,8 @@ fn spawn_page_bar(app: tauri::AppHandle) {
         let mut last_inject = std::time::Instant::now() - Duration::from_secs(600);
         let mut collecting = false;
         let mut collected: Vec<PostEntry> = Vec::new();
+        // 去重集合与 collected 同步维护：几千条时逐条 any() 扫描是 O(n²)，滚久了会卡
+        let mut seen_bids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut stale: u32 = 0;
 
         let clear_hash = |window: &tauri::WebviewWindow| {
@@ -3142,7 +3186,13 @@ fn spawn_page_bar(app: tauri::AppHandle) {
                     if value == "start" {
                         collecting = true;
                         collected.clear();
+                        seen_bids.clear();
                         stale = 0;
+                        // 抽取脚本只回传"上次之后的增量"，重新开始收集必须清零标记，
+                        // 否则同一页面上第二次收集只会收到增量（基本是空的）
+                        let _ = window.eval(
+                            "window.__xhsdownUserN=0;window.__xhsdownFeedN=0;window.__xhsdownSearchN=0;",
+                        );
                         xhs_core::login::debug_log("网页收集：开始（可见模式，边滚边收集）");
                         let _ = app.emit("collect://update", serde_json::json!({ "count": 0 }));
                     } else if value == "stop" {
@@ -3169,10 +3219,12 @@ fn spawn_page_bar(app: tauri::AppHandle) {
                 collecting = false;
                 // 把页面尾部提示记下来：区分"站点说没有更多了"与"被登录墙/风控挡住"
                 let _ = window.eval(
-                    "(function(){var t=document.body.innerText||'';t=t.split(String.fromCharCode(10)).join(' ');var tail=t.slice(-260);location.replace('#xhsdownselftest='+encodeURIComponent(tail));})()",
+                    "(function(){var t=document.body.innerText||'';t=t.split(String.fromCharCode(10)).join(' ');var tail=t.slice(-260);var c=document.getElementById('xhsdown-count');var n=c?c.textContent:'';location.replace('#xhsdownselftest='+encodeURIComponent(n+' ||| '+tail));})()",
                 );
                 if let Some(tail) = read_selftest(&window).await {
-                    xhs_core::login::debug_log(&format!("网页收集：页面尾部提示 = {tail}"));
+                    // 读数里前半是解析栏自己的计数（已加载 N / 共 M），后半是页尾文字：
+                    // 一起记下来，才分得清"真到底了"和"被站点挡住了"
+                    xhs_core::login::debug_log(&format!("网页收集：自动停止时的页面读数 = {tail}"));
                 }
                 let _ = window.eval("history.replaceState(null,'',location.pathname+location.search)");
                 emit_done(&app, &collected, true);
@@ -3186,7 +3238,7 @@ fn spawn_page_bar(app: tauri::AppHandle) {
                     let before = collected.len();
                     for card in cards {
                         let entry = card.entry("");
-                        if !collected.iter().any(|old| old.bid == entry.bid) {
+                        if seen_bids.insert(entry.bid.clone()) {
                             collected.push(entry);
                         }
                     }
