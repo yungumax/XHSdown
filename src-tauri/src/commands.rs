@@ -2583,64 +2583,60 @@ pub async fn web_login_open(app: tauri::AppHandle, state: State<'_, AppState>) -
 /// 幂等：重复注入只在页面里补一条，不会叠出多条。
 const PAGE_BAR_JS: &str = r#"(function () {
   var Z = '2147483000';
-  // 展开状态钉在**页面元素自己身上**（DOM 属性），而不是 sessionStorage——
-  // 小红书页面可能限制会话存储，那样后端每次重新注入都会读成"未展开"，
-  // 把已经展开的条子又收回去，看起来就是反复上下跳（实测踩过）
-  var pinned = function () {
-    var el = document.getElementById('xhsdown-bar') || document.getElementById('xhsdown-handle');
-    if (el && el.dataset && el.dataset.pinned === '1') return true;
-    try { return sessionStorage.getItem('xhsdownBarPinned') === '1'; } catch (e) { return false; }
+  // 展开状态**只从元素自己身上实时读**，绝不留闭包快照——
+  // 脚本可能被后端多次注入，每份闭包各带一份旧状态，会互相把地址栏拉来拉去
+  // （表现为"反复上下跳、点不到"，实测踩过）
+  var isOpen = function () {
+    var bar = document.getElementById('xhsdown-bar');
+    if (bar && bar.dataset) return bar.dataset.pinned === '1';
+    var handle = document.getElementById('xhsdown-handle');
+    if (handle && handle.dataset) return handle.dataset.pinned === '1';
+    return false;
   };
-  var setPinned = function (on) {
+  var markPinned = function (on) {
     var bar = document.getElementById('xhsdown-bar');
     var handle = document.getElementById('xhsdown-handle');
     if (bar && bar.dataset) bar.dataset.pinned = on ? '1' : '0';
     if (handle && handle.dataset) handle.dataset.pinned = on ? '1' : '0';
-    try { sessionStorage.setItem('xhsdownBarPinned', on ? '1' : '0'); } catch (e) {}
   };
-  var open = pinned();
-
-  var apply = function (bar) {
-    var want = open ? 'translateY(0)' : 'translateY(-102%)';
-    if (bar.style.transform !== want) bar.style.transform = want;
-  };
-
-  var setOpen = function (next) {
-    open = next;
+  var apply = function () {
     var bar = document.getElementById('xhsdown-bar');
-    if (!bar) {
-      // 元素还没建出来：先按目标状态建好元素，再写钉住标记
-      var pair = ensure();
-      bar = pair.bar;
+    if (!bar) return;
+    var want = isOpen() ? 'translateY(0)' : 'translateY(-102%)';
+    if (bar.style.transform !== want && bar.style.transform !== want.replace('0)', '0px)')) {
+      bar.style.transform = want;
     }
-    setPinned(next);
-    apply(bar);
+  };
+  var setOpen = function (next) {
+    markPinned(next);
+    apply();
   };
 
   var ensure = function () {
     var handle = document.getElementById('xhsdown-handle');
     var bar = document.getElementById('xhsdown-bar');
-    // 小把手：不遮挡内容（左下角 20px 半透明方块）；鼠标碰到/点它就展开并**钉住**
     if (!handle) {
       handle = document.createElement('div');
       handle.id = 'xhsdown-handle';
+      handle.dataset.pinned = '0';
       handle.textContent = '⌃';
       handle.title = '地址栏（移上去展开，展开后不会自动收起）';
       handle.style.cssText = 'position:fixed;left:8px;bottom:10px;width:20px;height:20px;z-index:' + Z + ';display:flex;align-items:center;justify-content:center;background:#ff2442;color:#fff;border-radius:6px;font:11px/1 sans-serif;cursor:pointer;opacity:.4;transition:opacity .15s;box-shadow:0 2px 8px rgba(0,0,0,.28);';
       handle.onmouseenter = function () {
         handle.style.opacity = '1';
-        setOpen(true); // 展开后保持，不再因鼠标移开而收回
+        setOpen(true);
       };
       handle.onmouseleave = function () { handle.style.opacity = '.4'; };
       handle.onclick = function () { setOpen(true); };
       (document.documentElement || document.body).appendChild(handle);
     }
     if (!bar) {
+      var startOpen = isOpen();
       bar = document.createElement('div');
       bar.id = 'xhsdown-bar';
-      // 关键：创建时就带上初始位置（否则会先"闪现在顶部"再滑上去，看起来就是反复上下跳），
-      // 过渡动画推迟到下一帧再挂（避免重建时也走一遍动画）
-      bar.style.cssText = 'position:fixed;left:0;right:0;top:0;height:34px;z-index:' + Z + ';display:flex;align-items:center;gap:6px;padding:0 10px;background:#17181a;color:#e8e9ea;border-bottom:1px solid #282a2d;font:12px/1 "Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;box-sizing:border-box;transform:' + (open ? 'translateY(0)' : 'translateY(-102%)') + ';';
+      bar.dataset.pinned = startOpen ? '1' : '0';
+      // 创建时就带上当前状态的位置（否则会先闪现在顶部再滑上去），过渡推迟到下一帧
+      bar.style.cssText = 'position:fixed;left:0;right:0;top:0;height:34px;z-index:' + Z + ';display:flex;align-items:center;gap:6px;padding:0 10px;background:#17181a;color:#e8e9ea;border-bottom:1px solid #282a2d;font:12px/1 "Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;box-sizing:border-box;transform:' + (startOpen ? 'translateY(0)' : 'translateY(-102%)') + ';';
       var btn = function (label, title, fn) {
         var b = document.createElement('button');
         b.textContent = label;
@@ -2678,30 +2674,28 @@ const PAGE_BAR_JS: &str = r#"(function () {
         location.replace('#xhsdownparse=' + encodeURIComponent(url));
       });
       btn('收起', '收起地址栏（收回到左下角小方块）', function () { setOpen(false); });
-      // 挂到 documentElement 上：SPA 重渲染 body 时不容易被清掉
       (document.documentElement || document.body).appendChild(bar);
-      // 下一帧再启用过渡：这样"被页面清掉后补回"时不会再演一遍滑入动画
-      var first = bar;
       requestAnimationFrame(function () {
-        try { first.style.transition = 'transform .16s ease'; } catch (e) {}
+        try { bar.style.transition = 'transform .16s ease'; } catch (e) {}
       });
     }
-    apply(bar);
-    return { bar: bar, handle: handle };
+    apply();
   };
 
-  // 换页/页面重渲染后补回，并同步地址显示（展开状态由 sessionStorage 钉住）
-  setInterval(function () {
-    try {
-      ensure();
-      var input = document.getElementById('xhsdown-url');
-      if (input && document.activeElement !== input) {
-        input.value = location.href.split('#')[0];
-      }
-    } catch (e) {}
-  }, 800);
-
   ensure();
+
+  // 全局只留一个定时器：脚本被反复注入时不会叠加出一堆互斗的定时器
+  if (!window.__xhsdownBarTimer) {
+    window.__xhsdownBarTimer = setInterval(function () {
+      try {
+        ensure();
+        var input = document.getElementById('xhsdown-url');
+        if (input && document.activeElement !== input) {
+          input.value = location.href.split('#')[0];
+        }
+      } catch (e) {}
+    }, 800);
+  }
 })();"#;
 
 /// 网页显示期间：定期注入地址栏，并接收页面里「解析」按钮送来的地址
