@@ -1025,6 +1025,7 @@ async fn ensure_work_window(
     }
     let dir = crate::state::webview_dir(settings);
     std::fs::create_dir_all(&dir).map_err(err)?;
+    let app_for_new_window = app.clone();
     let window = tauri::WebviewWindowBuilder::new(
         app,
         "xhs-work",
@@ -1034,6 +1035,18 @@ async fn ensure_work_window(
     .inner_size(1000.0, 760.0)
     .visible(false)
     .data_directory(dir)
+    // 站内链接常以"新窗口"打开（target=_blank / window.open）：浏览器里是新标签页，
+    // 而我们没有新窗口处理，请求会被静默丢弃——表现就是"点了没反应"。
+    // 这里统一改成就地跳转，与浏览器点击行为一致。
+    .on_new_window(move |url, _features| {
+        let text = url.to_string();
+        if text.starts_with("http://") || text.starts_with("https://") {
+            if let Some(work) = app_for_new_window.get_webview_window("xhs-work") {
+                let _ = work.navigate(url.clone());
+            }
+        }
+        tauri::webview::NewWindowResponse::Deny
+    })
     .build()
     .map_err(err)?;
     Ok(window)
@@ -2583,6 +2596,41 @@ pub async fn web_login_open(app: tauri::AppHandle, state: State<'_, AppState>) -
 /// 幂等：重复注入只在页面里补一条，不会叠出多条。
 const PAGE_BAR_JS: &str = r#"(function () {
   var Z = '2147483000';
+  // 站内点击常走"新窗口"（window.open / target=_blank）：浏览器里弹新标签页，
+  // 我们这里没有新窗口，请求会被丢弃——点了看起来没反应。
+  // 统一改成就地跳转（与浏览器点击体验一致），只做一次。
+  if (!window.__xhsdownOpenPatched) {
+    window.__xhsdownOpenPatched = true;
+    try {
+      window.open = function (url) {
+        try {
+          if (url) location.href = String(url);
+        } catch (e) {}
+        return null;
+      };
+    } catch (e) {}
+    document.addEventListener(
+      'click',
+      function (ev) {
+        try {
+          var el = ev.target;
+          while (el && el !== document.documentElement) {
+            if (el.tagName === 'A') break;
+            el = el.parentElement;
+          }
+          if (!el || el.tagName !== 'A') return;
+          var href = el.getAttribute('href') || '';
+          if (!href || href.charAt(0) === '#') return;
+          if (el.getAttribute('target') === '_blank') {
+            ev.preventDefault();
+            ev.stopPropagation();
+            location.href = el.href;
+          }
+        } catch (e) {}
+      },
+      true
+    );
+  }
   // 展开状态**只从元素自己身上实时读**，绝不留闭包快照——
   // 脚本可能被后端多次注入，每份闭包各带一份旧状态，会互相把地址栏拉来拉去
   // （表现为"反复上下跳、点不到"，实测踩过）
