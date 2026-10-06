@@ -1032,14 +1032,15 @@ const EXTRACT_JS: &str = r#"(function () {
   try {
     var st = window.__INITIAL_STATE__ || null;
     if (!st) {
-      report({ ready: false, pageUrl: location.href });
+      report({ ready: false, pageUrl: here });
       return;
     }
 
     // 先按**当前网址**判断页面类型，再读对应的数据。
     // 不能"状态里有什么就读什么"：小红书是单页应用，状态会残留上一次看过的
     // 笔记/主页数据（实测：在推荐流页面上读到了残留的笔记，登录流程一直等不到昵称）
-    var here = location.href;
+    // 页面地址一律去掉 #片段：上报时若带上一次 marker，会层层嵌套越滚越长（实测）
+    var here = location.href.split('#')[0];
     var urlNote = here.match(/(?:\/explore\/|\/discovery\/item\/)([0-9a-f]{24})/);
     var isNotePage = !!urlNote;
     var isProfilePage = here.indexOf("/user/profile/") >= 0;
@@ -1090,7 +1091,7 @@ const EXTRACT_JS: &str = r#"(function () {
       }
       var nu = unwrap(note.user) || {};
       report({
-        ready: true, kind: 'note', pageUrl: location.href,
+        ready: true, kind: 'note', pageUrl: here,
         noteId: note.noteId || ids[0],
         title: note.title || '',
         desc: String(note.desc || '').slice(0, 20000),
@@ -1174,17 +1175,17 @@ const EXTRACT_JS: &str = r#"(function () {
     // 且必须有昵称——笔记列表会先于资料到达，只认昵称会得到"有列表没资料"的半成品
     var fetchStatus = String(unwrap(pu.userFetchingStatus) || '');
     if (!nameOut) {
-      report({ ready: false, pageUrl: location.href });
+      report({ ready: false, pageUrl: here });
       return;
     }
     if (fetchStatus !== 'resolved' && cards.length === 0) {
-      report({ ready: false, pageUrl: location.href });
+      report({ ready: false, pageUrl: here });
       return;
     }
     var countRaw = unwrap(merged.notes) !== undefined ? unwrap(merged.notes) : unwrap(merged.noteCount);
     var countOut = typeof countRaw === 'number' ? countRaw : 0;
     report({
-      ready: true, kind: 'user', pageUrl: location.href,
+      ready: true, kind: 'user', pageUrl: here,
       uid: urlUid || stateUid,
       nickname: nameOut,
       avatar: avatarOut,
@@ -1194,7 +1195,7 @@ const EXTRACT_JS: &str = r#"(function () {
     });
     return;
   } catch (e) {
-    report({ error: String(e), pageUrl: location.href });
+    report({ error: String(e), pageUrl: here });
   }
 })();
 "#;
@@ -1251,7 +1252,8 @@ async fn webview_fetch_inner(
         tokio::time::sleep(Duration::from_millis(700)).await;
         let Some(value) = extract_from_page(&window).await else { continue };
         if let Some(page) = value.get("pageUrl").and_then(|v| v.as_str()) {
-            last_page = page.to_string();
+            // 去掉 #片段：marker 会层层嵌套，日志会被撑爆（实测踩过）
+            last_page = page.split('#').next().unwrap_or(page).to_string();
         }
         if value.get("ready").and_then(|v| v.as_bool()).unwrap_or(false) {
             return Ok(value);
@@ -1904,7 +1906,7 @@ const PAGE_SNAPSHOT_JS: &str = r#"(function () {
     try { return JSON.stringify(unwrap(v)).slice(0, 300); } catch (e) { return '[circular]'; }
   };
   try {
-    var out = { url: location.href, title: document.title };
+    var out = { url: location.href.split('#')[0], title: document.title };
     var st = window.__INITIAL_STATE__ || {};
     var pu = unwrap(st.user) || {};
     out.userFields = fields(pu, 18);
