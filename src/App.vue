@@ -52,6 +52,7 @@ const settingsEnv = ref(null);
 const showOnboarding = ref(false);
 
 let unlistenTask = null;
+let unlistenLogin = null;
 let toastTimer = null;
 
 const queue = computed(() => {
@@ -119,10 +120,17 @@ onMounted(async () => {
     if (index === -1) tasks.value.unshift(task);
     else tasks.value[index] = task;
   });
+
+  // 登录成功的通知（后端检测到登录后推送）：全局监听——登录窗是独立的官方页面，
+  // 应用侧不留自定义登录弹窗，收到通知只更新右上角并把结果告诉用户
+  unlistenLogin = await api.onLoginConfirmed((info) => {
+    onWebConfirmed(info);
+  });
 });
 
 onUnmounted(() => {
   if (unlistenTask) unlistenTask();
+  if (unlistenLogin) unlistenLogin();
   clearTimeout(toastTimer);
 });
 
@@ -318,8 +326,19 @@ function onWebConfirmed(loginInfo) {
   showLogin.value = false;
 }
 
-function openLogin() {
-  showLogin.value = true;
+/** 点「未登录」：直接打开小红书官方登录页（独立窗口），不再套自家弹窗 */
+async function openLogin() {
+  if (login.value.logged_in) {
+    showLogin.value = true; // 已登录时打开的是账号面板（看昵称头像、退出登录）
+    return;
+  }
+  try {
+    await api.webLoginOpen();
+    await api.webLoginWatch();
+    showToast("已打开小红书官方登录页，登录成功后这里会自动完成绑定");
+  } catch (error) {
+    showToast(String(error));
+  }
 }
 
 async function doLogout() {

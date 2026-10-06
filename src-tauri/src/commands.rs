@@ -1098,6 +1098,15 @@ const EXTRACT_JS: &str = r#"(function () {
         break;
       }
     }
+    // 页头渲染出的昵称元素（标题还没更新时的兜底）
+    var domNameEl = '';
+    var nameEl = document.querySelector(
+      '[class*="user-name"], [class*="nickname"], [class*="user-nickname"], h1'
+    );
+    if (nameEl) {
+      var nt = (nameEl.textContent || '').trim();
+      if (nt && nt.length <= 30 && nt.indexOf('小红书') < 0) domNameEl = nt;
+    }
     // uid 只认 URL 里的：页面上的主页链接可能是别人的（实测把陌生人 uid 当成了本人）
     var domUid = '';
     var um = location.href.match(/profile\/([0-9a-f]{24})/);
@@ -1106,17 +1115,20 @@ const EXTRACT_JS: &str = r#"(function () {
     }
 
     var uidOut = pick(merged, ['id', 'userId', 'user_id', 'userid']) || domUid || '';
-    var nameOut = pick(merged, ['nickname', 'nickName', 'nick_name', 'name', 'userName']) || domName || '';
+    var nameOut =
+      pick(merged, ['nickname', 'nickName', 'nick_name', 'name', 'userName']) ||
+      domName ||
+      domNameEl ||
+      '';
     var avatarOut = pick(merged, ['headImage', 'image', 'avatar', 'images', 'avatarUrl', 'imageb']) || domAvatar || '';
     var countOut = 0;
     var rawCount = merged.notes !== undefined ? merged.notes : merged.noteCount;
     if (typeof rawCount === 'number') countOut = rawCount;
     else if (typeof rawCount === 'string' && rawCount) countOut = parseInt(rawCount, 10) || 0;
 
-    // 就绪判定：昵称来自状态/真标题、或已有笔记列表、或状态给出了 uid 才算。
-    // 光靠"页面上有主页链接"不行——那可能是别人的 uid（实测踩过）
-    var stateUid = pick(merged, ['id', 'userId', 'user_id', 'userid']);
-    if (!nameOut && !stateUid && cards.length === 0) {
+    // 就绪判定：主页**必须有昵称**才算。笔记列表会先于资料返回，那时交卷就会得到
+    // "已登录但昵称头像全空"的假状态（实测踩过两次）；昵称总会有，继续等即可。
+    if (!nameOut) {
       report({ ready: false, pageUrl: location.href });
       return;
     }

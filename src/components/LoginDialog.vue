@@ -1,92 +1,22 @@
 <script setup>
-// 登录对话框（小红书版）：打开官方登录页（手机号验证码 / 账号密码 / 扫码都在里面），
-// 登录成功后自动检测、自动关闭，并把昵称与头像同步到标题栏。
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+// 账号面板（小红书版）：只在已登录时打开——显示昵称、头像与退出登录。
+// 登录流程本身是**独立窗口里的官方登录页**（见后端 web_login_* 命令），
+// 这里不套任何自定义登录表单。
+import { computed, onUnmounted } from "vue";
 import * as api from "../api";
 import Icon from "./Icon.vue";
 
 const props = defineProps({
   login: { type: Object, default: () => ({ logged_in: false }) },
 });
-const emit = defineEmits(["close", "logout", "web-confirmed"]);
+const emit = defineEmits(["close", "logout"]);
 
-const busy = ref(false);
-const status = ref("正在打开小红书官方登录窗口…");
-const windowOpen = ref(false);
-
-// 后端轮询：界面窗口被登录窗遮挡时，前端定时器会被系统降频到近乎停摆
-//（实测静默 80+ 秒），所以"等登录"这件事交给后端 Rust 定时器做，
-// 检测到登录后由后端推 login://confirmed 事件过来。
 let alive = true;
-let unlisten = null;
-
-watch(
-  () => props.login.logged_in,
-  (on, was) => {
-    if (was && !on) stop(); // 退出登录
-  }
-);
-
 onUnmounted(() => {
   alive = false;
-  if (unlisten) unlisten();
 });
 
-function stop() {
-  status.value = "";
-  busy.value = false;
-}
-
-/** 打开官方登录窗口（已开着就聚焦） */
-async function openWindow() {
-  try {
-    await api.webLoginOpen();
-    windowOpen.value = true;
-    return true;
-  } catch (error) {
-    status.value = `打开登录窗口失败：${error}`;
-    return false;
-  }
-}
-
-/** 开始等待登录：开窗 + 后端轮询 + 监听成功事件 */
-async function startWaiting() {
-  await openWindow();
-  await api.webLoginWatch().catch((error) => {
-    status.value = String(error);
-  });
-  status.value =
-    "请在小窗里完成登录（手机号 + 短信验证码最稳，也可扫码）。登录成功后此处会自动完成绑定。";
-}
-
-/** 手动查一次（后端轮询之外的手动兜底） */
-async function checkNow() {
-  if (busy.value) return;
-  busy.value = true;
-  status.value = "正在检测登录状态…";
-  try {
-    const info = await api.webLoginCookies();
-    if (!alive) return;
-    emit("web-confirmed", info);
-  } catch (error) {
-    status.value = String(error);
-  } finally {
-    if (alive) busy.value = false;
-  }
-}
-
-/** 重新加载登录页：二维码/页面卡住时的恢复手段（关掉重开 = 全新页面） */
-async function reloadLogin() {
-  try {
-    await api.webLoginClose();
-  } catch {}
-  await new Promise((r) => setTimeout(r, 400));
-  status.value = "已重新加载登录页…";
-  await startWaiting();
-}
-
 async function closeAll() {
-  stop();
   try {
     await api.webLoginClose();
   } catch {}
@@ -97,15 +27,6 @@ const idText = computed(() => {
   const id = props.login.mid || "";
   if (!id) return "";
   return id.length > 16 ? `${id.slice(0, 8)}…${id.slice(-4)}` : id;
-});
-
-onMounted(async () => {
-  if (props.login.logged_in) return;
-  unlisten = await api.onLoginConfirmed((info) => {
-    if (!alive) return;
-    emit("web-confirmed", info);
-  });
-  await startWaiting();
 });
 </script>
 
@@ -133,32 +54,6 @@ onMounted(async () => {
         </div>
       </template>
 
-      <template v-else>
-        <div class="web-login">
-          <Icon name="lock" class="big-icon" />
-          <p class="hint">
-            已打开<b>小红书官方登录页</b>（独立小窗）。两种方式：
-            <b>手机号 + 短信验证码</b>（推荐，最稳）、<b>扫码</b>（小红书 App 或微信）。
-          </p>
-          <p class="hint dim">
-            二维码过期会<b>自动刷新</b>（点不动会自动重载页面）；若仍卡在过期状态，
-            点下方「重新加载登录页」。账号密码登录只有小红书 App 里有，网页端不提供。
-          </p>
-          <p v-if="status" class="status">{{ status }}</p>
-          <p v-if="busy" class="waiting">
-            <span class="dot-pulse"></span>
-            正在等待登录…
-          </p>
-        </div>
-        <div class="actions">
-          <button class="ghost" :disabled="busy" @click="reloadLogin">
-            重新加载登录页
-          </button>
-          <button class="primary" :disabled="busy" @click="checkNow">
-            {{ busy ? "检测中…" : "我已登录，立即绑定" }}
-          </button>
-        </div>
-      </template>
     </div>
   </div>
 </template>
