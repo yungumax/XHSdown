@@ -246,11 +246,15 @@ export async function onCollectUpdate(handler) {
   return listen("collect://update", (event) => handler(event.payload?.count || 0));
 }
 
-/** 网页内收集：完成（整份列表） */
+/** 网页内收集：完成（整份列表 + 页面自己报的主页总数，0 表示没读到） */
 export async function onCollectDone(handler) {
   if (!hasTauri) return () => {};
   return listen("collect://done", (event) =>
-    handler(event.payload?.items || [], !!event.payload?.auto),
+    handler(
+      event.payload?.items || [],
+      !!event.payload?.auto,
+      Number(event.payload?.total) || 0,
+    ),
   );
 }
 

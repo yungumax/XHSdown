@@ -204,16 +204,24 @@ onMounted(async () => {
     collectCount.value = count;
     if (count > 0) showToast(`网页收集中：已收集 ${count} 条`);
   });
-  unlistenCollectDone = await api.onCollectDone((items) => {
+  unlistenCollectDone = await api.onCollectDone((items, auto, total) => {
     collectCount.value = 0;
     if (!items.length) {
       showToast("网页收集：没有收集到内容");
       return;
     }
     collected.value = { items, stamp: Date.now() };
-    showToast(
-      `网页收集完成：${items.length} 条，已送入解析结果（数量明显少于主页总数时，先登录再收集可拿到更多）`,
-    );
+    // 总数拿得到就直接给结论：收全了 / 还差多少。用户看到"停在 N 条"时最需要这个答案
+    if (total > 0 && items.length >= total) {
+      showToast(`网页收集完成：${items.length} 条，已收全（主页共 ${total} 条）`);
+    } else if (total > items.length) {
+      showToast(
+        `网页收集完成：${items.length} 条，主页共 ${total} 条，还差 ${total - items.length} 条` +
+          "（未登录时小红书会拦住后续笔记，登录后再收集即可拿全）",
+      );
+    } else {
+      showToast(`网页收集完成：${items.length} 条，已送入解析结果`);
+    }
   });
 });
 

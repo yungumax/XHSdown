@@ -75,27 +75,52 @@ pub async fn app_status(
     warmup_once(&state).await;
     let settings = state.settings_snapshot();
 
-    // 登录态：让浏览器读一次「我的主页」——登录态存在浏览器数据目录里，
-    // 所以跨重启也能恢复。超时或失败一律当未登录，不卡界面。
+    // 登录态：让浏览器读一次「我的主页」——登录态存在浏览器数据目录里，所以跨重启也能恢复。
+    // 「读失败」（超时/风控/窗口被隐藏）跟「确认未登录」是两回事，混淆过一次：
+    // 界面显示"未登录"害用户以为掉线、又去别处登录，把会话互相顶掉。所以失败要重试一次，
+    // 仍失败就沿用内存里上一次的登录态，不把"没读成"当成"未登录"。
     let mut login = LoginInfo::default();
-    // 给足 40 秒：页面加载慢时（风控/网络）也能等到结果，不要提前放弃
-    let check = tokio::time::timeout(Duration::from_secs(40), browser_login_check(&app)).await;
-    match check {
-        Ok(Ok(Some((uid, name, avatar)))) => {
-            let client = state.client();
-            login = LoginInfo {
-                logged_in: true,
-                uname: name,
-                face: inline_avatar(&client, &avatar).await,
-                mid: uid,
-                ..Default::default()
-            };
-            *state.login.write().unwrap() = Some(login.clone());
-            xhs_core::login::debug_log("启动恢复登录：已登录");
+    let mut last_err: Option<String> = None;
+    for attempt in 0..2 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_secs(3)).await;
         }
-        Ok(Ok(None)) => xhs_core::login::debug_log("启动恢复登录：未登录"),
-        Ok(Err(e)) => xhs_core::login::debug_log(&format!("启动恢复登录失败：{e}")),
-        Err(_) => xhs_core::login::debug_log("启动恢复登录：检测超时"),
+        // 每次给足 40 秒：页面加载慢时（风控/网络）也能等到结果，不要提前放弃
+        match tokio::time::timeout(Duration::from_secs(40), browser_login_check(&app)).await {
+            Ok(Ok(Some((uid, name, avatar)))) => {
+                let client = state.client();
+                login = LoginInfo {
+                    logged_in: true,
+                    uname: name,
+                    face: inline_avatar(&client, &avatar).await,
+                    mid: uid,
+                    ..Default::default()
+                };
+                *state.login.write().unwrap() = Some(login.clone());
+                xhs_core::login::debug_log("启动恢复登录：已登录");
+                last_err = None;
+                break;
+            }
+            Ok(Ok(None)) => {
+                xhs_core::login::debug_log("启动恢复登录：未登录");
+                last_err = None;
+                break;
+            }
+            Ok(Err(e)) => {
+                xhs_core::login::debug_log(&format!("启动恢复登录：读取失败（第 {} 次）：{e}", attempt + 1));
+                last_err = Some(e);
+            }
+            Err(_) => {
+                xhs_core::login::debug_log(&format!("启动恢复登录：检测超时（第 {} 次）", attempt + 1));
+                last_err = Some("检测超时".into());
+            }
+        }
+    }
+    if let Some(err) = last_err {
+        if let Some(cached) = state.login.read().unwrap().clone() {
+            login = cached;
+            xhs_core::login::debug_log(&format!("启动恢复登录：{err}，沿用上次登录态"));
+        }
     }
 
     // 自检开关：数据目录里放一个 login_selftest 文件 → 启动后自动探一次登录页
@@ -1516,8 +1541,12 @@ const EXTRACT_JS: &str = r#"(function () {
       report({ ready: false, pageUrl: here });
       return;
     }
-    var countRaw = unwrap(merged.notes) !== undefined ? unwrap(merged.notes) : unwrap(merged.noteCount);
-    var countOut = typeof countRaw === 'number' ? countRaw : 0;
+    // 总数实测在 userPageData.posted（纯数字）；notes/noteCount 是列表字段（可能是数组），当兜底
+    var numOf = function (v) {
+      v = unwrap(v);
+      return typeof v === 'number' && isFinite(v) ? Math.floor(v) : 0;
+    };
+    var countOut = numOf(merged.posted) || numOf(merged.notes) || numOf(merged.noteCount);
     report({
       ready: true, kind: 'user', pageUrl: here,
       uid: urlUid || stateUid,
@@ -1777,8 +1806,10 @@ async fn browser_login_check(
                 {
                     Ok(value) => value,
                     Err(e) => {
+                        // 读不到 ≠ 没登录：网络慢 / 被风控 / 窗口被隐藏时页面读也会失败。
+                        // 返回 Err，让调用方区分"确认未登录"和"本次没读成"（启动时据此重试）
                         xhs_core::login::debug_log(&format!("登录检测：{e}"));
-                        return Ok(None);
+                        return Err(e);
                     }
                 }
             }
@@ -3092,7 +3123,9 @@ const PAGE_BAR_JS: &str = r#"(function () {
       };
       var page = unwrapAll(u.userPageData) || {};
       var info = unwrapAll(u.userInfo) || {};
-      return num(page.notes) || num(page.noteCount) || num(info.notes) || num(info.noteCount);
+      // 实测：总数在 userPageData.posted（纯数字，=该账号已发布笔记数）；
+      // notes/noteCount 是列表字段（可能是数组），只能当兜底
+      return num(page.posted) || num(page.notes) || num(page.noteCount) || num(info.notes) || num(info.noteCount);
     } catch (e) {
       return 0;
     }
@@ -3111,10 +3144,10 @@ const PAGE_BAR_JS: &str = r#"(function () {
         if (count) {
           var n = countCards();
           var total = totalCards();
-          count.textContent =
-            n > 0
-              ? (total > n ? '已加载 ' + n + ' / 共 ' + total + ' 条' : '已加载 ' + n + ' 条')
-              : '';
+          if (n <= 0) count.textContent = '';
+          else if (total > n) count.textContent = '已加载 ' + n + ' / 共 ' + total + ' 条';
+          else if (total > 0) count.textContent = '已收全 ' + n + ' 条';
+          else count.textContent = '已加载 ' + n + ' 条';
         }
       } catch (e) {}
     }, 800);
@@ -3137,19 +3170,45 @@ fn spawn_page_bar(app: tauri::AppHandle) {
         let clear_hash = |window: &tauri::WebviewWindow| {
             let _ = window.eval("history.replaceState(null,'',location.pathname+location.search)");
         };
-        let emit_done = |app: &tauri::AppHandle, collected: &[PostEntry], auto: bool| {
+        // 从解析栏读数里抠出主页总数：「已收全 625 条」或「已加载 320 / 共 625 条」
+        let parse_total = |text: &str| -> u32 {
+            let pick = |after: &str| -> u32 {
+                text.split(after)
+                    .nth(1)
+                    .and_then(|rest| rest.split(' ').next())
+                    .and_then(|num| num.parse::<u32>().ok())
+                    .unwrap_or(0)
+            };
+            let n = pick("已收全 ");
+            if n > 0 {
+                return n;
+            }
+            pick("共 ")
+        };
+        let emit_done = |app: &tauri::AppHandle, collected: &[PostEntry], auto: bool, total: u32| {
             if collected.is_empty() {
                 xhs_core::login::debug_log("网页收集：没有收集到内容");
                 return;
             }
+            // 有总数就说得明白：到底收够了没有（用户看到"停在 N 条"时最需要这个答案）
+            let hint = if total == 0 {
+                String::new()
+            } else if total as usize <= collected.len() {
+                "（已收全）".to_string()
+            } else {
+                format!(
+                    "（主页共 {total} 条，还差 {} 条；未登录时小红书会拦住后续笔记，登录后再收集）",
+                    total as usize - collected.len()
+                )
+            };
             xhs_core::login::debug_log(&format!(
-                "网页收集：完成，共 {} 条{auto_hint}",
+                "网页收集：完成，共 {} 条{auto_hint}{hint}",
                 collected.len(),
                 auto_hint = if auto { "（自动判定到底）" } else { "" }
             ));
             let _ = app.emit(
                 "collect://done",
-                serde_json::json!({ "items": collected, "auto": auto }),
+                serde_json::json!({ "items": collected, "auto": auto, "total": total }),
             );
         };
 
@@ -3160,7 +3219,7 @@ fn spawn_page_bar(app: tauri::AppHandle) {
             };
             if !window.is_visible().unwrap_or(false) {
                 if collecting {
-                    emit_done(&app, &collected, false);
+                    emit_done(&app, &collected, false, 0);
                     collecting = false;
                 }
                 break;
@@ -3197,7 +3256,17 @@ fn spawn_page_bar(app: tauri::AppHandle) {
                         let _ = app.emit("collect://update", serde_json::json!({ "count": 0 }));
                     } else if value == "stop" {
                         collecting = false;
-                        emit_done(&app, &collected, false);
+                        // 手动点「完成解析」：顺手把页面读一遍拿总数，好告诉用户收够了没有
+                        let total = {
+                            let _ = window.eval(
+                                "(function(){var c=document.getElementById('xhsdown-count');location.replace('#xhsdownselftest='+encodeURIComponent(c?c.textContent:''));})()",
+                            );
+                            read_selftest(&window)
+                                .await
+                                .map(|text| parse_total(&text))
+                                .unwrap_or(0)
+                        };
+                        emit_done(&app, &collected, false, total);
                     }
                 } else if let Some(idx) = text.find("xhsdownparse=") {
                     let rest = &text[idx + "xhsdownparse=".len()..];
@@ -3221,13 +3290,15 @@ fn spawn_page_bar(app: tauri::AppHandle) {
                 let _ = window.eval(
                     "(function(){var t=document.body.innerText||'';t=t.split(String.fromCharCode(10)).join(' ');var tail=t.slice(-260);var c=document.getElementById('xhsdown-count');var n=c?c.textContent:'';location.replace('#xhsdownselftest='+encodeURIComponent(n+' ||| '+tail));})()",
                 );
+                let mut total = 0;
                 if let Some(tail) = read_selftest(&window).await {
-                    // 读数里前半是解析栏自己的计数（已加载 N / 共 M），后半是页尾文字：
+                    // 读数里前半是解析栏自己的计数（已加载 N / 共 M / 已收全 N），后半是页尾文字：
                     // 一起记下来，才分得清"真到底了"和"被站点挡住了"
                     xhs_core::login::debug_log(&format!("网页收集：自动停止时的页面读数 = {tail}"));
+                    total = parse_total(tail.split("|||").next().unwrap_or(""));
                 }
                 let _ = window.eval("history.replaceState(null,'',location.pathname+location.search)");
-                emit_done(&app, &collected, true);
+                emit_done(&app, &collected, true, total);
                 continue;
             }
             let _ = window.eval(SCROLL_BOTTOM_JS);
