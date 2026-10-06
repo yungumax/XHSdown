@@ -20,10 +20,20 @@
 ## 小红书接口的坑（改代码前先读）
 
 - **登录是硬门槛**：2026 起笔记详情页与用户主页对未登录访问直接 302 到
-  `/login`。登录统一走「内嵌官方登录页 + 收割 Cookie」（`web_login_*` 命令），
-  没有可裸调的登录接口（都要 x-s 签名）。
+  `/login`（有时是 `/404?error_code=300031`）。没有可裸调的登录接口（都要 x-s 签名），
+  登录统一走「内嵌官方登录页」（`web_login_*` 命令）。
+- **取数一律借浏览器会话**：小红书会拒绝「复制 Cookie 再用 reqwest 请求」的会话
+  （实测：登录窗里 Cookie 齐全，程序自己请求仍被判未登录）。所以解析走隐藏的
+  `xhs-fetch` 窗口（与登录窗共用浏览器数据目录），reqwest 只负责下载 CDN 直链
+  （那些地址自带签名，不需要 Cookie）。入口：`webview_fetch()` / `fetch_note()` / `fetch_user()`。
+- **登录判定的唯一权威依据**：让浏览器去读 `/user/profile/me`，拿到真实资料
+  才算已登录（`browser_login_check()`）。页面里的 `loggedIn` 字段**对匿名访客也是
+  true**，用它判定会误报「已登录」（实测踩过）。
+- **登录态存在 %APPDATA%\xhsdown\webview**（浏览器数据目录），跨重启保留；
+  退出登录时删该目录，删不掉就留 `webview.logout` 标记下次启动清——否则会
+  「点了退出登录、重启又自动登录回去」。
 - **访客指纹 Cookie**：无 `a1` / `webId` / `xsecappid` 时，连探索页都会被 302。
-  `XhsClient::warmup()` 会补一组访客值——这组值只够过首页，详情页仍要登录。
+  `XhsClient::warmup()` 会补一组访客值——这组值只够过首页（reqwest 快路径用）。
 - **xsec_token**：笔记链接必须带 `xsec_token`（App 分享链接自带；用户主页解析出的
   条目由 `note_page_url()` 拼好）。文件：`crates/xhs-core/src/parser.rs`。
 - **数据在 `__INITIAL_STATE__`**：笔记详情在 `noteDetailMap[id].note`；
