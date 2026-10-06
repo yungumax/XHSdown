@@ -10,6 +10,9 @@ use crate::error::{Result, XhsError};
 /// 一条输入归一后的来源目标。
 #[derive(Debug, Clone, PartialEq)]
 pub enum SourceTarget {
+    /// 推荐流首页（https://www.xiaohongshu.com/explore，没有具体笔记 id）：
+    /// 解析页面里那一屏笔记卡片，勾选后即可下载
+    Feed,
     /// 单条笔记（id = 24 位十六进制；token = xsec_token，详情页多数情况必需）
     Note { id: String, token: Option<String>, url: String },
     /// 用户主页（uid = 24 位十六进制）
@@ -78,14 +81,17 @@ pub fn parse_input(input: &str) -> Result<SourceTarget> {
     }
     // /explore/{id}
     if let Some(i) = segments.iter().position(|s| *s == "explore") {
-        if let Some(id) = segments.get(i + 1) {
-            if looks_like_id(id) {
+        match segments.get(i + 1) {
+            Some(id) if looks_like_id(id) => {
                 return Ok(SourceTarget::Note {
                     id: id.to_string(),
                     token,
                     url: candidate.to_string(),
                 });
             }
+            // /explore 本身（信息流首页）：解析这一屏笔记
+            None if is_xhs => return Ok(SourceTarget::Feed),
+            _ => {}
         }
     }
     // /discovery/item/{id}（老版分享形态）
@@ -184,6 +190,18 @@ mod tests {
             }
             other => panic!("应为 User，实际 {other:?}"),
         }
+    }
+
+    #[test]
+    fn explore_home_is_feed() {
+        assert_eq!(
+            parse_input("https://www.xiaohongshu.com/explore").unwrap(),
+            SourceTarget::Feed
+        );
+        assert_eq!(
+            parse_input("https://www.xiaohongshu.com/explore/").unwrap(),
+            SourceTarget::Feed
+        );
     }
 
     #[test]

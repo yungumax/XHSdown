@@ -47,6 +47,21 @@ pub struct UserInfo {
     pub fans: String,
 }
 
+/// 页面没有 `__INITIAL_STATE__` 时，先判断它是不是登录页：
+/// 站点有时用 HTTP 200 直接返回登录页 HTML（不 302），只按跳转判断会漏掉。
+fn decode_or_login(html: &str, original: XhsError) -> XhsError {
+    if html.contains("/login?redirectPath=")
+        || html.contains("登录后推荐更懂你的笔记")
+        || html.contains("扫码登录")
+    {
+        XhsError::NeedLogin(
+            "小红书要求登录后浏览该内容（页面直接返回了登录页）——请先登录再重试".into(),
+        )
+    } else {
+        original
+    }
+}
+
 impl XhsClient {
     /// 单条笔记详情。`url` 是带 xsec_token 的完整笔记页地址
     /// （分享链接自带；用户主页来的笔记由本库拼好带回）。
@@ -54,7 +69,10 @@ impl XhsClient {
         let html = self
             .fetch_text(url, crate::client::SITE_REFERER)
             .await?;
-        let state = XhsClient::parse_initial_state(&html)?;
+        let state = match XhsClient::parse_initial_state(&html) {
+            Ok(state) => state,
+            Err(e) => return Err(decode_or_login(&html, e)),
+        };
         let detail = note_from_state(&state).ok_or_else(|| {
             XhsError::Api("笔记可能已被删除、仅自己可见或页面改版（未取到笔记数据）".into())
         })?;
@@ -68,7 +86,10 @@ impl XhsClient {
         let html = self
             .fetch_text(&url, crate::client::SITE_REFERER)
             .await?;
-        let state = XhsClient::parse_initial_state(&html)?;
+        let state = match XhsClient::parse_initial_state(&html) {
+            Ok(state) => state,
+            Err(e) => return Err(decode_or_login(&html, e)),
+        };
         // userPageData 未登录时实测是空数组；只有拿到对象才算真数据
         let page = state
             .pointer("/user/userPageData")

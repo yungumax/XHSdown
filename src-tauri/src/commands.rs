@@ -314,28 +314,50 @@ pub async fn probe_source(
             }
             Ok(probe)
         }
+        SourceTarget::Feed => {
+            // 推荐流首页：解析页面里这一屏笔记卡片（都带 token，可直接下载）
+            let value = webview_fetch(&app, "https://www.xiaohongshu.com/explore").await?;
+            let cards = UserBundle::cards_from_web(&value);
+            if cards.is_empty() {
+                return Err(
+                    "推荐流页面没有解析到笔记卡片（可能被风控或页面还没加载完）——请稍后重试"
+                        .into(),
+                );
+            }
+            let entries: Vec<PostEntry> = cards.iter().map(|card| card.entry("")).collect();
+            let count = entries.len();
+            let probe = Probe {
+                kind: "feed".into(),
+                bid: String::new(),
+                mid: String::new(),
+                title: "推荐流".into(),
+                author: String::new(),
+                uid: String::new(),
+                cover: String::new(),
+                note: format!(
+                    "推荐流这一屏共 {count} 条。推荐流是持续加载的，程序只能读到当前这一屏；手里有具体链接的话，直接粘链接或作者主页更准"
+                ),
+                total: count,
+                loaded: count,
+                exhausted: true,
+                qualities: quality_options(&[]),
+                items: entries,
+            };
+            xhs_core::login::debug_log(&format!("probe feed：本屏 {count} 条"));
+            let cache = BatchCache {
+                uid: String::new(),
+                items: probe.items.clone(),
+                exhausted: true,
+            };
+            let key = "feed:explore".to_string();
+            state.cache_batch(key, cache);
+            Ok(probe)
+        }
         SourceTarget::User { uid, token, url } => {
             let page_url = user_fetch_url(&uid, &token, &url);
             let user = fetch_user(&app, &client, &uid, &page_url).await?;
-            let entries: Vec<PostEntry> = user
-                .cards
-                .iter()
-                .map(|card| PostEntry {
-                    bid: card.id.clone(),
-                    mid: String::new(),
-                    title: naming::title_of(&card.title),
-                    author: user.nickname.clone(),
-                    created_at: card.created_at,
-                    pics: 0,
-                    has_video: card.is_video,
-                    is_audio: false,
-                    media_url: String::new(),
-                    page_url: note_page_url(&card.id, &card.token),
-                    duration: 0,
-                    is_retweet: false,
-                    media_unknown: true,
-                })
-                .collect();
+            let entries: Vec<PostEntry> =
+                user.cards.iter().map(|card| card.entry(&user.nickname)).collect();
             let exhausted = true;
             let note = if entries.is_empty() {
                 "没读到这个作者的笔记：列表可能还在加载、或被短时限流。稍等片刻重试一次；也可以直接粘贴单条笔记链接（在 App 里分享复制）试试"
@@ -390,6 +412,7 @@ fn input_key(target: SourceTarget) -> String {
     match target {
         SourceTarget::Note { id, .. } => format!("post:{id}"),
         SourceTarget::User { uid, .. } => format!("user:{uid}"),
+        SourceTarget::Feed => "feed:explore".to_string(),
     }
 }
 
@@ -1045,8 +1068,44 @@ const EXTRACT_JS: &str = r#"(function () {
     var urlNote = here.match(/(?:\/explore\/|\/discovery\/item\/)([0-9a-f]{24})/);
     var isNotePage = !!urlNote;
     var isProfilePage = here.indexOf("/user/profile/") >= 0;
-    if (!isNotePage && !isProfilePage) {
+    // 裸 /explore（可带查询串）才算推荐流：带笔记 id 的走笔记分支
+    var isFeedPage = !urlNote && /\/explore(\/|\?|$)/.test(here);
+    if (!isNotePage && !isProfilePage && !isFeedPage) {
       report({ ready: false, pageUrl: here });
+      return;
+    }
+
+    // ── 推荐流首页：这一屏的笔记卡片（都带 token，勾选即可下载）──
+    if (isFeedPage) {
+      var feedRoot = unwrap(st.feed) || {};
+      var feeds = arr(feedRoot.feeds);
+      var feedCards = [];
+      for (var fi = 0; fi < feeds.length && fi < 200; fi++) {
+        var fc = unwrap(feeds[fi]) || {};
+        var fnc = unwrap(fc.noteCard) || {};
+        var fcu = unwrap(fnc.user) || {};
+        var fid = fc.id || "";
+        if (!fid) continue;
+        feedCards.push({
+          id: fid,
+          token: fc.xsecToken || "",
+          title: fnc.displayTitle || "",
+          type: fnc.type || "",
+          time: fc.time || fnc.time || 0,
+          author: fcu.nickname || fcu.nickName || "",
+        });
+      }
+      report({
+        ready: feedCards.length > 0,
+        kind: "feed",
+        pageUrl: here,
+        uid: "",
+        nickname: "推荐流",
+        avatar: "",
+        desc: "",
+        notesCount: feedCards.length,
+        notes: feedCards,
+      });
       return;
     }
 
@@ -1562,14 +1621,40 @@ impl NoteBundle {
     }
 }
 
-/// 主页卡片
+/// 主页/推荐流卡片
 #[derive(Debug, Clone, Default)]
 struct CardBundle {
     id: String,
     token: String,
     title: String,
+    author: String,
     is_video: bool,
     created_at: i64,
+}
+
+impl CardBundle {
+    /// 卡片 → 表格条目（媒体数量未知，进详情页才有）
+    fn entry(&self, fallback_author: &str) -> PostEntry {
+        PostEntry {
+            bid: self.id.clone(),
+            mid: String::new(),
+            title: naming::title_of(&self.title),
+            author: if self.author.is_empty() {
+                fallback_author.to_string()
+            } else {
+                self.author.clone()
+            },
+            created_at: self.created_at,
+            pics: 0,
+            has_video: self.is_video,
+            is_audio: false,
+            media_url: String::new(),
+            page_url: note_page_url(&self.id, &self.token),
+            duration: 0,
+            is_retweet: false,
+            media_unknown: true,
+        }
+    }
 }
 
 /// 用户主页数据
@@ -1583,6 +1668,32 @@ struct UserBundle {
 }
 
 impl UserBundle {
+    /// 只解析卡片数组（推荐流没有 uid，不能走 from_web 的归属校验）
+    fn cards_from_web(value: &serde_json::Value) -> Vec<CardBundle> {
+        let mut cards = Vec::new();
+        if let Some(arr) = value.get("notes").and_then(|v| v.as_array()) {
+            for item in arr {
+                let id = item.get("id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                if id.is_empty() {
+                    continue;
+                }
+                cards.push(CardBundle {
+                    id,
+                    token: item.get("token").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                    title: item.get("title").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                    author: item.get("author").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                    is_video: item.get("type").and_then(|v| v.as_str()) == Some("video"),
+                    created_at: item
+                        .get("time")
+                        .and_then(|v| v.as_i64())
+                        .map(|ms| ms / 1000)
+                        .unwrap_or(0),
+                });
+            }
+        }
+        cards
+    }
+
     fn from_web(value: &serde_json::Value) -> Result<Self, String> {
         let uid = value.get("uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
         if uid.is_empty() {
@@ -1599,6 +1710,7 @@ impl UserBundle {
                     id,
                     token: item.get("token").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                     title: item.get("title").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                    author: item.get("author").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                     is_video: item.get("type").and_then(|v| v.as_str()) == Some("video"),
                     created_at: item
                         .get("time")
@@ -1629,8 +1741,20 @@ async fn fetch_note(
     // 小红书风控会把"同一会话来自另一个客户端"判成劫持，直接把会话作废——
     // 连带把浏览器里的登录态一起杀掉（实测：登录后 9 秒内会话就没了）。
     xhs_core::login::debug_log("笔记：走浏览器会话取数（不使用复制的 Cookie）");
-    let value = webview_fetch(app, url).await?;
-    NoteBundle::from_web(&value)
+    match webview_fetch(app, url).await {
+        Ok(value) => NoteBundle::from_web(&value),
+        Err(first) => {
+            // 带 token 的链接失败时，去掉 token 再试一次：搜索来源的 token 常被限用
+            let bare = url.split('?').next().unwrap_or(url).to_string();
+            if bare != url {
+                xhs_core::login::debug_log(&format!("带 token 取数失败（{first}），去掉 token 重试"));
+                let value = webview_fetch(app, &bare).await?;
+                NoteBundle::from_web(&value)
+            } else {
+                Err(first)
+            }
+        }
+    }
 }
 
 /// 取一个用户主页：同样的两段式。
@@ -2041,6 +2165,24 @@ async fn login_selftest(app: tauri::AppHandle, settings: Settings, probe_url: St
                         user.notes_count
                     )),
                     Err(e) => xhs_core::login::debug_log(&format!("自检·主页失败：{e}")),
+                }
+            }
+            Ok(SourceTarget::Feed) => {
+                xhs_core::login::debug_log("自检·推荐流链接：走推荐流解析");
+                let client = app.state::<AppState>().client();
+                let _ = client;
+                match probe_source(
+                    app.clone(),
+                    app.state::<AppState>(),
+                    "https://www.xiaohongshu.com/explore".to_string(),
+                )
+                .await
+                {
+                    Ok(probe) => xhs_core::login::debug_log(&format!(
+                        "自检·推荐流结果：{} 条",
+                        probe.items.len()
+                    )),
+                    Err(e) => xhs_core::login::debug_log(&format!("自检·推荐流失败：{e}")),
                 }
             }
             Ok(SourceTarget::Note { id, token, url }) => {

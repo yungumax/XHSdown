@@ -8,6 +8,7 @@ import * as api from "./api";
 export const KIND_LABELS = {
   post: "单条笔记",
   user: "用户主页",
+  feed: "推荐流",
 };
 
 export function localDate(unixSecs) {

@@ -83,6 +83,7 @@ const sources = [
   { label: "图文/多图", icon: "photo" },
   { label: "用户主页", icon: "user" },
   { label: "分享文本", icon: "clipboard" },
+  { label: "推荐流", icon: "broadcast" },
   { label: "多行批量", icon: "listLine" },
 ];
 
