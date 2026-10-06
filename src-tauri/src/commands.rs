@@ -212,12 +212,24 @@ pub fn update_settings(
 // ───────────────────────── 来源解析 ─────────────────────────
 
 /// 笔记页地址：带 xsec_token（详情页多数情况必需），无 token 时用裸链接。
-fn note_page_url(id: &str, token: &str) -> String {
+/// `source` = 抓这批卡片时的来源上下文（pc_search / pc_user / pc_feed …）：
+/// token 与来源相关，写错来源会被站点弹回首页（实测踩过），所以跟着链接一起带着。
+fn note_page_url(id: &str, token: &str, source: &str) -> String {
     if token.is_empty() {
-        format!("https://www.xiaohongshu.com/explore/{id}")
-    } else {
-        format!("https://www.xiaohongshu.com/explore/{id}?xsec_token={token}&xsec_source=pc_user")
+        return format!("https://www.xiaohongshu.com/explore/{id}");
     }
+    let src = if source.trim().is_empty() { "pc_user" } else { source.trim() };
+    format!("https://www.xiaohongshu.com/explore/{id}?xsec_token={token}&xsec_source={src}")
+}
+
+/// 抽出来的 "这批卡片来自哪个来源上下文"（抽取脚本从页面 URL 里读的 xsec_source）
+fn bundle_source(value: &serde_json::Value) -> String {
+    value
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 /// 视频清晰度选项：auto 永远在，hd/sd 按实际有没有给。
@@ -1361,6 +1373,13 @@ const EXTRACT_JS: &str = r#"(function () {
       report({ ready: false, pageUrl: here });
       return;
     }
+    // 页面 URL 里的来源上下文（pc_search / pc_user / pc_feed …）。
+    // 卡片 token 与它相关：下载时要用同一个来源去开笔记页，写错来源会被站点弹回首页（实测踩过）
+    var pageSource = '';
+    try {
+      var sm = (location.search || '').match(/[?&]xsec_source=([^&]+)/);
+      if (sm) pageSource = decodeURIComponent(sm[1]);
+    } catch (e) {}
 
     // ── 搜索结果页：这一屏结果卡片（与信息流同构，在 search.feeds 下）──
     if (isSearchPage) {
@@ -1386,6 +1405,7 @@ const EXTRACT_JS: &str = r#"(function () {
         ready: searchCards.length > 0,
         kind: 'search',
         pageUrl: here,
+        source: pageSource,
         uid: '', nickname: '搜索结果', avatar: '', desc: '',
         notesCount: searchCards.length,
         notes: delta('__xhsdownSearchN', searchCards),
@@ -1421,6 +1441,7 @@ const EXTRACT_JS: &str = r#"(function () {
         nickname: "推荐流",
         avatar: "",
         desc: "",
+        source: pageSource,
         notesCount: feedCards.length,
         notes: delta('__xhsdownFeedN', feedCards),
       });
@@ -1622,6 +1643,7 @@ const EXTRACT_JS: &str = r#"(function () {
       nickname: nameOut,
       avatar: avatarOut,
       desc: String(pick(merged, ['desc', 'description']) || '').slice(0, 3000),
+      source: pageSource,
       notesCount: countOut,
       notes: delta('__xhsdownUserN', cards)
     });
@@ -1709,6 +1731,21 @@ async fn webview_fetch_inner(
         xhs_core::login::debug_log("取数前收起网页窗口（避免把用户正在看的页面导航走）");
     }
     let parsed: tauri::Url = url.parse().map_err(|e| format!("地址无效：{e}"))?;
+    // 导航前的地址：轮询里用它判断"导航是否已经落地"（落地了才做快速失败判断，
+    // 否则会把还没被替换掉的旧页面误当成"被弹走"）
+    let before_url = window
+        .url()
+        .map(|u| u.to_string().split('#').next().unwrap_or("").to_string())
+        .unwrap_or_default();
+    {
+        // 目标地址记进日志（token 只留长度）：取数失败时能一眼看出是链接形态问题还是站点问题
+        let (note_id, token) = split_note_url(url);
+        xhs_core::login::debug_log(&format!(
+            "取数目标：{} （id={note_id} token 长度={}）",
+            xhs_core::error::truncate(url.split('?').next().unwrap_or(url), 100),
+            token.len()
+        ));
+    }
     window.navigate(parsed).map_err(err)?;
 
     // 这次要的是哪类页面：轮询时只有同类型的 ready 才算数。
@@ -1721,6 +1758,28 @@ async fn webview_fetch_inner(
     let mut stale_kind_logged = false;
     while started.elapsed() < Duration::from_secs(30) {
         tokio::time::sleep(Duration::from_millis(700)).await;
+
+        // 导航已落地（浏览器地址变了）时先做快速失败：被站点弹回首页 / 弹到登录页或
+        // 404 都不必再等满 30 秒——候选阶梯要靠它把每个失败形态压到一两秒
+        let live_url = window
+            .url()
+            .map(|u| u.to_string().split('#').next().unwrap_or("").to_string())
+            .unwrap_or_default();
+        if !live_url.is_empty() && live_url != before_url {
+            if live_url.contains("/explore") && !live_url.contains("/explore/") && expect == "note" {
+                return Err(
+                    "这个链接已失效：页面跳回了首页（token 过期、来源不匹配或已被使用过）".into(),
+                );
+            }
+            if live_url.contains("/404") || live_url.contains("/login") {
+                let kind = if live_url.contains("/404") { "404/不可见" } else { "登录页" };
+                return Err(format!(
+                    "需要登录：小红书要求登录后才能浏览该内容（落地页={kind}；{}）",
+                    xhs_core::error::truncate(&live_url, 120)
+                ));
+            }
+        }
+
         let Some(value) = extract_from_page(&window).await else { continue };
         if let Some(page) = value.get("pageUrl").and_then(|v| v.as_str()) {
             // 去掉 #片段：marker 会层层嵌套，日志会被撑爆（实测踩过）
@@ -2076,6 +2135,10 @@ impl NoteBundle {
 struct CardBundle {
     id: String,
     token: String,
+    /// 这批卡片是从哪个来源上下文抓的（pc_search / pc_user / pc_feed …）。
+    /// 小红书的 token 跟来源上下文相关：从搜索点进的主页，卡片 token 也带搜索上下文，
+    /// 下载时若一律写 pc_user，站点会把链接弹回首页（实测踩过）。
+    source: String,
     title: String,
     author: String,
     is_video: bool,
@@ -2099,7 +2162,7 @@ impl CardBundle {
             has_video: self.is_video,
             is_audio: false,
             media_url: String::new(),
-            page_url: note_page_url(&self.id, &self.token),
+            page_url: note_page_url(&self.id, &self.token, &self.source),
             duration: 0,
             is_retweet: false,
             media_unknown: true,
@@ -2130,6 +2193,7 @@ impl UserBundle {
                 cards.push(CardBundle {
                     id,
                     token: item.get("token").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                    source: bundle_source(value),
                     title: item.get("title").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                     author: item.get("author").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                     is_video: item.get("type").and_then(|v| v.as_str()) == Some("video"),
@@ -2159,6 +2223,7 @@ impl UserBundle {
                 cards.push(CardBundle {
                     id,
                     token: item.get("token").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                    source: bundle_source(value),
                     title: item.get("title").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                     author: item.get("author").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                     is_video: item.get("type").and_then(|v| v.as_str()) == Some("video"),
@@ -2188,23 +2253,81 @@ async fn fetch_note(
     _retries: usize,
 ) -> Result<NoteBundle, String> {
     // 只走浏览器会话。**不要**用复制的 Cookie 让 reqwest 去请求：
-    // 小红书风控会把"同一会话来自另一个客户端"判成劫持，直接把会话作废——
+    // 小红书风控会把"同一 session 来自另一个客户端"判成劫持，直接把会话作废——
     // 连带把浏览器里的登录态一起杀掉（实测：登录后 9 秒内会话就没了）。
     xhs_core::login::debug_log("笔记：走浏览器会话取数（不使用复制的 Cookie）");
-    match webview_fetch(app, url).await {
-        Ok(value) => NoteBundle::from_web(&value),
-        Err(first) => {
-            // 带 token 的链接失败时，去掉 token 再试一次：搜索来源的 token 常被限用
-            let bare = url.split('?').next().unwrap_or(url).to_string();
-            if bare != url {
-                xhs_core::login::debug_log(&format!("带 token 取数失败（{first}），去掉 token 重试"));
-                let value = webview_fetch(app, &bare).await?;
-                NoteBundle::from_web(&value)
-            } else {
-                Err(first)
+    let (id, token) = split_note_url(url);
+    xhs_core::login::debug_log(&format!(
+        "笔记取数：id={id} token 长度={}",
+        token.len()
+    ));
+    let candidates = note_url_candidates(url);
+    let mut last_err = String::from("笔记取数失败");
+    for (index, cand) in candidates.iter().enumerate() {
+        match webview_fetch(app, cand).await {
+            Ok(value) => match NoteBundle::from_web(&value) {
+                Ok(bundle) => return Ok(bundle),
+                Err(e) => last_err = e,
+            },
+            Err(e) => last_err = e,
+        }
+        if index + 1 < candidates.len() {
+            // 站点对 token 与来源上下文很敏感（写错来源会被弹回首页），逐个形态试
+            xhs_core::login::debug_log(&format!(
+                "笔记取数候选 {} 失败（{last_err}），换下一个地址形态",
+                index + 1
+            ));
+        }
+    }
+    Err(last_err)
+}
+
+/// 从笔记链接里拆出 id 与 token（token 缺省为空串）。
+fn split_note_url(url: &str) -> (String, String) {
+    let head = url.split('?').next().unwrap_or(url);
+    let id = head.rsplit('/').next().unwrap_or("").to_string();
+    let mut token = String::new();
+    if let Some((_, query)) = url.split_once('?') {
+        for pair in query.split('&') {
+            if let Some(value) = pair.strip_prefix("xsec_token=") {
+                token = value.to_string();
             }
         }
     }
+    (id, token)
+}
+
+/// 一条笔记的候选地址链：原样 → 换来源上下文（token 与来源相关）→ 移动版路径 → 裸链接。
+/// 顺序即优先级；配合取数里的"被弹回首页就快速失败"，每个失败候选只多花一两秒。
+fn note_url_candidates(url: &str) -> Vec<String> {
+    let (id, token) = split_note_url(url);
+    let mut out: Vec<String> = vec![url.to_string()];
+    let push = |out: &mut Vec<String>, candidate: String| {
+        if !out.iter().any(|existing| existing == &candidate) {
+            out.push(candidate);
+        }
+    };
+    if !id.is_empty() && !id.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return out;
+    }
+    if !token.is_empty() {
+        for source in ["pc_user", "pc_search", "pc_feed", "pc_homefeed"] {
+            push(
+                &mut out,
+                format!(
+                    "https://www.xiaohongshu.com/explore/{id}?xsec_token={token}&xsec_source={source}"
+                ),
+            );
+        }
+        push(
+            &mut out,
+            format!(
+                "https://www.xiaohongshu.com/discovery/item/{id}?xsec_token={token}&xsec_source=pc_user"
+            ),
+        );
+    }
+    push(&mut out, format!("https://www.xiaohongshu.com/explore/{id}"));
+    out
 }
 
 /// 取一个用户主页：同样的两段式。
@@ -3680,7 +3803,7 @@ pub async fn library_folders(
             created_at: card.created_at,
             pics: 0,
             video: card.is_video,
-            url: note_page_url(&card.id, &card.token),
+            url: note_page_url(&card.id, &card.token, &card.source),
             kind: "fav".into(),
         })
         .collect();
@@ -4332,4 +4455,82 @@ pub fn export_diagnostics(state: State<'_, AppState>) -> Result<String, String> 
     let path = dir.join("diagnostics.txt");
     std::fs::write(&path, text).map_err(err)?;
     Ok(path.to_string_lossy().to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 候选阶梯：原样 → 换来源 → 移动版路径 → 裸链接，且不重复
+    #[test]
+    fn note_url_candidates_cover_sources_and_paths() {
+        let url = "https://www.xiaohongshu.com/explore/6a1f0000000000000000abcd?xsec_token=ABtok=&xsec_source=pc_search";
+        let list = note_url_candidates(url);
+        assert_eq!(list[0], url);
+        assert!(list.iter().any(|u| u.contains("xsec_source=pc_user")));
+        assert!(list.iter().any(|u| u.contains("/discovery/item/")));
+        assert!(list
+            .iter()
+            .any(|u| u == "https://www.xiaohongshu.com/explore/6a1f0000000000000000abcd"));
+        let mut sorted = list.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), list.len(), "候选不应重复");
+    }
+
+    #[test]
+    fn split_note_url_reads_id_and_token() {
+        let (id, token) = split_note_url(
+            "https://www.xiaohongshu.com/explore/6a1f0000000000000000abcd?xsec_token=ABtok%3D&xsec_source=pc_user",
+        );
+        assert_eq!(id, "6a1f0000000000000000abcd");
+        assert_eq!(token, "ABtok%3D");
+        let (id2, token2) =
+            split_note_url("https://www.xiaohongshu.com/discovery/item/6a1f0000000000000000abcd");
+        assert_eq!(id2, "6a1f0000000000000000abcd");
+        assert!(token2.is_empty());
+    }
+
+    /// 来源上下文必须跟着链接走：写错来源会被站点弹回首页（实测踩过）
+    #[test]
+    fn note_page_url_keeps_source() {
+        assert!(note_page_url("id", "tok", "pc_search").contains("xsec_source=pc_search"));
+        assert!(note_page_url("id", "tok", "").contains("xsec_source=pc_user"));
+        assert_eq!(
+            note_page_url("id", "", "pc_search"),
+            "https://www.xiaohongshu.com/explore/id"
+        );
+    }
+
+    #[test]
+    fn expected_kind_by_url() {
+        assert_eq!(
+            expected_page_kind("https://www.xiaohongshu.com/explore/6a1f0000000000000000abcd?x=1"),
+            "note"
+        );
+        assert_eq!(expected_page_kind("https://www.xiaohongshu.com/explore"), "feed");
+        assert_eq!(
+            expected_page_kind("https://www.xiaohongshu.com/user/profile/66f3c481000000001c002a76"),
+            "user"
+        );
+        assert_eq!(
+            expected_page_kind("https://www.xiaohongshu.com/search_result?keyword=x"),
+            "search"
+        );
+        assert_eq!(
+            expected_page_kind("https://www.xiaohongshu.com/discovery/item/6a1f0000000000000000abcd"),
+            "note"
+        );
+    }
+
+    /// 扩展名要从 CDN 的 `!规格` 里认（路径上没有扩展名）
+    #[test]
+    fn url_ext_reads_cdn_variant_format() {
+        assert_eq!(
+            url_ext("https://sns-webpic-qc.xhscdn.com/2026/1040g!nc_n_webp_mw_1"),
+            "webp"
+        );
+        assert_eq!(url_ext("https://sns-webpic-qc.xhscdn.com/2026/1040g.jpg"), "jpg");
+        assert_eq!(url_ext("https://sns-webpic-qc.xhscdn.com/2026/1040g"), "jpg");
+    }
 }
