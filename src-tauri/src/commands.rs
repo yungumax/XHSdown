@@ -1675,6 +1675,11 @@ fn log_qr_state(window: &tauri::WebviewWindow) {
 async fn login_watch(app: tauri::AppHandle) {
     let state = app.state::<AppState>();
     let started = std::time::Instant::now();
+    // 两个阶段：0 = 等登录页自己跳走；1 = 已进入"读资料"
+    // （之前没有阶段概念，每 2.5 秒都重新导航一次"我的主页"：页面刚打开就被打断，
+    //   异步资料永远加载不出来，还把站点惹到限速——实测页面报"未连接到服务器"）
+    let mut entered = false;
+    let mut last_full_fetch = std::time::Instant::now() - Duration::from_secs(600);
 
     loop {
         if started.elapsed() > Duration::from_secs(600) {
@@ -1696,51 +1701,51 @@ async fn login_watch(app: tauri::AppHandle) {
         let _ = window.eval(QR_KEEPER_JS);
         log_qr_state(&window);
 
-        // 登录完成的强信号：页面自己离开了 /login（成功后跳到推荐流等）
-        let page_url = window.url().map(|u| u.to_string()).unwrap_or_default();
-        let left_login = page_url.contains("xiaohongshu.com") && !page_url.contains("/login");
-        if !left_login {
-            continue;
+        // 阶段 0：等登录页离开 /login（登录成功的必然结果，边沿触发一次）
+        if !entered {
+            let page_url = window.url().map(|u| u.to_string()).unwrap_or_default();
+            let left_login = page_url.contains("xiaohongshu.com") && !page_url.contains("/login");
+            if !left_login {
+                continue;
+            }
+            entered = true;
+            xhs_core::login::debug_log("登录页已跳走，开始读取账号资料");
         }
 
-        xhs_core::login::debug_log("登录页已跳走，开始读取账号资料");
-        // 用同一个窗口读「我的主页」——这时用户已经登录完成，导航过去不会打扰他
-        match webview_fetch_inner(&app, "https://www.xiaohongshu.com/user/profile/me", true).await {
-            Ok(value) => {
-                let name = value
-                    .get("nickname")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let uid = value
-                    .get("uid")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                let avatar = value
-                    .get("avatar")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                if name.is_empty() {
-                    xhs_core::login::debug_log("登录检测：已登录但资料未就绪，继续等待");
-                    continue;
-                }
-                xhs_core::login::debug_log(&format!(
-                    "检测到登录：昵称={:?} uid={:?}",
-                    name, uid
-                ));
-                match finish_login(&app, &state, uid, name, avatar).await {
-                    Ok(login) => {
-                        let _ = app.emit("login://confirmed", login);
-                        break;
-                    }
-                    Err(e) => xhs_core::login::debug_log(&format!("登录收尾失败：{e}")),
-                }
+        // 阶段 1：完整取数（含导航）最多每 20 秒一次；其余时间只读当前页面，
+        // 让页面的异步资料有机会加载完
+        let now = std::time::Instant::now();
+        let value = if now.duration_since(last_full_fetch) >= Duration::from_secs(20) {
+            last_full_fetch = now;
+            webview_fetch_inner(&app, "https://www.xiaohongshu.com/user/profile/me", true)
+                .await
+                .ok()
+        } else {
+            extract_from_page(&window).await
+        };
+
+        let Some(value) = value else { continue };
+        let name = value
+            .get("nickname")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let uid = value.get("uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+        let avatar = value
+            .get("avatar")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        xhs_core::login::debug_log(&format!("检测到登录：昵称={:?} uid={:?}", name, uid));
+        match finish_login(&app, &state, uid, name, avatar).await {
+            Ok(login) => {
+                let _ = app.emit("login://confirmed", login);
+                break;
             }
-            Err(e) => {
-                xhs_core::login::debug_log(&format!("登录检测：读取我的主页失败（{e}），继续等待"));
-            }
+            Err(e) => xhs_core::login::debug_log(&format!("登录收尾失败：{e}")),
         }
     }
 
