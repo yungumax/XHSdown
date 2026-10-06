@@ -98,6 +98,8 @@ pub struct ProbeMore {
 #[serde(default)]
 pub struct NamingVars {
     pub author: String,
+    /// 与 bid/mid 同样宽松：界面上一处 `|| 0` 就能把整条下载请求挡在门外（实测踩过）
+    #[serde(deserialize_with = "lenient::deserialize")]
     pub uid: String,
     #[serde(deserialize_with = "lenient::deserialize")]
     pub bid: String,
@@ -226,4 +228,51 @@ pub struct UpdateCheck {
     pub latest: String,
     pub up_to_date: bool,
     pub error: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 回归：网页收集来的来源没有 uid，界面曾用 `uid: x || 0` 兜底 →
+    /// 整条 start_download 被 serde 拒绝（invalid type: integer 0, expected a string）。
+    /// 命名变量里的 uid/bid/mid 必须扛得住数字。
+    #[test]
+    fn download_req_accepts_numeric_naming_ids() {
+        let payload = serde_json::json!({
+            "bid": "6a1f0000000000000000abcd",
+            "mid": "",
+            "source": "user",
+            "title": "四周年庆典·「绝响」主线倒计时【2】天",
+            "author": "无期迷途",
+            "uid": "",
+            "quality": "auto",
+            "image": "large",
+            "media_url": "",
+            "page_url": "https://www.xiaohongshu.com/explore/6a1f0000000000000000abcd?xsec_token=AB",
+            "audio_quality": "best",
+            "is_audio": false,
+            "image_count": 0,
+            "video_count": 1,
+            "quality_label": "视频",
+            "naming": {
+                "author": "无期迷途",
+                "uid": 0,
+                "bid": 0,
+                "mid": 0,
+                "publish_date": "2026-10-06",
+                "date": "2026-10-06",
+                "year": "2026",
+                "month": "10",
+                "source_kind": "用户主页",
+                "index": 557,
+                "index_pad": 3
+            }
+        });
+        let req: DownloadReq = serde_json::from_value(payload).expect("数字版命名变量要能反序列化");
+        assert_eq!(req.naming.uid, "0");
+        assert_eq!(req.naming.bid, "0");
+        assert_eq!(req.naming.index, 557);
+        assert_eq!(req.page_url.contains("xsec_token="), true);
+    }
 }

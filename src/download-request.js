@@ -32,7 +32,9 @@ export function singleNaming(probe) {
   const { year, month } = yearMonth(created);
   return {
     author: probe.author || entry.author || "",
-    uid: probe.uid || 0,
+    // uid 是字符串字段：这里写 `|| 0` 会把"没有 uid"变成整数 0，
+    // 后端 NamingVars.uid 是 String，反序列化直接报 invalid type（实测踩过）
+    uid: probe.uid || "",
     bid: probe.bid || entry.bid || "",
     mid: probe.mid || entry.mid || "",
     publish_date: localDate(created),
@@ -51,7 +53,8 @@ export function batchNaming(batch, entry, position) {
   const { year, month } = yearMonth(entry.created_at);
   return {
     author: entry.author || batch.author || "",
-    uid: batch.uid || 0,
+    // 同上：必须是字符串。网页收集来的来源 uid 为空，`|| 0` 会让整条下载请求被拒
+    uid: batch.uid || "",
     bid: entry.bid || "",
     mid: entry.mid || "",
     publish_date: localDate(entry.created_at),
