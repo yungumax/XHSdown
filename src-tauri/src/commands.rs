@@ -274,9 +274,7 @@ fn bundle_source(value: &serde_json::Value) -> String {
 
 /// 视频清晰度选项：auto 永远在，hd/sd 按实际有没有给。
 fn quality_options(videos: &[(String, String)]) -> Vec<QualityOption> {
-    let has_hd = videos
-        .iter()
-        .any(|(label, _)| label == "1080P" || label == "720P");
+    let has_hd = videos.iter().any(|(label, _)| quality_rank(label) >= 720);
     let has_sd = !videos.is_empty();
     vec![
         QualityOption { value: "auto".into(), label: "最佳可用".into(), available: true, hint: String::new() },
@@ -1162,20 +1160,12 @@ async fn run_task(app: tauri::AppHandle, req: DownloadReq, id: String) {
     );
 }
 
-/// 清晰度档位排名（越大越高）：1080 > 720 > 540 > 480 > 其余。
+/// 档位标签 → 可比数值：直接解析标签里的像素数（2160P > 1440P > 1080P > …）。
+/// 旧版写死一档到 1080 的表：实测存在 2160×3840 的 4K 流，
+/// 那个表会把 2160P 归到"其余"里排到最低，选流就直接错了。
 fn quality_rank(label: &str) -> u32 {
-    let l = label.to_lowercase();
-    if l.contains("1080") {
-        5
-    } else if l.contains("720") {
-        4
-    } else if l.contains("540") {
-        3
-    } else if l.contains("480") {
-        2
-    } else {
-        1
-    }
+    let digits: String = label.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse::<u32>().unwrap_or(0)
 }
 
 /// 按清晰度挑播放地址：auto 取最高档，hd 优先 ≥720 的最高档，sd 取最低档。
@@ -1190,14 +1180,14 @@ fn pick_video(videos: &[(String, String)], quality: &str) -> (String, String) {
     match quality {
         "hd" => sorted
             .iter()
-            .find(|(label, _)| quality_rank(label) >= 4)
+            .find(|(label, _)| quality_rank(label) >= 720)
             .or_else(|| sorted.first())
             .map(|&(l, u)| (l.clone(), u.clone()))
             .unwrap_or_default(),
         "sd" => sorted
             .iter()
             .rev()
-            .find(|(label, _)| quality_rank(label) <= 2)
+            .find(|(label, _)| quality_rank(label) <= 480)
             .or_else(|| sorted.last())
             .map(|&(l, u)| (l.clone(), u.clone()))
             .unwrap_or_default(),
@@ -2604,7 +2594,12 @@ fn quality_class(width: u64, height: u64) -> u64 {
 }
 
 fn height_label(height: u64) -> String {
-    if height >= 1080 {
+    // 分档覆盖到 4K：实测有 2160×3840 的流，旧表在 1080 封顶会把 4K 标成 1080P
+    if height >= 2160 {
+        "2160P".into()
+    } else if height >= 1440 {
+        "1440P".into()
+    } else if height >= 1080 {
         "1080P".into()
     } else if height >= 720 {
         "720P".into()
@@ -5420,6 +5415,24 @@ mod tests {
     }
 
     /// 扩展名要从 CDN 的 `!规格` 里认（路径上没有扩展名）
+    #[test]
+    fn quality_rank_parses_pixels() {
+        // 旧表写死到 1080：2160P 会被归到"其余"排最低——实测 4K 流选错
+        assert!(quality_rank("2160P") > quality_rank("1440P"));
+        assert!(quality_rank("1440P") > quality_rank("1080P"));
+        assert!(quality_rank("1080P") > quality_rank("720P"));
+        assert!(quality_rank("720P") > quality_rank("480P"));
+        assert_eq!(quality_rank("视频"), 0);
+    }
+
+    #[test]
+    fn height_label_covers_4k() {
+        assert_eq!(height_label(2160), "2160P");
+        assert_eq!(height_label(1440), "1440P");
+        assert_eq!(height_label(1080), "1080P");
+        assert_eq!(height_label(720), "720P");
+    }
+
     #[test]
     fn quality_class_uses_short_side() {
         // 竖屏 720×1104：站点 height 给长边，直接用会虚标 1080P（实测被用户抓包）
