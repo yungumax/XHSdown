@@ -1073,6 +1073,37 @@ function kindLabel(kind) {
       </div>
     </section>
 
+    <!-- 操作说明：两种取内容的路径，常驻显示（新用户不用翻文档） -->
+    <section class="card howto">
+      <h2>操作说明</h2>
+      <div class="howto-grid">
+        <div class="howto-way">
+          <div class="howto-title"><span class="badge">推荐</span>网页收集（整个主页 / 搜索结果）</div>
+          <ol>
+            <li>点右上角 <b>WEB</b> 打开小红书网页，登录一次（之后保持登录）</li>
+            <li>在网页里打开想收集的用户主页——左下角会显示 <b>共 N 条</b></li>
+            <li>点页面顶部红色 <b>开始解析</b>，网页自动滚动收集，进度实时可见</li>
+            <li>收集完成自动回到这里——勾选内容，点下载即可</li>
+          </ol>
+          <p class="howto-note">
+            提示：收集按笔记去重，重复收集不会产生重复条目，只用来补尾部；
+            少数笔记（仅自己可见/审核中）网页端不放出，可在 App 里分享单条链接下载。
+          </p>
+        </div>
+        <div class="howto-way">
+          <div class="howto-title"><span class="badge alt">单条</span>粘贴链接（单条笔记 / App 分享）</div>
+          <ol>
+            <li>在 App 里打开笔记 → 分享 → 复制链接（整段分享文本可直接粘贴）</li>
+            <li>粘贴到上方输入框（一行一个，可批量），点 <b>开始解析</b></li>
+            <li>解析完成后进入「选择内容」页，勾选下载</li>
+          </ol>
+          <p class="howto-note">
+            支持笔记链接、xhslink 短链、用户主页与探索页链接；带 xsec_token 的链接成功率更高。
+          </p>
+        </div>
+      </div>
+    </section>
+
     <!-- 解析结果入口：成功的一律进「选择内容」页，这里只留入口与失败项 -->
     <section v-if="items.length" class="card results page-in">
       <header class="results-head">
@@ -1261,6 +1292,67 @@ input:focus {
   padding-top: 13px;
   border-top: 1px solid var(--line-soft);
   font-size: 12px;
+  color: var(--muted);
+}
+
+/* 操作说明卡：两条路径并排，窄屏自动换行 */
+.howto h2 {
+  margin: 0 0 12px;
+  font-size: 15px;
+}
+
+.howto-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
+  gap: 14px;
+}
+
+.howto-way {
+  padding: 13px 14px;
+  background: var(--field);
+  border: 1px solid var(--line);
+  border-radius: var(--radius, 10px);
+}
+
+.howto-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 9px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.howto-title .badge {
+  flex: none;
+  padding: 2px 7px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent);
+  border-radius: 999px;
+}
+
+.howto-title .badge.alt {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border: 1px solid var(--accent-line);
+}
+
+.howto-way ol {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 12.5px;
+  line-height: 1.9;
+  color: var(--text);
+}
+
+.howto-note {
+  margin: 9px 0 0;
+  padding-top: 9px;
+  border-top: 1px dashed var(--line-soft);
+  font-size: 11.5px;
+  line-height: 1.7;
   color: var(--muted);
 }
 
