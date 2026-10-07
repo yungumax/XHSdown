@@ -3767,6 +3767,47 @@ const PAGE_BAR_JS: &str = r#"(function () {
         var hl = document.getElementById('xhsdown-handle-label');
         if (hl) hl.textContent = '收集中 ' + c + (t > c ? '/' + t : '') + ' 条';
       };
+      // 停止时的对账诊断：页面状态里的原始条目数 / 按 id 去重数 / 自报总数（posted）。
+      // 三个数一对比，"总数虚报 / 置顶重复占位 / 尾部没加载完"一眼可辨
+      window.__xhsdownDiag = function () {
+        try {
+          var st = window.__INITIAL_STATE__ || {};
+          var u = unwrapAll(st.user) || {};
+          var notes = unwrapAll(u.notes) || [];
+          var seen = {};
+          var raw = 0;
+          var uniq = 0;
+          var walk = function (node, depth) {
+            if (depth > 4) return;
+            var v = unwrapAll(node);
+            if (!Array.isArray(v)) return;
+            for (var i = 0; i < v.length; i++) {
+              var x = unwrapAll(v[i]);
+              if (Array.isArray(x)) { walk(x, depth + 1); continue; }
+              if (!x || typeof x !== 'object') continue;
+              var keys = Object.keys(x);
+              var numericOnly = keys.length > 0 && keys.every(function (k) { return /^[0-9]+$/.test(k); });
+              if (numericOnly && !x.id && !x.noteId && !x.noteCard) {
+                walk(keys.map(function (k) { return x[k]; }), depth + 1);
+                continue;
+              }
+              raw += 1;
+              var id = String(x.id || x.noteId || (unwrapAll(x.noteCard) || {}).noteId || '');
+              if (id) {
+                if (seen[id]) continue;
+                seen[id] = 1;
+              }
+              uniq += 1;
+            }
+          };
+          walk(notes, 0);
+          var page = unwrapAll(u.userPageData) || {};
+          var posted = Number(unwrapAll(page.posted)) || 0;
+          return '状态条目=' + raw + ' 去重=' + uniq + ' 自报总数=' + posted;
+        } catch (e) {
+          return 'diag错误:' + e;
+        }
+      };
       // 收集开关：一个按钮两个状态（开始解析 ⇄ 完成解析）。
       // 按自己的 data-on 切换发信号；后端在停止/自动停止/重新注入时会改写它保持同步
       var collect = document.createElement('button');
@@ -3822,6 +3863,9 @@ const PAGE_BAR_JS: &str = r#"(function () {
       var st = window.__INITIAL_STATE__ || {};
       var flattenCount = function (value) {
         var n = 0;
+        // 置顶笔记在页面状态里出现两次（置顶位 + 时间线位），按 id 去重，
+        // 否则页面侧计数比真实条数多 1、和后端清单对不上（实测踩过）
+        var seen = {};
         var walk = function (node, depth) {
           if (depth > 4) return;
           var list = arrOf(node);
@@ -3834,6 +3878,11 @@ const PAGE_BAR_JS: &str = r#"(function () {
             if (numericOnly && !item.id && !item.noteId && !item.noteCard) {
               walk(keys.map(function (k) { return item[k]; }), depth + 1);
               continue;
+            }
+            var id = String(item.id || item.noteId || (unwrapAll(item.noteCard) || {}).noteId || '');
+            if (id) {
+              if (seen[id]) continue;
+              seen[id] = 1;
             }
             n += 1;
           }
@@ -4060,9 +4109,10 @@ fn spawn_page_bar(app: tauri::AppHandle) {
             }
             if stale >= 4 {
                 collecting = false;
-                // 把页面尾部提示记下来：区分"站点说没有更多了"与"被登录墙/风控挡住"
+                // 把页面尾部提示记下来：区分"站点说没有更多了"与"被登录墙/风控挡住"；
+                // 顺带带上状态对账（原始条目/去重/自报总数），置顶重复或尾部没加载一眼可辨
                 let _ = window.eval(
-                    "(function(){var t=document.body.innerText||'';t=t.split(String.fromCharCode(10)).join(' ');var tail=t.slice(-260);var c=document.getElementById('xhsdown-count');var n=c?c.textContent:'';history.replaceState(null,'','#xhsdownselftest='+encodeURIComponent(n+' ||| '+tail));})()",
+                    "(function(){var t=document.body.innerText||'';t=t.split(String.fromCharCode(10)).join(' ');var tail=t.slice(-200);var c=document.getElementById('xhsdown-count');var n=c?c.textContent:'';var d=window.__xhsdownDiag?window.__xhsdownDiag():'无';history.replaceState(null,'','#xhsdownselftest='+encodeURIComponent(n+' ||| '+d+' ||| '+tail));})()",
                 );
                 let mut total = 0;
                 if let Some(tail) = read_selftest(&window).await {
