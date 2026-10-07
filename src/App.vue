@@ -491,6 +491,7 @@ async function doLogout() {
     <Onboarding
       v-if="showOnboarding && settings"
       :settings="settings"
+      :version="settingsEnv?.version || ''"
       @done="finishOnboarding"
     />
 

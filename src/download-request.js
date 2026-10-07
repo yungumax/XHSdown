@@ -23,6 +23,18 @@ export const IMAGE_CHOICES = [
   { value: "thumbnail", label: "压缩图（省空间，约 1/4 体积）" },
 ];
 
+/** 视频清晰度选项（唯一定义，引导页与设置页共用）。
+ *  档位按视频**短边**命名；选具体档时取"不超过该档"的最高流（要 1080P 就不下 4K），
+ *  该档不存在则自动退到最佳可用。实测单条视频最高有 2160P(4K)。 */
+export const VIDEO_QUALITIES = [
+  { value: "auto", label: "最佳可用（分辨率与码率都最高）" },
+  { value: "2160p", label: "2160P（4K，单条可达 70 MB）" },
+  { value: "1440p", label: "1440P（2K）" },
+  { value: "1080p", label: "1080P（多数视频的最高档）" },
+  { value: "720p", label: "720P（体积适中）" },
+  { value: "480p", label: "480P（最小，省流量）" },
+];
+
 export function localDate(unixSecs) {
   const d = unixSecs ? new Date(unixSecs * 1000) : new Date();
   const pad = (n) => String(n).padStart(2, "0");

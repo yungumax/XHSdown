@@ -4,9 +4,14 @@
 import { ref } from "vue";
 import Icon from "./Icon.vue";
 import * as api from "../api";
+// 媒体选项用共享定义（与设置页同一份，避免两处文案各行其是——实测漏过一次）
+import { IMAGE_CHOICES, VIDEO_QUALITIES } from "../download-request.js";
 
 const props = defineProps({
   settings: { type: Object, required: true },
+  // 版本号来自 AppStatus（settings 里没有这个字段——之前读 props.settings.version
+  // 会渲染出一个光秃秃的 "v"，截图核对时抓到）
+  version: { type: String, default: "" },
 });
 const emit = defineEmits(["done", "skip"]);
 
@@ -15,16 +20,6 @@ const imageFormat = ref(props.settings.image_format || "large");
 const videoQuality = ref(props.settings.video_quality || "auto");
 const downloadText = ref(props.settings.download_text ?? true);
 const busy = ref(false);
-
-const IMAGE_CHOICES = [
-  { value: "large", label: "原图（最佳画质）" },
-  { value: "thumbnail", label: "压缩图（体积小）" },
-];
-const VIDEO_QUALITIES = [
-  { value: "auto", label: "最佳可用" },
-  { value: "hd", label: "高清" },
-  { value: "sd", label: "标清" },
-];
 
 async function chooseDir() {
   const dir = await api.chooseOutputDir().catch(() => "");
@@ -56,7 +51,7 @@ function skip() {
         <Icon name="download" class="mark" />
         <div>
           <h1>欢迎使用 XHSdown</h1>
-          <p class="sub num">v{{ props.settings.version || "" }}</p>
+          <p v-if="props.version" class="sub num">v{{ props.version }}</p>
         </div>
       </div>
 
@@ -89,14 +84,20 @@ function skip() {
           </div>
         </div>
         <p class="note">
-          图片规格决定多图笔记下载原图还是压缩图；视频清晰度不可用时自动取最佳可用档
-          （网页端常见 1080P / 720P）。
+          图片两档分辨率相同（最高 1080 宽，区别在压缩质量）；视频档位按短边分级
+          （最高 2160P/4K），所选档不存在时自动退到最佳可用。
         </p>
 
         <label class="check card-check full">
           <input type="checkbox" v-model="downloadText" />
           <span>下载文案（独立 .txt，与媒体文件放在一起）</span>
         </label>
+
+        <p class="note top">
+          <b>怎么用</b>：点右上角 <b>WEB</b> 打开小红书网页并登录 → 在主页里点页面顶部的
+          <b>开始解析</b> 自动滚动收集（左下角实时显示条数）→ 回软件勾选下载；
+          单条内容可点网页地址栏的 <b>复制</b> 送进解析栏。
+        </p>
       </div>
 
       <div class="actions">

@@ -3,7 +3,7 @@ import Icon from "../components/Icon.vue";
 import { computed, nextTick, onMounted, onUnmounted, ref, shallowRef, watch } from "vue";
 import { animate, stagger } from "animejs";
 import * as api from "../api";
-import { IMAGE_CHOICES } from "../download-request.js";
+import { IMAGE_CHOICES, VIDEO_QUALITIES } from "../download-request.js";
 
 const props = defineProps({
   login: { type: Object, required: true },
@@ -157,17 +157,8 @@ function beginDraft() {
 }
 beginDraft();
 
-// 媒体页的两个单值下拉：选项说明直接写在标签里（下拉栏内一眼看清，不占字段下方的版面）
-// 图片规格选项来自共享定义（与下载弹层同一份文案，见 download-request.js）
-
-const VIDEO_QUALITIES = [
-  { value: "auto", label: "最佳可用（分辨率与码率都最高）" },
-  { value: "2160p", label: "2160P（4K，单条可达 70 MB）" },
-  { value: "1440p", label: "1440P（2K）" },
-  { value: "1080p", label: "1080P（多数视频的最高档）" },
-  { value: "720p", label: "720P（体积适中）" },
-  { value: "480p", label: "480P（最小，省流量）" },
-];
+// 媒体页的两个单值下拉都来自共享定义（选项说明写在标签里，下拉栏内一眼看清；
+// 与引导页/下载弹层同一份，见 download-request.js）
 
 const AUDIO_QUALITIES = [
   { value: "best", label: "最佳音质" },
