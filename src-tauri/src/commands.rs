@@ -3581,7 +3581,14 @@ pub async fn web_login_open(app: tauri::AppHandle, state: State<'_, AppState>) -
     Ok(())
 }
 
-/// 注入到网页里的浮动地址栏（后退/前进/刷新/地址/复制/解析/收起）。
+/// 收集开关按钮的同步脚本（按钮合并成"开始解析 ⇄ 完成解析"后，
+/// 后端在开始/停止/自动停止/重新注入时调用，让按钮与真实收集状态一致）
+const COLLECT_SYNC_ON: &str =
+    "(function(){if(window.__xhsdownCollectSync)window.__xhsdownCollectSync(1);})()";
+const COLLECT_SYNC_OFF: &str =
+    "(function(){if(window.__xhsdownCollectSync)window.__xhsdownCollectSync(0);})()";
+
+/// 注入到网页里的浮动地址栏（后退/前进/刷新/地址/收集开关/收起）。
 /// 为什么用注入而不是窗口内嵌工具条：Tauri 的 add_child 需要 unstable 特性，
 /// 而注入只影响页面本身，不引入第二个浏览器环境（多环境会丢登录态，实测踩过）。
 /// 幂等：重复注入只在页面里补一条，不会叠出多条。
@@ -3700,20 +3707,36 @@ const PAGE_BAR_JS: &str = r#"(function () {
         }
       });
       bar.appendChild(input);
-      btn('复制', '复制当前地址', function () {
-        var url = location.href.split('#')[0];
-        input.value = url;
-        input.select();
-        try { document.execCommand('copy'); } catch (e) {}
-        try { navigator.clipboard.writeText(url); } catch (e) {}
-        input.blur();
-      });
-      btn('开始解析', '在本页滚动收集笔记（数字会实时增长）', function () {
-        history.replaceState(null, '', '#xhsdowncollect=start');
-      });
-      btn('完成解析', '停止收集并把整份列表送进软件', function () {
-        history.replaceState(null, '', '#xhsdowncollect=stop');
-      });
+      // 收集开关的全局同步口：后端在停止/自动停止/重新注入时调用它保持按钮与真实状态一致
+      window.__xhsdownCollectSync = function (on) {
+        var b = document.getElementById('xhsdown-collect');
+        if (!b) return;
+        b.dataset.on = on ? '1' : '0';
+        b.textContent = on ? '完成解析' : '开始解析';
+        b.style.background = on ? '#8a2530' : '#ff2442';
+        b.style.borderColor = on ? '#8a2530' : '#ff2442';
+      };
+      // 收集开关：一个按钮两个状态（开始解析 ⇄ 完成解析）。
+      // 按自己的 data-on 切换发信号；后端在停止/自动停止/重新注入时会改写它保持同步
+      var collect = document.createElement('button');
+      collect.id = 'xhsdown-collect';
+      collect.dataset.on = '0';
+      collect.textContent = '开始解析';
+      collect.title = '开始后在本页滚动收集（数字实时增长）；再点一次完成并送进软件';
+      collect.style.cssText = 'height:22px;min-width:56px;padding:0 10px;color:#fff;background:#ff2442;border:1px solid #ff2442;border-radius:6px;cursor:pointer;font:inherit;';
+      collect.onmouseenter = function () { if (collect.dataset.on !== '1') collect.style.background = '#e51e3a'; };
+      collect.onmouseleave = function () { if (collect.dataset.on !== '1') collect.style.background = '#ff2442'; };
+      collect.onclick = function (e) {
+        e.stopPropagation();
+        e.preventDefault();
+        var on = collect.dataset.on === '1';
+        var next = on ? '0' : '1';
+        try {
+          history.replaceState(null, '', '#xhsdowncollect=' + (on ? 'stop' : 'start'));
+        } catch (x) {}
+        window.__xhsdownCollectSync(next === '1');
+      };
+      bar.appendChild(collect);
       var count = document.createElement('span');
       count.id = 'xhsdown-count';
       count.style.cssText = 'flex:none;font:11px/1 sans-serif;color:#a2a6ab;min-width:64px;text-align:right;';
@@ -3895,6 +3918,7 @@ fn spawn_page_bar(app: tauri::AppHandle) {
                 break;
             }
 
+
             let url = window
                 .url()
                 .map(|u| u.to_string().split('#').next().unwrap_or("").to_string())
@@ -3903,6 +3927,10 @@ fn spawn_page_bar(app: tauri::AppHandle) {
                 last_url = url.clone();
                 last_inject = std::time::Instant::now();
                 let _ = window.eval(PAGE_BAR_JS);
+                // 新注入的按钮默认是"开始解析"：如果后端还在收集中，把按钮同步回"完成解析"
+                if collecting {
+                    let _ = window.eval(COLLECT_SYNC_ON);
+                }
             }
 
             // 页面按钮信号
@@ -3922,10 +3950,12 @@ fn spawn_page_bar(app: tauri::AppHandle) {
                         let _ = window.eval(
                             "window.__xhsdownUserN=0;window.__xhsdownFeedN=0;window.__xhsdownSearchN=0;",
                         );
+                        let _ = window.eval(COLLECT_SYNC_ON);
                         xhs_core::login::debug_log("网页收集：开始（可见模式，边滚边收集）");
                         let _ = app.emit("collect://update", serde_json::json!({ "count": 0 }));
                     } else if value == "stop" {
                         collecting = false;
+                        let _ = window.eval(COLLECT_SYNC_OFF);
                         // 手动点「完成解析」：顺手把页面读一遍拿总数，好告诉用户收够了没有
                         let total = {
                             let _ = window.eval(
@@ -3968,6 +3998,7 @@ fn spawn_page_bar(app: tauri::AppHandle) {
                     total = parse_total(tail.split("|||").next().unwrap_or(""));
                 }
                 let _ = window.eval("history.replaceState(null,'',location.pathname+location.search)");
+                let _ = window.eval(COLLECT_SYNC_OFF);
                 emit_done(&app, &collected, true, total);
                 continue;
             }

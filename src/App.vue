@@ -52,63 +52,18 @@ const settings = ref(null);
 const settingsEnv = ref(null);
 const showOnboarding = ref(false);
 
-/** 网页工具栏：WEB 窗口的地址与可见性（每 1.5 秒同步一次） */
+/** WEB 窗口可见性（每 1.5 秒同步一次）：驱动标题栏 WEB 按钮的状态点与开/收切换。
+ *  轮询本身还兼职让后端记录"用户最后在看的页面"（点 WEB 恢复用），别删。 */
 const webBar = ref({ url: "", visible: false });
-const webDraft = ref("");
-let webEditing = false;
 let webBarTimer = null;
 
 async function pollWebBar() {
   try {
     const state = await api.webBarState();
     webBar.value.visible = !!state?.visible;
-    if (!webEditing) {
-      webBar.value.url = state?.url || "";
-      webDraft.value = state?.url || "";
-    }
+    webBar.value.url = state?.url || "";
   } catch {
     // 忽略：窗口可能正在关闭
-  }
-}
-
-async function webCmd(cmd) {
-  try {
-    await api.webBarCmd(cmd);
-  } catch (error) {
-    showToast(String(error));
-  }
-}
-
-async function webGo() {
-  webEditing = false;
-  try {
-    await api.webBarGo(webDraft.value.trim());
-  } catch (error) {
-    showToast(String(error));
-  }
-}
-
-async function webCopy() {
-  try {
-    await navigator.clipboard.writeText(webBar.value.url || webDraft.value);
-    showToast("已复制当前网页地址");
-  } catch {
-    showToast("复制失败，请手动选中复制");
-  }
-}
-
-async function webToParse() {
-  const url = webBar.value.url || webDraft.value;
-  if (!url) return;
-  openSource(url);
-}
-
-async function webHide() {
-  try {
-    await api.webBarHide();
-    webBar.value.visible = false;
-  } catch (error) {
-    showToast(String(error));
   }
 }
 
@@ -427,12 +382,14 @@ function onWebConfirmed(loginInfo) {
   showLogin.value = false;
 }
 
-/** 点「未登录」：直接打开小红书官方登录页（独立窗口），不再套自家弹窗 */
-/** 打开网页窗口：看/复制链接用（登录了就是当前账号主页） */
+/** 标题栏 WEB 按钮：网页窗口开着就收起，没开就打开（地址/导航在网页窗口内完成） */
 async function openWeb() {
   try {
-    await api.openWebHome();
-    showToast("已打开小红书网页；解析时它会自动收起");
+    if (webBar.value.visible) {
+      await api.webBarHide();
+    } else {
+      await api.openWebHome();
+    }
   } catch (error) {
     showToast(String(error));
   }
@@ -469,31 +426,14 @@ async function doLogout() {
       :login="login"
       :version="version"
       :theme="settings?.theme || 'system'"
+      :web-active="webBar.visible"
       @login="openLogin"
       @set-theme="setTheme"
       @web="openWeb"
     />
 
-    <!-- 网页工具栏：WEB 窗口可见时出现（地址实时同步，可复制/直接送解析） -->
-    <div v-if="webBar.visible" class="web-bar">
-      <button class="wb-btn" title="后退" @click="webCmd('back')">◀</button>
-      <button class="wb-btn" title="前进" @click="webCmd('forward')">▶</button>
-      <button class="wb-btn" title="刷新" @click="webCmd('reload')">⟳</button>
-      <input
-        v-model="webDraft"
-        class="wb-url"
-        spellcheck="false"
-        placeholder="小红书网页地址（回车跳转）"
-        @focus="webEditing = true"
-        @blur="webEditing = false"
-        @keydown.enter="webGo"
-      />
-      <button class="wb-btn wide" title="复制当前地址" @click="webCopy">复制</button>
-      <button class="wb-btn wide" title="把当前地址送到解析页" @click="webToParse">解析</button>
-      <span v-if="collectCount" class="wb-count num">收集中 {{ collectCount }} 条</span>
-      <button class="wb-btn wide" title="收起网页窗口" @click="webHide">收起</button>
-    </div>
-
+    <!-- WEB 窗口的地址/导航/解析都在它窗口内的地址栏里完成，
+         主窗口不再重复一条工具栏；WEB 按钮（标题栏）负责开/收 -->
     <div class="body">
       <Sidebar
         :current="page"
@@ -590,63 +530,6 @@ async function doLogout() {
   min-width: 0;
   overflow-y: auto;
   padding: 18px 22px 22px;
-}
-
-.web-bar {
-  flex: none;
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  height: 34px;
-  padding: 0 12px;
-  background: var(--raised);
-  border-bottom: 1px solid var(--line);
-}
-
-.wb-btn {
-  flex: none;
-  height: 24px;
-  min-width: 28px;
-  padding: 0 8px;
-  font-size: 12px;
-  color: var(--muted);
-  background: var(--field);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-}
-
-.wb-btn:hover {
-  color: var(--accent);
-  border-color: var(--accent-line);
-  background: var(--accent-soft);
-}
-
-.wb-btn.wide {
-  min-width: 44px;
-}
-
-.wb-url {
-  flex: 1;
-  min-width: 0;
-  height: 24px;
-  padding: 0 10px;
-  font-size: 12.5px;
-  color: var(--text);
-  background: var(--field);
-  border: 1px solid var(--line);
-  border-radius: var(--radius-sm);
-}
-
-.wb-count {
-  flex: none;
-  font-size: 11.5px;
-  color: var(--accent);
-}
-
-.wb-url:focus {
-  outline: none;
-  border-color: var(--accent-line);
-  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
 .toast {

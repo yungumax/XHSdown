@@ -9,6 +9,8 @@ const props = defineProps({
   version: { type: String, default: "" },
   /** 主题模式：light / dark / system */
   theme: { type: String, default: "system" },
+  /** 网页窗口是否开着：开着时 WEB 按钮点亮（点击=收起） */
+  webActive: { type: Boolean, default: false },
 });
 const emit = defineEmits(["login", "set-theme", "web"]);
 
@@ -153,7 +155,13 @@ function onDrag(event) {
       </Transition>
     </div>
 
-    <button class="web-chip" title="打开小红书网页（看/复制链接）" @click="emit('web')">
+    <button
+      class="web-chip"
+      :class="{ on: webActive }"
+      :title="webActive ? '收起小红书网页窗口' : '打开小红书网页（浏览/网页内收集）'"
+      @click="emit('web')"
+    >
+      <span class="dot" />
       WEB
     </button>
 
@@ -233,6 +241,9 @@ function onDrag(event) {
 }
 
 .web-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
   height: 26px;
   padding: 0 10px;
   margin-right: 8px;
@@ -244,6 +255,25 @@ function onDrag(event) {
   border: 1px solid var(--line);
   border-radius: 999px;
   transition: color 0.15s ease, border-color 0.15s ease, background 0.15s ease;
+}
+
+.web-chip .dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--line);
+  transition: background 0.15s ease;
+}
+
+/* 网页窗口开着：点亮（点击=收起） */
+.web-chip.on {
+  color: var(--accent);
+  border-color: var(--accent-line);
+  background: var(--accent-soft);
+}
+
+.web-chip.on .dot {
+  background: var(--accent);
 }
 
 .web-chip:hover {
