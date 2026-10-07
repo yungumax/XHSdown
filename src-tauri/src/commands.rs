@@ -3647,11 +3647,15 @@ const PAGE_BAR_JS: &str = r#"(function () {
   };
   var apply = function () {
     var bar = document.getElementById('xhsdown-bar');
-    if (!bar) return;
-    var want = isOpen() ? 'translateY(0)' : 'translateY(-102%)';
-    if (bar.style.transform !== want && bar.style.transform !== want.replace('0)', '0px)')) {
-      bar.style.transform = want;
+    if (bar) {
+      var want = isOpen() ? 'translateY(0)' : 'translateY(-102%)';
+      if (bar.style.transform !== want && bar.style.transform !== want.replace('0)', '0px)')) {
+        bar.style.transform = want;
+      }
     }
+    // 收起药丸只在地址栏收起时出现：展开后它就是多余的（按钮都在栏里）
+    var handle = document.getElementById('xhsdown-handle');
+    if (handle) handle.style.display = isOpen() ? 'none' : 'flex';
   };
   var setOpen = function (next) {
     markPinned(next);
@@ -3662,17 +3666,26 @@ const PAGE_BAR_JS: &str = r#"(function () {
     var handle = document.getElementById('xhsdown-handle');
     var bar = document.getElementById('xhsdown-bar');
     if (!handle) {
+      // 收起态是一枚带状态的小药丸（旧版是无字小方块，没有信息量也不好点）：
+      // 平时「⌃ 解析」；收集时由定时器改写成实时进度「收集中 62/83 条」，
+      // 收起地址栏也能盯进度。移上去/点一下展开完整地址栏。
       handle = document.createElement('div');
       handle.id = 'xhsdown-handle';
       handle.dataset.pinned = '0';
-      handle.textContent = '⌃';
-      handle.title = '地址栏（移上去展开，展开后不会自动收起）';
-      handle.style.cssText = 'position:fixed;left:8px;bottom:10px;width:20px;height:20px;z-index:' + Z + ';display:flex;align-items:center;justify-content:center;background:#ff2442;color:#fff;border-radius:6px;font:11px/1 sans-serif;cursor:pointer;opacity:.4;transition:opacity .15s;box-shadow:0 2px 8px rgba(0,0,0,.28);';
+      handle.title = '地址栏收起中：移上去或点一下展开；收集时这里实时显示进度';
+      handle.style.cssText = 'position:fixed;left:8px;bottom:10px;z-index:' + Z + ';display:flex;align-items:center;gap:5px;height:24px;padding:0 10px;background:#ff2442;color:#fff;border-radius:999px;font:11px/1 "Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;cursor:pointer;opacity:.85;box-shadow:0 2px 8px rgba(0,0,0,.28);transition:opacity .15s;';
+      var caret = document.createElement('span');
+      caret.textContent = '⌃';
+      caret.style.cssText = 'font-size:10px;opacity:.85;';
+      var hlabel = document.createElement('span');
+      hlabel.id = 'xhsdown-handle-label';
+      hlabel.textContent = '解析';
+      handle.appendChild(caret);
+      handle.appendChild(hlabel);
       handle.onmouseenter = function () {
         handle.style.opacity = '1';
         setOpen(true);
       };
-      handle.onmouseleave = function () { handle.style.opacity = '.4'; };
       handle.onclick = function () { setOpen(true); };
       (document.documentElement || document.body).appendChild(handle);
     }
@@ -3709,12 +3722,16 @@ const PAGE_BAR_JS: &str = r#"(function () {
       bar.appendChild(input);
       // 收集开关的全局同步口：后端在停止/自动停止/重新注入时调用它保持按钮与真实状态一致
       window.__xhsdownCollectSync = function (on) {
+        window.__xhsdownCollecting = !!on;
         var b = document.getElementById('xhsdown-collect');
-        if (!b) return;
-        b.dataset.on = on ? '1' : '0';
-        b.textContent = on ? '完成解析' : '开始解析';
-        b.style.background = on ? '#8a2530' : '#ff2442';
-        b.style.borderColor = on ? '#8a2530' : '#ff2442';
+        if (b) {
+          b.dataset.on = on ? '1' : '0';
+          b.textContent = on ? '完成解析' : '开始解析';
+          b.style.background = on ? '#8a2530' : '#ff2442';
+          b.style.borderColor = on ? '#8a2530' : '#ff2442';
+        }
+        var hl = document.getElementById('xhsdown-handle-label');
+        if (hl && !on) hl.textContent = '解析';
       };
       // 收集开关：一个按钮两个状态（开始解析 ⇄ 完成解析）。
       // 按自己的 data-on 切换发信号；后端在停止/自动停止/重新注入时会改写它保持同步
@@ -3833,14 +3850,20 @@ const PAGE_BAR_JS: &str = r#"(function () {
         if (input && document.activeElement !== input) {
           input.value = location.href.split('#')[0];
         }
+        var n = countCards();
+        var total = totalCards();
         var count = document.getElementById('xhsdown-count');
         if (count) {
-          var n = countCards();
-          var total = totalCards();
           if (n <= 0) count.textContent = '';
           else if (total > n) count.textContent = '已加载 ' + n + ' / 共 ' + total + ' 条';
           else if (total > 0) count.textContent = '已收全 ' + n + ' 条';
           else count.textContent = '已加载 ' + n + ' 条';
+        }
+        // 收起药丸的实时进度：收集期间「收集中 62/83 条」，把地址栏收起也能盯进度
+        var hl = document.getElementById('xhsdown-handle-label');
+        if (hl && window.__xhsdownCollecting) {
+          hl.textContent =
+            n > 0 ? '收集中 ' + n + (total > n ? '/' + total : '') + ' 条' : '收集中…';
         }
       } catch (e) {}
     }, 800);
