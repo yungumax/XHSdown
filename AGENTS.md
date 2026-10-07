@@ -82,6 +82,29 @@
 - **视频清晰度**：`video.media.stream.h264[].masterUrl`，"1080P / 480P" 这类标签排序
   必须按数值比（字典序下 "480P" > "1080P"，踩过）。
 
+## 安装包（NSIS，实测核对）
+
+- **安装向导页面顺序**（Tauri 模板）：欢迎 → [许可协议：**仅当配置了 license 文件**，
+  本项目未配 → 无此页] → [语言选择：displayLanguageSelector=false → 无] →
+  [重装/卸载检测：仅检测到旧安装时出现] → 安装目录 → 开始菜单文件夹 →
+  安装进度 → 完成页（两个复选框：创建桌面快捷方式、**运行程序（默认勾选）**）。
+- 安装位置 `installMode=currentUser` → `%LOCALAPPDATA%\XHSdown`；
+  安装器自带 **WebView2 检查与引导安装**（Section WebView2）。
+- **卸载程序**：安装时写入 `$INSTDIR\uninstall.exe`，并在
+  `HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\XHSdown` 注册
+  DisplayName / DisplayIcon / DisplayVersion / Publisher / UninstallString / EstimatedSize
+  （控制面板可见）。卸载确认页带**「删除应用数据」复选框**。
+- **坑（已修）**：Tauri 卸载器只删 `$APPDATA\<bundle id>`（=com.xhsdown.app），
+  而本软件数据在 `%APPDATA%\xhsdown` → 勾了删数据也会残留。已用
+  `bundle.windows.nsis.installerHooks`（`src-tauri/installer-hooks.nsh`，
+  `NSIS_HOOK_POSTUNINSTALL`）在勾选时同时清 `$APPDATA\xhsdown` 与 `$LOCALAPPDATA\xhsdown`。
+  改钩子后**反向验证一次**：把 installerHooks 指向不存在的文件，构建应报错（证明接线生效）。
+- **坑（已修）**：本地打包签名变量名是 `TAURI_SIGNING_PRIVATE_KEY`（**密钥内容**），
+  不是 `TAURI_SIGNING_PRIVATE_KEY_PATH`；用错名字不报错但**静默不签名**
+  （产物没有 `.sig`，更新器无法验证）。dev.bat 已改。
+- 本地验证：`npm run tauri build` → `target/release/bundle/nsis/XHSdown_x.y.z_x64-setup.exe`
+  （+ `.sig`）。构建顺序见 dev.bat（先 npm run build 再 cargo build）。
+
 ## 其他
 
 - 用户数据/设置在 `%APPDATA%\xhsdown\`；调试日志 `xhs_debug.log` 同目录。
