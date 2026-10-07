@@ -27,7 +27,10 @@ if exist "%WBO%.lldbin" (
 )
 
 rem 更新包签名密钥（createUpdaterArtifacts 需要本地签名；CI 发布走 GitHub Secrets）
-set "TAURI_SIGNING_PRIVATE_KEY_PATH=D:\Zcode\_data\tauri-keys\xhsdown.key"
+rem 注意变量名：Tauri CLI 读的是 TAURI_SIGNING_PRIVATE_KEY（**密钥内容**），不是 *_PATH。
+rem 用错名字不会报错但会静默不签名——打出来的安装包没有 .sig，更新器无法验证（实测踩过）。
+set "TAURI_SIGNING_PRIVATE_KEY_FILE=D:\Zcode\_data\tauri-keys\xhsdown.key"
+set /p TAURI_SIGNING_PRIVATE_KEY=<"%TAURI_SIGNING_PRIVATE_KEY_FILE%"
 set "TAURI_SIGNING_PRIVATE_KEY_PASSWORD="
 
 if /i "%~1"=="build" (
