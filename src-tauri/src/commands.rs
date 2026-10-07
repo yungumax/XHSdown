@@ -3922,8 +3922,9 @@ fn spawn_page_bar(app: tauri::AppHandle) {
             } else if total as usize <= collected.len() {
                 "（已收全）".to_string()
             } else {
+                // 措辞中性：收集时可能登录也可能没登录，别把"未登录"当唯一原因（实测误导过用户）
                 format!(
-                    "（主页共 {total} 条，还差 {} 条；未登录时小红书会拦住后续笔记，登录后再收集）",
+                    "（主页共 {total} 条，还差 {} 条；可能未滚到底或个别笔记不可见）",
                     total as usize - collected.len()
                 )
             };
@@ -4013,11 +4014,13 @@ fn spawn_page_bar(app: tauri::AppHandle) {
                 }
             }
 
-            // 收集：滚动 → 抽取 → 合并；条数连续 3 轮不增长即判到底
+            // 收集：滚动 → 抽取 → 合并；条数连续 4 轮不增长即判到底。
+            // （3 轮太急：最后一批笔记常要等站点慢慢吐，实测 144/147 时尾部 3 条
+            // 再给一轮就能到位；多等一轮只花 3~4 秒）
             if !collecting {
                 continue;
             }
-            if stale >= 3 {
+            if stale >= 4 {
                 collecting = false;
                 // 把页面尾部提示记下来：区分"站点说没有更多了"与"被登录墙/风控挡住"
                 let _ = window.eval(

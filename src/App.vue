@@ -166,13 +166,17 @@ onMounted(async () => {
       return;
     }
     collected.value = { items, stamp: Date.now() };
-    // 总数拿得到就直接给结论：收全了 / 还差多少。用户看到"停在 N 条"时最需要这个答案
+    // 总数拿得到就直接给结论：收全了 / 还差多少。用户看到"停在 N 条"时最需要这个答案。
+    // 措辞按登录态分：登录着还说"去登录"就是误导（实测被用户抓包）
     if (total > 0 && items.length >= total) {
       showToast(`网页收集完成：${items.length} 条，已收全（主页共 ${total} 条）`);
     } else if (total > items.length) {
+      const gap = total - items.length;
+      const hint = login.value.logged_in
+        ? `差的 ${gap} 条多半是个别笔记已删除/仅自己可见，或最后一批还没滚出来（再收一次常能补上）`
+        : "未登录时小红书会拦住后续笔记，登录后再收集即可拿全";
       showToast(
-        `网页收集完成：${items.length} 条，主页共 ${total} 条，还差 ${total - items.length} 条` +
-          "（未登录时小红书会拦住后续笔记，登录后再收集即可拿全）",
+        `网页收集完成：${items.length} 条，主页共 ${total} 条，还差 ${gap} 条（${hint}）`,
       );
     } else {
       showToast(`网页收集完成：${items.length} 条，已送入解析结果`);
