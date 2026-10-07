@@ -1101,10 +1101,10 @@ function kindLabel(kind) {
           </p>
         </div>
         <div class="howto-way">
-          <div class="howto-title"><span class="badge alt">单条</span>粘贴链接（单条笔记 / App 分享）</div>
+          <div class="howto-title"><span class="badge alt">单条</span>粘贴链接 / 一键复制（单条笔记）</div>
           <ol>
-            <li>在 App 里打开笔记 → 分享 → 复制链接（整段分享文本可直接粘贴）</li>
-            <li>粘贴到上方输入框（一行一个，可批量），点 <b>开始解析</b></li>
+            <li>在 App 里打开笔记 → 分享 → 复制链接（整段分享文本可直接粘贴）；或点网页地址栏的 <b>复制</b>，当前网页地址直接进解析栏</li>
+            <li>粘贴到上方输入框（一行一个，可批量；点复制是追加，攒多条一起解析），点 <b>开始解析</b></li>
             <li>解析完成后进入「选择内容」页，勾选下载</li>
           </ol>
           <p class="howto-note">
