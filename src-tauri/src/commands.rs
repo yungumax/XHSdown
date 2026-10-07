@@ -87,14 +87,23 @@ pub async fn app_status(
             // 等启动首屏稳住再开始
             tokio::time::sleep(Duration::from_secs(3)).await;
             let mut attempts = 0u32;
+            let mut waited_logs = 0u32;
             loop {
                 if attempts >= 4 {
                     xhs_core::login::debug_log("启动恢复登录：多次读取失败，本轮放弃（下次启动再测）");
                     break;
                 }
-                // 用户正看着网页窗口就让路：等它收起再测（不计入尝试次数）
+                // 用户正看着网页窗口就让路：等它收起再测（不计入尝试次数）。
+                // 等待会一直持续（用户什么时候收起不确定），满 30 秒解释一次原因，
+                // 否则日志里只有"未登录"却不知道为什么
                 if let Some(w) = app2.get_webview_window("xhs-work") {
                     if w.is_visible().unwrap_or(false) {
+                        waited_logs += 1;
+                        if waited_logs == 15 {
+                            xhs_core::login::debug_log(
+                                "启动恢复登录：网页窗口正被使用，等它收起后再检测（不抢用户的窗口）",
+                            );
+                        }
                         tokio::time::sleep(Duration::from_secs(2)).await;
                         continue;
                     }
@@ -103,7 +112,8 @@ pub async fn app_status(
                 let state = app2.state::<crate::state::AppState>();
                 match tokio::time::timeout(Duration::from_secs(40), browser_login_check(&app2)).await {
                     Ok(Ok(Some((uid, name, avatar)))) => {
-                        match finish_login(&app2, &state, uid, name, avatar).await {
+                        // 后台检测：不收窗口（用户可能正在浏览）
+                        match finish_login(&app2, &state, uid, name, avatar, false).await {
                             Ok(info) => {
                                 let _ = app2.emit("login://confirmed", info);
                                 xhs_core::login::debug_log("启动恢复登录：已登录");
@@ -1949,7 +1959,15 @@ const IDENTITY_DOM_JS: &str = r#"(function () {
     return '';
   };
   try {
-    var out = { ready: true };
+    var out = { ready: true, selfPage: false };
+    // **本人页防呆（错误登录事故的根源）**：state.user 在「别人的主页」上是对方的资料、
+    // 在「笔记页」上文档标题是笔记标题——把它们当登录者就是错误登录。
+    // 所以身份只在 /user/profile/me 上读取；其它页面一律报"这里没有我的资料"，
+    // 由调用方导航到 /me 再读。
+    if (location.href.indexOf('/user/profile/me') < 0) {
+      report(out);
+      return;
+    }
     var st = window.__INITIAL_STATE__ || {};
     var pu = unwrap(st.user) || {};
     var page = unwrap(pu.userPageData);
@@ -1963,6 +1981,7 @@ const IDENTITY_DOM_JS: &str = r#"(function () {
       }
       return '';
     };
+    out.selfPage = true;
     out.name =
       pick(page, ['nickname', 'nickName', 'nick_name', 'name']) ||
       pick(info, ['nickname', 'nickName', 'nick_name', 'name']);
@@ -1970,7 +1989,7 @@ const IDENTITY_DOM_JS: &str = r#"(function () {
     out.avatar =
       pick(page, ['headImage', 'image', 'avatar', 'images', 'avatarUrl']) ||
       pick(info, ['headImage', 'image', 'avatar', 'images', 'avatarUrl']);
-    // 状态里没有就退回 DOM
+    // 状态里没有就退回 DOM（/me 页的标题=我的昵称、页头有我的头像图）
     if (!out.name) {
       var raw = (document.title || '').trim();
       var generic = raw === '小红书' || raw.indexOf('你的生活兴趣社区') >= 0;
@@ -2025,90 +2044,67 @@ async fn read_identity(window: &tauri::WebviewWindow) -> Option<(String, String,
 
 /// 让浏览器去读「我的主页」，判断当前是否已登录并尽量取回账号资料。
 ///
-/// 判定依据是**页面有没有被踢到登录页**：未登录时 /user/profile/me 会 302 到 /login
-/// （`webview_fetch` 会因此返回"需要登录"错误），登录成功则正常渲染。
-/// 资料字段不能作为判据——登录后 userPageData 仍可能是空对象（实测踩过）。
+/// 返回值语义（错误登录/登录不上事故的教训，调用方必须照此处理）：
+/// - `Ok(Some((uid, name, avatar)))` = **确认已登录**（在 /me 上读到了真昵称）
+/// - `Ok(None)` = **确认未登录**（/me 被站点 302 到登录页——唯一的权威未登录信号）
+/// - `Err(...)` = **本次没读成**（超时/风控/窗口被用/资料懒加载未到）——
+///   调用方只能重试或沿用旧态，**绝不能当成未登录去清状态**
 async fn browser_login_check(
     app: &tauri::AppHandle,
 ) -> Result<Option<(String, String, String)>, String> {
-    // 先看当前页面（多数时候已经带着登录者资料，不用导航，快且不打扰站点）
+    // 只在当前页面就是 /me 时快读（其它页面 state.user 是别人的资料或为空，
+    // 笔记页标题是笔记名——拿它们当登录者 = 错误登录，实测踩过）
     let value = {
         let mut found: Option<serde_json::Value> = None;
         if let Some(window) = app.get_webview_window("xhs-work") {
-            for _ in 0..3 {
-                let _ = window.eval(IDENTITY_DOM_JS);
-                if let Some((uid, name, avatar)) = read_identity(&window).await {
-                    if !name.is_empty() {
-                        found = Some(serde_json::json!({
-                            "kind": "user", "uid": uid, "nickname": name, "avatar": avatar,
-                        }));
-                        break;
+            let on_me = window
+                .url()
+                .map(|u| u.to_string().contains("/user/profile/me"))
+                .unwrap_or(false);
+            if on_me {
+                for _ in 0..3 {
+                    let _ = window.eval(IDENTITY_DOM_JS);
+                    if let Some((uid, name, avatar)) = read_identity(&window).await {
+                        if !name.is_empty() {
+                            found = Some(serde_json::json!({
+                                "kind": "user", "uid": uid, "nickname": name, "avatar": avatar,
+                            }));
+                            break;
+                        }
                     }
+                    tokio::time::sleep(Duration::from_millis(600)).await;
                 }
-                tokio::time::sleep(Duration::from_millis(600)).await;
             }
         }
         match found {
             Some(value) => value,
-            None => {
-                // 当前页面读不到就导航到「我的主页」读一次
-                match webview_fetch_inner(app, "https://www.xiaohongshu.com/user/profile/me", true)
-                    .await
-                {
-                    Ok(value) => value,
-                    Err(e) => {
-                        // 读不到 ≠ 没登录：网络慢 / 被风控 / 窗口被隐藏时页面读也会失败。
-                        // 返回 Err，让调用方区分"确认未登录"和"本次没读成"（启动时据此重试）
-                        xhs_core::login::debug_log(&format!("登录检测：{e}"));
-                        return Err(e);
+            None => match webview_fetch_inner(app, "https://www.xiaohongshu.com/user/profile/me", true)
+                .await
+            {
+                Ok(value) => value,
+                Err(e) => {
+                    // /me 被踢到登录页 = **唯一权威的未登录信号**；其余错误都只是"没读成"
+                    if e.contains("需要登录") {
+                        xhs_core::login::debug_log("登录检测：/me 被踢到登录页，确认未登录");
+                        return Ok(None);
                     }
+                    xhs_core::login::debug_log(&format!("登录检测：{e}"));
+                    return Err(e);
                 }
-            }
+            },
         }
     };
 
-    let mut uid = value.get("uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let mut name = value.get("nickname").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let mut avatar = value.get("avatar").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-    let notes = value
-        .get("notes")
-        .and_then(|v| v.as_array())
-        .map(|a| a.len())
-        .unwrap_or(0);
+    let uid = value.get("uid").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let name = value.get("nickname").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let avatar = value.get("avatar").and_then(|v| v.as_str()).unwrap_or_default().to_string();
 
-    // 判定门槛：**必须拿到真昵称**。笔记列表单独不算——实测遇到过
-    // "笔记列表先到、资料还没渲染"的半就绪状态，那时收工就会得到
-    // "已登录但昵称头像全空"的假成功（正是用户看到的怪状态）。
+    // 判定门槛：**必须拿到真昵称**。/me 的资料是懒加载的，昵称没到不算确认——
+    // 返回 Err（未定）让调用方重试；**绝不能返回 Ok(None)**（那会清掉有效登录态，
+    // 实测：/me 懒加载慢一次，界面就"未登录"，用户以为自己掉线）
     if name.is_empty() {
-        xhs_core::login::debug_log(&format!(
-            "登录检测：已登录但资料未就绪（笔记 {notes} 条），继续等待"
-        ));
-        return Ok(None);
-    }
-
-    // 状态里没资料就退回 DOM（文档标题=昵称、头像图）
-    if name.is_empty() || avatar.is_empty() {
-        if let Some(window) = app.get_webview_window("xhs-work") {
-            // 资料异步到达：最多重试 3 轮（每轮内部轮询 ~5 秒）
-            for _ in 0..3 {
-                let _ = window.eval(IDENTITY_DOM_JS);
-                if let Some((_u, _n, _a)) = read_identity(&window).await {
-                    break;
-                }
-            }
-            let _ = window.eval(IDENTITY_DOM_JS);
-            if let Some((dom_uid, dom_name, dom_avatar)) = read_identity(&window).await {
-                if uid.is_empty() {
-                    uid = dom_uid;
-                }
-                if name.is_empty() {
-                    name = dom_name;
-                }
-                if avatar.is_empty() {
-                    avatar = dom_avatar;
-                }
-            }
-        }
+        xhs_core::login::debug_log("登录检测：已登录但资料未就绪（昵称懒加载未到），稍后重试");
+        return Err("登录检测：资料未就绪（昵称懒加载未到）".into());
     }
 
     xhs_core::login::debug_log(&format!(
@@ -2664,13 +2660,22 @@ async fn login_watch(app: tauri::AppHandle) {
         // 阶段 1：完整取数（含导航）最多每 20 秒一次；其余时间只读当前页面，
         // 让页面的异步资料有机会加载完
         let now = std::time::Instant::now();
-        // 优先在当前页面读账号资料（登录者的资料就在全局状态里，不需要任何导航）
-        let _ = window.eval(IDENTITY_DOM_JS);
-        let mut value = match read_identity(&window).await {
-            Some((uid, name, avatar)) if !name.is_empty() => Some(serde_json::json!({
-                "kind": "user", "uid": uid, "nickname": name, "avatar": avatar,
-            })),
-            _ => None,
+        // 优先在当前页面读账号资料——**仅限 /me 页**（身份脚本自身有防呆，
+        // 非 /me 页一律不报身份；这里再按 URL 短路，省掉 5 秒的无效轮询）
+        let on_me_page = window
+            .url()
+            .map(|u| u.to_string().contains("/user/profile/me"))
+            .unwrap_or(false);
+        let mut value = if on_me_page {
+            let _ = window.eval(IDENTITY_DOM_JS);
+            match read_identity(&window).await {
+                Some((uid, name, avatar)) if !name.is_empty() => Some(serde_json::json!({
+                    "kind": "user", "uid": uid, "nickname": name, "avatar": avatar,
+                })),
+                _ => None,
+            }
+        } else {
+            None
         };
         // 当前页面读不到（例如状态还没热）：退回到「我的主页」读，
         // 带退避（5s→10s→20s→40s），避免频繁打扰站点被限流
@@ -2710,7 +2715,7 @@ async fn login_watch(app: tauri::AppHandle) {
             .unwrap_or_default()
             .to_string();
         xhs_core::login::debug_log(&format!("检测到登录：昵称={:?} uid={:?}", name, uid));
-        match finish_login(&app, &state, uid, name, avatar).await {
+        match finish_login(&app, &state, uid, name, avatar, true).await {
             Ok(login) => {
                 let _ = app.emit("login://confirmed", login);
                 break;
@@ -3524,13 +3529,17 @@ fn harvest_webview_cookies(window: &tauri::WebviewWindow) -> Vec<(String, String
     cookies
 }
 
-/// 登录成功后收尾：备份 Cookie、内嵌头像、写登录态、关登录小窗。
+/// 登录成功后收尾：备份 Cookie、内嵌头像、写登录态。
+/// `hide_window`：**只有扫码登录流程**该收窗口（登录小窗使命完成）；
+/// 启动后台检测也会走到这里——那时窗口是用户自己在浏览，收掉等于
+/// 当面把人家的页面藏了（实测窗口莫名消失，看起来像"登录出问题"）
 async fn finish_login(
     app: &tauri::AppHandle,
     state: &State<'_, AppState>,
     uid: String,
     name: String,
     avatar: String,
+    hide_window: bool,
 ) -> Result<LoginInfo, String> {
     let settings = state.settings_snapshot();
     if let Some(window) = app.get_webview_window("xhs-work") {
@@ -3557,8 +3566,10 @@ async fn finish_login(
         "登录完成：昵称={:?} uid={:?}",
         login.uname, login.mid
     ));
-    if let Some(window) = app.get_webview_window("xhs-work") {
-        let _ = window.hide();
+    if hide_window {
+        if let Some(window) = app.get_webview_window("xhs-work") {
+            let _ = window.hide();
+        }
     }
     state.login_window_open.store(false, Ordering::SeqCst);
     Ok(login)
@@ -4463,7 +4474,8 @@ pub async fn web_login_cookies(app: tauri::AppHandle, state: State<'_, AppState>
     let Some((uid, name, avatar)) = browser_login_check(&app).await? else {
         return Err(not_yet());
     };
-    finish_login(&app, &state, uid, name, avatar).await
+    // 这个命令只被旧登录轮询路径使用：登录窗开着才走到这，收窗口
+    finish_login(&app, &state, uid, name, avatar, true).await
 }
 
 #[tauri::command]
