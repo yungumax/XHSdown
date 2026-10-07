@@ -3731,6 +3731,11 @@ const PAGE_BAR_JS: &str = r#"(function () {
       // 收集几十秒就到底了，用户收起地址栏再看时如果归零，就永远看不到进度（实测踩过）
       window.__xhsdownCollectSync = function (on, label) {
         window.__xhsdownCollecting = !!on;
+        if (on) {
+          window.__xhsdownDoneLabel = '';
+        } else {
+          window.__xhsdownDoneLabel = label || '完成 ' + (window.__xhsdownLastN || 0) + ' 条';
+        }
         var b = document.getElementById('xhsdown-collect');
         if (b) {
           b.dataset.on = on ? '1' : '0';
@@ -3739,7 +3744,7 @@ const PAGE_BAR_JS: &str = r#"(function () {
           b.style.borderColor = on ? '#8a2530' : '#ff2442';
         }
         var hl = document.getElementById('xhsdown-handle-label');
-        if (hl && !on) hl.textContent = label || '完成 ' + (window.__xhsdownLastN || 0) + ' 条';
+        if (hl && !on) hl.textContent = window.__xhsdownDoneLabel;
       };
       // 收集开关：一个按钮两个状态（开始解析 ⇄ 完成解析）。
       // 按自己的 data-on 切换发信号；后端在停止/自动停止/重新注入时会改写它保持同步
@@ -3862,18 +3867,27 @@ const PAGE_BAR_JS: &str = r#"(function () {
         var total = totalCards();
         var count = document.getElementById('xhsdown-count');
         if (count) {
-          if (n <= 0) count.textContent = '';
+          if (n <= 0 && total > 0) count.textContent = '共 ' + total + ' 条';
+          else if (n <= 0) count.textContent = '';
           else if (total > n) count.textContent = '已加载 ' + n + ' / 共 ' + total + ' 条';
           else if (total > 0) count.textContent = '已收全 ' + n + ' 条';
           else count.textContent = '已加载 ' + n + ' 条';
         }
-        // 收起药丸的实时进度：收集期间「收集中 62/83 条」，把地址栏收起也能盯进度；
-        // 顺手记下最新条数，结束时按钮/后端用它显示结果
+        // 收起药丸的四态：解析前亮总数（主页自报发布数，不用等解析）→ 收集中实时进度
+        // → 结束后保留结果。优先级：收集 > 结果 > 总数 > 默认
         window.__xhsdownLastN = n;
         var hl = document.getElementById('xhsdown-handle-label');
-        if (hl && window.__xhsdownCollecting) {
-          hl.textContent =
-            n > 0 ? '收集中 ' + n + (total > n ? '/' + total : '') + ' 条' : '收集中…';
+        if (hl) {
+          if (window.__xhsdownCollecting) {
+            hl.textContent =
+              n > 0 ? '收集中 ' + n + (total > n ? '/' + total : '') + ' 条' : '收集中…';
+          } else if (window.__xhsdownDoneLabel) {
+            hl.textContent = window.__xhsdownDoneLabel;
+          } else if (total > 0) {
+            hl.textContent = '共 ' + total + ' 条';
+          } else {
+            hl.textContent = '解析';
+          }
         }
       } catch (e) {}
     }, 800);
