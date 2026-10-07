@@ -1508,16 +1508,29 @@ const EXTRACT_JS: &str = r#"(function () {
       var video = unwrap(note.video) || {};
       var media = unwrap(video.media) || {};
       var streams = unwrap(media.stream) || {};
-      var codecs = ['h264', 'h265', 'av1'];
-      for (var c = 0; c < codecs.length && !videos.length; c++) {
-        var streamArr = arr(streams[codecs[c]]);
+      // 实测：流的编码键名已从 h264/h265/av1 改成 EF4/EF5 这类内部码——
+      // 不能再按编码名取，遍历 stream 下**所有**条目，凡是带 masterUrl 的都收进来，
+      // 按视频码率从高到低排（auto 取首个=最高画质；同分辨率下 h264 码率通常也更高）
+      var pool = [];
+      var streamKeys = Object.keys(streams);
+      for (var c = 0; c < streamKeys.length; c++) {
+        var streamArr = arr(streams[streamKeys[c]]);
         for (var k = 0; k < streamArr.length; k++) {
           var it = unwrap(streamArr[k]) || {};
+          var murl = str(it.masterUrl);
+          if (!murl) continue;
           var meta = unwrap(it.videoMeta) || {};
-          if (it.masterUrl) {
-            videos.push({ url: it.masterUrl, height: meta.height || 0, duration: meta.duration || 0 });
-          }
+          pool.push({
+            url: murl,
+            height: Number(unwrap(it.height)) || Number(unwrap(meta.height)) || 0,
+            duration: Number(unwrap(it.videoDuration)) || Number(unwrap(meta.duration)) || 0,
+            bitrate: Number(unwrap(it.videoBitrate)) || 0,
+          });
         }
+      }
+      pool.sort(function (a, b) { return b.bitrate - a.bitrate; });
+      for (var v = 0; v < pool.length; v++) {
+        videos.push({ url: pool[v].url, height: pool[v].height, duration: pool[v].duration });
       }
       var nu = unwrap(note.user) || {};
       report({
