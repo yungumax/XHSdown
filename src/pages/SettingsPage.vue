@@ -3,6 +3,7 @@ import Icon from "../components/Icon.vue";
 import { computed, nextTick, onMounted, onUnmounted, ref, shallowRef, watch } from "vue";
 import { animate, stagger } from "animejs";
 import * as api from "../api";
+import { IMAGE_CHOICES } from "../download-request.js";
 
 const props = defineProps({
   login: { type: Object, required: true },
@@ -157,12 +158,7 @@ function beginDraft() {
 beginDraft();
 
 // 媒体页的两个单值下拉：选项说明直接写在标签里（下拉栏内一眼看清，不占字段下方的版面）
-// 实测口径：笔记图片站点只放出两个变体，分辨率相同（1080 宽 = 站点上限），
-// 差别在压缩质量（实测同图 84 KB vs 18 KB，约 1/4.6）——没有更高的图片档位可加
-const IMAGE_FORMATS = [
-  { value: "large", label: "原图（1080 宽·最高画质，站点上限）" },
-  { value: "thumbnail", label: "压缩图（同 1080 宽·高压缩，约 1/4 体积）" },
-];
+// 图片规格选项来自共享定义（与下载弹层同一份文案，见 download-request.js）
 
 const VIDEO_QUALITIES = [
   { value: "auto", label: "最佳可用（分辨率与码率都最高）" },
@@ -696,7 +692,7 @@ async function cleanup(kind) {
               <div class="field">
                 <label>图片规格</label>
                 <select v-model="draft.image_format">
-                  <option v-for="item in IMAGE_FORMATS" :key="item.value" :value="item.value">
+                  <option v-for="item in IMAGE_CHOICES" :key="item.value" :value="item.value">
                     {{ item.label }}
                   </option>
                 </select>

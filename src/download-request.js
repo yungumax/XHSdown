@@ -12,6 +12,17 @@ export const KIND_LABELS = {
   search: "搜索结果",
 };
 
+/** 图片规格选项（唯一定义，设置页与下载弹层共用，避免两处文案漂移）。
+ *
+ * 实测（抽样多条笔记逐张解码 + 量体积）：站点对笔记图片只放出两个变体，
+ * **分辨率完全相同**（1080 宽即网页端上限），差别只在压缩质量：
+ * 同图原图 84 KB vs 压缩图 18 KB（约 1/4）。所以只有两档可选，
+ * 不存在"更清晰"的第三档——网传的换域名/剥后缀取原图技巧实测全部 403。 */
+export const IMAGE_CHOICES = [
+  { value: "large", label: "原图（最佳画质，最高 1080 宽）" },
+  { value: "thumbnail", label: "压缩图（省空间，约 1/4 体积）" },
+];
+
 export function localDate(unixSecs) {
   const d = unixSecs ? new Date(unixSecs * 1000) : new Date();
   const pad = (n) => String(n).padStart(2, "0");

@@ -3,7 +3,14 @@ import Icon from "../components/Icon.vue";
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import { animate, stagger } from "animejs";
 import * as api from "../api";
-import { KIND_LABELS, batchNaming, paddedSeq, pickDefaultQuality, singleNaming } from "../download-request.js";
+import {
+  IMAGE_CHOICES,
+  KIND_LABELS,
+  batchNaming,
+  paddedSeq,
+  pickDefaultQuality,
+  singleNaming,
+} from "../download-request.js";
 import StepHeader from "../components/StepHeader.vue";
 import { collected } from "../collect";
 
@@ -364,10 +371,7 @@ function toggleAllLoaded(checked) {
 const multiQuality = ref("auto");
 const multiImage = ref("large");
 
-const IMAGE_CHOICES = [
-  { value: "large", label: "原图（最佳画质）" },
-  { value: "thumbnail", label: "压缩图（体积小）" },
-];
+// 图片规格选项来自共享定义（与设置页同一份文案，见 download-request.js）
 
 const dlQuality = computed({
   get: () => (useShared.value ? multiQuality.value : activeSource.value?.quality ?? "auto"),
@@ -939,7 +943,8 @@ function kindLabel(kind) {
                 </select>
               </label>
               <p class="pop-note">
-                只对本次下载生效；视频清晰度不可用时自动取最佳可用档。
+                只对本次下载生效。图片只有两档（分辨率相同，区别在压缩质量）；
+                视频所列档位为本条实际可用，选某档时取不超过它的最高流。
               </p>
             </div>
           </Transition>
