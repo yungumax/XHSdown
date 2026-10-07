@@ -138,6 +138,21 @@ pub async fn app_status(
         tokio::spawn(async move { login_selftest(app2, settings2, probe_url).await });
     }
 
+    // 笔记自检开关：数据目录里放一个 note_selftest 文件 → 启动后用本会话实测
+    // 「笔记详情页是否被弹回首页」（远程判断下载失败是不是风控；平时不跑）。
+    // 文件内容可以是"要探测的笔记链接"（为空就自动从探索页抓一张新卡片）
+    let note_marker = settings.data_root().join("note_selftest");
+    if note_marker.exists() {
+        let probe_url = std::fs::read_to_string(&note_marker)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let _ = std::fs::remove_file(&note_marker);
+        let app2 = app.clone();
+        let settings2 = settings.clone();
+        tokio::spawn(async move { note_selftest(app2, settings2, probe_url).await });
+    }
+
     Ok(AppStatus {
         version: APP_VERSION.to_string(),
         login,
@@ -2799,6 +2814,123 @@ const PAGE_SNAPSHOT_JS: &str = r#"(function () {
     report({ error: String(e) });
   }
 })();"#;
+
+/// 从探索页状态里抓一张新卡片的 id + token（笔记自检第一步用）
+const NOTE_SELFTEST_CARD_JS: &str = r#"(function () {
+  var report = function (t) {
+    try { location.replace('#xhsdownselftest=' + encodeURIComponent(t)); } catch (e) {}
+  };
+  try {
+    var unwrap = function (v) {
+      var d = 0;
+      while (v && typeof v === 'object' && v.__v_isRef === true && d < 6) {
+        v = v._value !== undefined ? v._value : v.value;
+        d += 1;
+      }
+      return v;
+    };
+    var st = window.__INITIAL_STATE__ || {};
+    var feeds = unwrap((unwrap(st.feed) || {}).feeds) || [];
+    for (var i = 0; i < feeds.length; i++) {
+      var o = unwrap(feeds[i]) || {};
+      var id = String(o.id || '');
+      var token = String(o.xsecToken || '');
+      if (/^[0-9a-f]{24}$/.test(id) && token) {
+        report('CARD~' + id + '~' + token);
+        return;
+      }
+    }
+    report('NOCARD');
+  } catch (e) {
+    report('ERR~' + e);
+  }
+})();"#;
+
+/// 笔记自检：用本会话实测「笔记详情页是否被弹回首页」。
+/// 由数据目录里的 note_selftest 标记文件触发（平时不跑），用来远程判断
+/// 下载失败是不是会话被风控——先探后答，别让用户当测试员。
+async fn note_selftest(app: tauri::AppHandle, settings: Settings, custom_url: String) {
+    // 等 40 秒：让启动时的登录检测先跑完（它也导航这个窗口，别互相抢）
+    tokio::time::sleep(Duration::from_secs(40)).await;
+    let window = match ensure_work_window(&app, &settings).await {
+        Ok(w) => w,
+        Err(e) => {
+            xhs_core::login::debug_log(&format!("笔记自检：窗口不可用 {e}"));
+            return;
+        }
+    };
+    let _ = window.hide();
+
+    // 第一步：拿一条新鲜的笔记 id+token（探索页第一张卡片），避免拿旧 token 得出假阴性
+    let target = if !custom_url.is_empty() {
+        xhs_core::login::debug_log("笔记自检：使用标记文件里指定的链接");
+        custom_url
+    } else {
+        if let Ok(parsed) = "https://www.xiaohongshu.com/explore".parse::<tauri::Url>() {
+            let _ = window.navigate(parsed);
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        let _ = window.eval(NOTE_SELFTEST_CARD_JS);
+        let card = read_selftest(&window).await.unwrap_or_default();
+        let mut parts = card.splitn(3, '~');
+        let kind = parts.next().unwrap_or("");
+        let id = parts.next().unwrap_or("").to_string();
+        let token = parts.next().unwrap_or("").to_string();
+        if kind != "CARD" || id.is_empty() || token.is_empty() {
+            xhs_core::login::debug_log(&format!(
+                "笔记自检：探索页没取到新卡片（{card}），自检终止"
+            ));
+            return;
+        }
+        xhs_core::login::debug_log(&format!("笔记自检：取到新卡片 id={id}"));
+        format!(
+            "https://www.xiaohongshu.com/explore/{id}?xsec_token={token}&xsec_source=pc_feed"
+        )
+    };
+
+    // 第二步：导航到笔记页，盯地址 11 秒——稳在笔记页 = 正常，被弹走 = 会话仍被风控
+    if let Ok(parsed) = target.parse::<tauri::Url>() {
+        let _ = window.navigate(parsed);
+    }
+    let note_prefix = "https://www.xiaohongshu.com/explore/".to_string();
+    let mut stable = 0u32;
+    let mut landed = String::new();
+    let mut bounced = false;
+    for _ in 0..16 {
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let live = window
+            .url()
+            .map(|u| u.to_string().split('#').next().unwrap_or("").to_string())
+            .unwrap_or_default();
+        if live.is_empty() {
+            continue;
+        }
+        if live.starts_with(&note_prefix) && live.len() > note_prefix.len() + 10 {
+            if landed.is_empty() {
+                xhs_core::login::debug_log("笔记自检：笔记页已打开，观察是否被弹走…");
+            }
+            landed = live;
+            stable += 1;
+            if stable >= 3 {
+                break;
+            }
+        } else if live.contains("/explore") || live.contains("/404") || live.contains("/login") {
+            landed = live;
+            bounced = true;
+            break;
+        }
+    }
+    let verdict = if bounced {
+        "会话仍被风控：笔记页刚打开就被弹走（这就是下载失败的原因，与链接/token 无关）。建议退出登录重新扫码，换一个新会话"
+    } else if stable >= 3 {
+        "会话正常：笔记页稳定打开没被弹走（现在可以下载了，先小批量试 3~5 条）"
+    } else if landed.is_empty() {
+        "结果不明：11 秒内没有任何落页（网络慢？再跑一次自检）"
+    } else {
+        "结果不明：没等到稳定落页也没被弹走（再跑一次自检确认）"
+    };
+    xhs_core::login::debug_log(&format!("笔记自检：结论 → {verdict}"));
+}
 
 /// 登录页自检：隐藏窗口打开官方登录页，探测「二维码状态 + 保活脚本是否生效」并写日志。
 /// 由数据目录里的 login_selftest 标记文件触发（平时不跑），用于远程诊断。
