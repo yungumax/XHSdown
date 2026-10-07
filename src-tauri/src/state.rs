@@ -223,6 +223,10 @@ pub struct AppState {
     pub note_block: Mutex<(std::time::Instant, u32)>,
     /// 上一次笔记取数的时间：批量下载按最小间隔降速（猛拉详情最容易触发风控）
     pub last_note_fetch: Mutex<Option<std::time::Instant>>,
+    /// WEB 窗口"用户最后在看的页面"（窗口可见时由状态轮询持续跟踪）。
+    /// 再点 WEB 时恢复它，而不是每次都跳回发现页；空串=本会话还没看过（去发现页）。
+    /// 只存内存：软件重启后第一次点 WEB 回发现页。
+    pub last_web_url: Mutex<String>,
     /// 登录窗刚打开时的浏览器 Cookie 指纹：轮询时先比指纹，
     /// 没变化就不去请求主页（省请求、也少触发风控）
     pub login_cookie_baseline: Mutex<Option<String>>,
@@ -280,6 +284,7 @@ impl AppState {
                 0,
             )),
             last_note_fetch: Mutex::new(None),
+            last_web_url: Mutex::new(String::new()),
             login_cookie_baseline: Mutex::new(None),
             last_login_check: Mutex::new(None),
             login_watch_running: AtomicBool::new(false),

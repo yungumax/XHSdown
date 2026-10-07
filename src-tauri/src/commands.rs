@@ -3981,7 +3981,10 @@ fn spawn_page_bar(app: tauri::AppHandle) {
 
 /// 地址栏状态：当前网页地址 + 窗口是否可见（主界面的网页工具栏据此显示）
 #[tauri::command]
-pub fn web_bar_state(app: tauri::AppHandle) -> Result<serde_json::Value, String> {
+pub fn web_bar_state(
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<serde_json::Value, String> {
     let window = app.get_webview_window("xhs-work");
     let visible = window
         .as_ref()
@@ -3991,6 +3994,11 @@ pub fn web_bar_state(app: tauri::AppHandle) -> Result<serde_json::Value, String>
         .and_then(|w| w.url().ok())
         .map(|u| u.to_string().split('#').next().unwrap_or("").to_string())
         .unwrap_or_default();
+    // 窗口可见时持续跟踪"用户最后在看的页面"：之后点 WEB 恢复的就是它。
+    // 取数/收起期间窗口不可见，不会把取数残留页误记成用户的页面
+    if visible && url.starts_with("http") {
+        *state.last_web_url.lock().unwrap() = url.clone();
+    }
     Ok(serde_json::json!({ "url": url, "visible": visible }))
 }
 
@@ -4064,18 +4072,31 @@ fn spawn_title_sync(app: tauri::AppHandle) {
 #[tauri::command]
 pub async fn open_web_home(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let settings = state.settings_snapshot();
+    // 窗口是不是这次调用新建的：新建才做尺寸/居中，别每次点 WEB 都把用户调好的窗口拍回去
+    let existed = app.get_webview_window("xhs-work").is_some();
     let window = ensure_work_window(&app, &settings).await?;
-    let login = state.login.read().unwrap().clone().unwrap_or_default();
-    let url = if login.logged_in && !login.mid.is_empty() {
-        format!("https://www.xiaohongshu.com/user/profile/{}", login.mid)
-    } else {
-        "https://www.xiaohongshu.com/explore".to_string()
-    };
-    let parsed: tauri::Url = url.parse().map_err(|e| format!("地址无效：{e}"))?;
-    window.navigate(parsed).map_err(err)?;
-    let _ = window.set_title("小红书（网页）");
-    let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(1000.0, 760.0)));
-    let _ = window.center();
+
+    // 去哪儿：本会话第一次点 WEB → 发现页；之后 → 恢复用户最后在看的页面
+    // （取数会把窗口导航走，恢复逻辑保证点 WEB 永远回到用户自己的页面）
+    let saved = state.last_web_url.lock().unwrap().clone();
+    let current = window
+        .url()
+        .map(|u| u.to_string().split('#').next().unwrap_or("").to_string())
+        .unwrap_or_default();
+    if saved.is_empty() || !current.starts_with("http") {
+        let parsed: tauri::Url = "https://www.xiaohongshu.com/explore"
+            .parse()
+            .map_err(|e| format!("地址无效：{e}"))?;
+        window.navigate(parsed).map_err(err)?;
+    } else if current != saved {
+        let parsed: tauri::Url = saved.parse().map_err(|e| format!("地址无效：{e}"))?;
+        window.navigate(parsed).map_err(err)?;
+    }
+    if !existed {
+        let _ = window.set_title("小红书（网页）");
+        let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(1000.0, 760.0)));
+        let _ = window.center();
+    }
     let _ = window.show();
     let _ = window.set_focus();
     // 显示期间把当前地址同步到窗口标题（后端定时器，不受界面降频影响）
