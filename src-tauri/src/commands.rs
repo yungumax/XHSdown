@@ -3813,6 +3813,25 @@ const PAGE_BAR_JS: &str = r#"(function () {
         var hl = document.getElementById('xhsdown-handle-label');
         if (hl) hl.textContent = '收集中 ' + c + (t > c ? '/' + t : '') + ' 条';
       };
+      // 页内通知横幅：收集完成/缺口说明直接显示在网页里（用户盯着的是这个窗口，
+      // 别让他们切回主窗口才能看到结论）。底部居中，不遮内容，9 秒自动消失
+      window.__xhsdownNotify = function (text) {
+        try {
+          var note = document.getElementById('xhsdown-note');
+          if (!note) {
+            note = document.createElement('div');
+            note.id = 'xhsdown-note';
+            note.style.cssText = 'position:fixed;left:50%;bottom:44px;transform:translateX(-50%);max-width:72%;z-index:' + (Z + 1) + ';padding:9px 14px;background:#17181a;color:#e8e9ea;border:1px solid #ff2442;border-radius:8px;font:12px/1.6 "Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;box-shadow:0 4px 16px rgba(0,0,0,.4);display:none;';
+            (document.documentElement || document.body).appendChild(note);
+          }
+          note.textContent = text;
+          note.style.display = 'block';
+          if (window.__xhsdownNoteTimer) clearTimeout(window.__xhsdownNoteTimer);
+          window.__xhsdownNoteTimer = setTimeout(function () {
+            note.style.display = 'none';
+          }, 9000);
+        } catch (e) {}
+      };
       // 停止时的对账诊断：页面状态里的原始条目数 / 按 id 去重数 / 自报总数（posted）。
       // 三个数一对比，"总数虚报 / 置顶重复占位 / 尾部没加载完"一眼可辨
       window.__xhsdownDiag = function () {
@@ -4026,12 +4045,54 @@ fn spawn_page_bar(app: tauri::AppHandle) {
         let clear_hash = |window: &tauri::WebviewWindow| {
             let _ = window.eval("history.replaceState(null,'',location.pathname+location.search)");
         };
+        // 完成提示措辞**唯一出处**：主窗口 toast 与网页内横幅共用这一份（防止两处漂移）
+        fn collect_done_message(
+            collected: usize,
+            total: u32,
+            state_uniq: u32,
+            logged_in: bool,
+        ) -> String {
+            if total > 0 && collected >= total as usize {
+                return format!("网页收集完成：{collected} 条，已收全（主页共 {total} 条）");
+            }
+            if total > collected as u32 {
+                let gap = total as usize - collected;
+                let hint = if state_uniq > 0 && state_uniq as usize <= collected {
+                    format!(
+                        "网页信息流只放出了 {collected} 条（其余 {gap} 条站点未下发，多为仅自己可见/审核中）——网页端拿不全，可在 App 里分享单条链接下载"
+                    )
+                } else if logged_in {
+                    "最后一批可能还没滚出来，再收一次常能补上；或个别笔记已删除/仅自己可见".to_string()
+                } else {
+                    "未登录时小红书会拦住后续笔记，登录后再收集即可拿全".to_string()
+                };
+                return format!("网页收集完成：{collected} 条，主页共 {total} 条，还差 {gap} 条（{hint}）");
+            }
+            format!("网页收集完成：{collected} 条，已送入解析结果")
+        }
+
         let emit_done = |app: &tauri::AppHandle, collected: &[PostEntry], auto: bool, total: u32, state_uniq: u32| {
             if collected.is_empty() {
                 xhs_core::login::debug_log("网页收集：没有收集到内容");
+                // 网页里也给一句反馈（用户点了解析却没动静会很困惑）
+                if let Some(window) = app.get_webview_window("xhs-work") {
+                    let _ = window.eval(
+                        "(function(){if(window.__xhsdownNotify)window.__xhsdownNotify('网页收集：本页没有收集到内容（要先打开一个主页/搜索页再收集）');})()",
+                    );
+                }
                 return;
             }
             // 有总数就说得明白：到底收够了没有（用户看到"停在 N 条"时最需要这个答案）
+            let logged_in = app
+                .state::<crate::state::AppState>()
+                .login
+                .read()
+                .unwrap()
+                .clone()
+                .unwrap_or_default()
+                .logged_in;
+            let message =
+                collect_done_message(collected.len(), total, state_uniq, logged_in);
             let hint = if total == 0 {
                 String::new()
             } else if total as usize <= collected.len() {
@@ -4048,9 +4109,16 @@ fn spawn_page_bar(app: tauri::AppHandle) {
                 collected.len(),
                 auto_hint = if auto { "（自动判定到底）" } else { "" }
             ));
+            // 同一句话两处显示：主窗口 toast（事件带 message）+ 网页内横幅
+            let escaped = message.replace('\\', "\\\\").replace('\'', "\\'");
+            if let Some(window) = app.get_webview_window("xhs-work") {
+                let _ = window.eval(&format!(
+                    "(function(){{if(window.__xhsdownNotify)window.__xhsdownNotify('{escaped}');}})()"
+                ));
+            }
             let _ = app.emit(
                 "collect://done",
-                serde_json::json!({ "items": collected, "auto": auto, "total": total, "state_uniq": state_uniq }),
+                serde_json::json!({ "items": collected, "auto": auto, "total": total, "state_uniq": state_uniq, "message": message }),
             );
         };
 
