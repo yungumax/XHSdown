@@ -3659,9 +3659,10 @@ const PAGE_BAR_JS: &str = r#"(function () {
         bar.style.transform = want;
       }
     }
-    // 收起药丸只在地址栏收起时出现：展开后它就是多余的（按钮都在栏里）
+    // 药丸**常驻**：它现在是状态显示器（总数/收集进度/结果），地址栏展开与否都在。
+    // 地址栏收起时它兼任"展开把手"（点一下/移上去展开）
     var handle = document.getElementById('xhsdown-handle');
-    if (handle) handle.style.display = isOpen() ? 'none' : 'flex';
+    if (handle) handle.style.display = 'flex';
   };
   var setOpen = function (next) {
     markPinned(next);
@@ -3678,7 +3679,7 @@ const PAGE_BAR_JS: &str = r#"(function () {
       handle = document.createElement('div');
       handle.id = 'xhsdown-handle';
       handle.dataset.pinned = '0';
-      handle.title = '地址栏收起中：移上去或点一下展开；收集时这里实时显示进度';
+      handle.title = '状态显示器：主页总数 / 收集进度 / 收集结果。地址栏收起时移上去或点一下展开';
       handle.style.cssText = 'position:fixed;left:8px;bottom:10px;z-index:' + Z + ';display:flex;align-items:center;gap:5px;height:24px;padding:0 10px;background:#ff2442;color:#fff;border-radius:999px;font:11px/1 "Microsoft YaHei UI","Microsoft YaHei",system-ui,sans-serif;cursor:pointer;opacity:.85;box-shadow:0 2px 8px rgba(0,0,0,.28);transition:opacity .15s;';
       var caret = document.createElement('span');
       caret.textContent = '⌃';
@@ -3692,7 +3693,11 @@ const PAGE_BAR_JS: &str = r#"(function () {
         handle.style.opacity = '1';
         setOpen(true);
       };
-      handle.onclick = function () { setOpen(true); };
+      handle.onmouseleave = function () { handle.style.opacity = '.85'; };
+      handle.onclick = function () {
+        // 已展开时点它没有副作用（展开是 hover 触发的，点一下别把栏又收回去）
+        if (!isOpen()) setOpen(true);
+      };
       (document.documentElement || document.body).appendChild(handle);
     }
     if (!bar) {
