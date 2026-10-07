@@ -3585,8 +3585,14 @@ pub async fn web_login_open(app: tauri::AppHandle, state: State<'_, AppState>) -
 /// 后端在开始/停止/自动停止/重新注入时调用，让按钮与真实收集状态一致）
 const COLLECT_SYNC_ON: &str =
     "(function(){if(window.__xhsdownCollectSync)window.__xhsdownCollectSync(1);})()";
-const COLLECT_SYNC_OFF: &str =
-    "(function(){if(window.__xhsdownCollectSync)window.__xhsdownCollectSync(0);})()";
+
+/// 结束收集：药丸**保留结果**而不是归零——收集几十秒就到底，
+/// 用户收起地址栏再看时已结束，归零就永远看不到进度（实测踩过）
+fn collect_sync_off(count: usize) -> String {
+    format!(
+        "(function(){{if(window.__xhsdownCollectSync)window.__xhsdownCollectSync(0,'已收 {count} 条');}})()"
+    )
+}
 
 /// 注入到网页里的浮动地址栏（后退/前进/刷新/地址/收集开关/收起）。
 /// 为什么用注入而不是窗口内嵌工具条：Tauri 的 add_child 需要 unstable 特性，
@@ -3720,8 +3726,10 @@ const PAGE_BAR_JS: &str = r#"(function () {
         }
       });
       bar.appendChild(input);
-      // 收集开关的全局同步口：后端在停止/自动停止/重新注入时调用它保持按钮与真实状态一致
-      window.__xhsdownCollectSync = function (on) {
+      // 收集开关的全局同步口：后端在停止/自动停止/重新注入时调用它保持按钮与真实状态一致。
+      // 结束时带上条数：药丸**保留结果**（「已收 357 条」）而不是归零——
+      // 收集几十秒就到底了，用户收起地址栏再看时如果归零，就永远看不到进度（实测踩过）
+      window.__xhsdownCollectSync = function (on, label) {
         window.__xhsdownCollecting = !!on;
         var b = document.getElementById('xhsdown-collect');
         if (b) {
@@ -3731,7 +3739,7 @@ const PAGE_BAR_JS: &str = r#"(function () {
           b.style.borderColor = on ? '#8a2530' : '#ff2442';
         }
         var hl = document.getElementById('xhsdown-handle-label');
-        if (hl && !on) hl.textContent = '解析';
+        if (hl && !on) hl.textContent = label || '完成 ' + (window.__xhsdownLastN || 0) + ' 条';
       };
       // 收集开关：一个按钮两个状态（开始解析 ⇄ 完成解析）。
       // 按自己的 data-on 切换发信号；后端在停止/自动停止/重新注入时会改写它保持同步
@@ -3859,7 +3867,9 @@ const PAGE_BAR_JS: &str = r#"(function () {
           else if (total > 0) count.textContent = '已收全 ' + n + ' 条';
           else count.textContent = '已加载 ' + n + ' 条';
         }
-        // 收起药丸的实时进度：收集期间「收集中 62/83 条」，把地址栏收起也能盯进度
+        // 收起药丸的实时进度：收集期间「收集中 62/83 条」，把地址栏收起也能盯进度；
+        // 顺手记下最新条数，结束时按钮/后端用它显示结果
+        window.__xhsdownLastN = n;
         var hl = document.getElementById('xhsdown-handle-label');
         if (hl && window.__xhsdownCollecting) {
           hl.textContent =
@@ -3978,7 +3988,7 @@ fn spawn_page_bar(app: tauri::AppHandle) {
                         let _ = app.emit("collect://update", serde_json::json!({ "count": 0 }));
                     } else if value == "stop" {
                         collecting = false;
-                        let _ = window.eval(COLLECT_SYNC_OFF);
+                        let _ = window.eval(collect_sync_off(collected.len()));
                         // 手动点「完成解析」：顺手把页面读一遍拿总数，好告诉用户收够了没有
                         let total = {
                             let _ = window.eval(
@@ -4021,7 +4031,7 @@ fn spawn_page_bar(app: tauri::AppHandle) {
                     total = parse_total(tail.split("|||").next().unwrap_or(""));
                 }
                 let _ = window.eval("history.replaceState(null,'',location.pathname+location.search)");
-                let _ = window.eval(COLLECT_SYNC_OFF);
+                let _ = window.eval(collect_sync_off(collected.len()));
                 emit_done(&app, &collected, true, total);
                 continue;
             }
