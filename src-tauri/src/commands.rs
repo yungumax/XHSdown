@@ -75,52 +75,67 @@ pub async fn app_status(
     warmup_once(&state).await;
     let settings = state.settings_snapshot();
 
-    // 登录态：让浏览器读一次「我的主页」——登录态存在浏览器数据目录里，所以跨重启也能恢复。
-    // 「读失败」（超时/风控/窗口被隐藏）跟「确认未登录」是两回事，混淆过一次：
-    // 界面显示"未登录"害用户以为掉线、又去别处登录，把会话互相顶掉。所以失败要重试一次，
-    // 仍失败就沿用内存里上一次的登录态，不把"没读成"当成"未登录"。
-    let mut login = LoginInfo::default();
-    let mut last_err: Option<String> = None;
-    for attempt in 0..2 {
-        if attempt > 0 {
+    // 登录态检测改为**后台延迟**执行。旧逻辑在启动路径上同步等 40~80 秒，期间：
+    // 1) 界面一直"未登录"；2) 它导航 xhs-work 窗口去 /me，用户此时点 WEB 就会
+    // 互相抢窗口（实测：检测把用户正看的页面抢走、自己也被迫失败）。
+    // 现在：启动立即返回（用内存缓存），检测在后台跑——窗口正被用户看着就让路，
+    // 等它收起再测；结果出来后刷新 state.login 并推 login://confirmed 给界面。
+    let login = state.login.read().unwrap().clone().unwrap_or_default();
+    {
+        let app2 = app.clone();
+        tokio::spawn(async move {
+            // 等启动首屏稳住再开始
             tokio::time::sleep(Duration::from_secs(3)).await;
-        }
-        // 每次给足 40 秒：页面加载慢时（风控/网络）也能等到结果，不要提前放弃
-        match tokio::time::timeout(Duration::from_secs(40), browser_login_check(&app)).await {
-            Ok(Ok(Some((uid, name, avatar)))) => {
-                let client = state.client();
-                login = LoginInfo {
-                    logged_in: true,
-                    uname: name,
-                    face: inline_avatar(&client, &avatar).await,
-                    mid: uid,
-                    ..Default::default()
-                };
-                *state.login.write().unwrap() = Some(login.clone());
-                xhs_core::login::debug_log("启动恢复登录：已登录");
-                last_err = None;
-                break;
+            let mut attempts = 0u32;
+            loop {
+                if attempts >= 4 {
+                    xhs_core::login::debug_log("启动恢复登录：多次读取失败，本轮放弃（下次启动再测）");
+                    break;
+                }
+                // 用户正看着网页窗口就让路：等它收起再测（不计入尝试次数）
+                if let Some(w) = app2.get_webview_window("xhs-work") {
+                    if w.is_visible().unwrap_or(false) {
+                        tokio::time::sleep(Duration::from_secs(2)).await;
+                        continue;
+                    }
+                }
+                attempts += 1;
+                let state = app2.state::<crate::state::AppState>();
+                match tokio::time::timeout(Duration::from_secs(40), browser_login_check(&app2)).await {
+                    Ok(Ok(Some((uid, name, avatar)))) => {
+                        match finish_login(&app2, &state, uid, name, avatar).await {
+                            Ok(info) => {
+                                let _ = app2.emit("login://confirmed", info);
+                                xhs_core::login::debug_log("启动恢复登录：已登录");
+                            }
+                            Err(e) => xhs_core::login::debug_log(&format!("启动恢复登录：收尾失败 {e}")),
+                        }
+                        break;
+                    }
+                    Ok(Ok(None)) => {
+                        // 确认未登录：清掉内存里的旧态（界面默认就是未登录，不用推事件）
+                        *state.login.write().unwrap() = None;
+                        xhs_core::login::debug_log("启动恢复登录：未登录");
+                        break;
+                    }
+                    Ok(Err(e)) => {
+                        // 读失败 ≠ 未登录（网络慢/风控）：重试，不清登录态
+                        xhs_core::login::debug_log(&format!(
+                            "启动恢复登录：读取失败（第 {} 次）：{e}",
+                            attempts
+                        ));
+                        tokio::time::sleep(Duration::from_secs(4)).await;
+                    }
+                    Err(_) => {
+                        xhs_core::login::debug_log(&format!(
+                            "启动恢复登录：检测超时（第 {} 次）",
+                            attempts
+                        ));
+                        tokio::time::sleep(Duration::from_secs(4)).await;
+                    }
+                }
             }
-            Ok(Ok(None)) => {
-                xhs_core::login::debug_log("启动恢复登录：未登录");
-                last_err = None;
-                break;
-            }
-            Ok(Err(e)) => {
-                xhs_core::login::debug_log(&format!("启动恢复登录：读取失败（第 {} 次）：{e}", attempt + 1));
-                last_err = Some(e);
-            }
-            Err(_) => {
-                xhs_core::login::debug_log(&format!("启动恢复登录：检测超时（第 {} 次）", attempt + 1));
-                last_err = Some("检测超时".into());
-            }
-        }
-    }
-    if let Some(err) = last_err {
-        if let Some(cached) = state.login.read().unwrap().clone() {
-            login = cached;
-            xhs_core::login::debug_log(&format!("启动恢复登录：{err}，沿用上次登录态"));
-        }
+        });
     }
 
     // 自检开关：数据目录里放一个 login_selftest 文件 → 启动后自动探一次登录页
@@ -1761,6 +1776,11 @@ async fn webview_fetch_inner(
     // 取数前窗口是否可见要记下来：隐藏窗口的渲染与定时器会被 WebView2 挂起/节流
     // （见 lib.rs 的启动参数），日志里有这条信息才能一眼分辨"取数失败"是不是窗口被挂起
     let was_visible = window.is_visible().unwrap_or(false);
+    if allow_login_window && was_visible {
+        // 登录检测让路：窗口正被用户看着（在浏览/登录页在前面），把它导航去 /me
+        // 等于当面抢走用户的页面，检测自己也会跟着失败（实测：启动检测与 WEB 点击打架）
+        return Err("网页窗口正被使用，登录检测稍后再试".into());
+    }
     // 用户正在看这个网页窗口时先收起：取数要导航，别当面把人家页面翻走
     if !allow_login_window && was_visible {
         let _ = window.hide();
@@ -3995,8 +4015,14 @@ pub fn web_bar_state(
         .map(|u| u.to_string().split('#').next().unwrap_or("").to_string())
         .unwrap_or_default();
     // 窗口可见时持续跟踪"用户最后在看的页面"：之后点 WEB 恢复的就是它。
-    // 取数/收起期间窗口不可见，不会把取数残留页误记成用户的页面
-    if visible && url.starts_with("http") {
+    // 取数/收起期间窗口不可见，不会把取数残留页误记成用户的页面；
+    // /me、登录页、404 也不是用户自己浏览的页面（登录检测/风控落的），同样不记
+    let user_browsing = visible
+        && url.starts_with("http")
+        && !url.contains("/user/profile/me")
+        && !url.contains("/login")
+        && !url.contains("/404");
+    if user_browsing {
         *state.last_web_url.lock().unwrap() = url.clone();
     }
     Ok(serde_json::json!({ "url": url, "visible": visible }))
@@ -4072,6 +4098,9 @@ fn spawn_title_sync(app: tauri::AppHandle) {
 #[tauri::command]
 pub async fn open_web_home(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let settings = state.settings_snapshot();
+    // 等正在进行的取数/登录检测完成再动窗口：它们的导航被打断会双双失败
+    // （锁在函数结束前释放——浏览本身不该持锁，也不该阻塞后续下载）
+    let _fetch_guard = state.fetch_lock.lock().await;
     // 窗口是不是这次调用新建的：新建才做尺寸/居中，别每次点 WEB 都把用户调好的窗口拍回去
     let existed = app.get_webview_window("xhs-work").is_some();
     let window = ensure_work_window(&app, &settings).await?;
