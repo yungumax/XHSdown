@@ -3586,11 +3586,12 @@ pub async fn web_login_open(app: tauri::AppHandle, state: State<'_, AppState>) -
 const COLLECT_SYNC_ON: &str =
     "(function(){if(window.__xhsdownCollectSync)window.__xhsdownCollectSync(1);})()";
 
-/// 结束收集：药丸**保留结果**而不是归零——收集几十秒就到底，
-/// 用户收起地址栏再看时已结束，归零就永远看不到进度（实测踩过）
+/// 结束收集：药丸与栏内计数**保留结果**而不是归零——收集几十秒就到底，
+/// 用户收起地址栏再看时已结束，归零就永远看不到进度（实测踩过）。
+/// 数字用后端去重清单的长度（与最终送进软件的条数同源）
 fn collect_sync_off(count: usize) -> String {
     format!(
-        "(function(){{if(window.__xhsdownCollectSync)window.__xhsdownCollectSync(0,'已收 {count} 条');}})()"
+        "(function(){{if(window.__xhsdownCollectSync)window.__xhsdownCollectSync(0,'已收 {count} 条');var b=document.getElementById('xhsdown-count');if(b)b.textContent='已收 {count} 条';}})()"
     )
 }
 
@@ -3751,6 +3752,21 @@ const PAGE_BAR_JS: &str = r#"(function () {
         var hl = document.getElementById('xhsdown-handle-label');
         if (hl && !on) hl.textContent = window.__xhsdownDoneLabel;
       };
+      // 收集进行中的进度**唯一写入口**（后端每轮合并后调用）：条数用后端去重清单的长度，
+      // 不用页面状态数出来的——两个来源可能差一两条，"不能有偏差"就必须单源
+      window.__xhsdownProgress = function (count) {
+        window.__xhsdownCollecting = true;
+        var c = Number(count) || 0;
+        var t = totalCards();
+        var bar = document.getElementById('xhsdown-count');
+        if (bar) {
+          bar.textContent = t > c
+            ? '已加载 ' + c + ' / 共 ' + t + ' 条'
+            : (t > 0 ? '已收全 ' + c + ' 条' : '已加载 ' + c + ' 条');
+        }
+        var hl = document.getElementById('xhsdown-handle-label');
+        if (hl) hl.textContent = '收集中 ' + c + (t > c ? '/' + t : '') + ' 条';
+      };
       // 收集开关：一个按钮两个状态（开始解析 ⇄ 完成解析）。
       // 按自己的 data-on 切换发信号；后端在停止/自动停止/重新注入时会改写它保持同步
       var collect = document.createElement('button');
@@ -3868,6 +3884,12 @@ const PAGE_BAR_JS: &str = r#"(function () {
         if (input && document.activeElement !== input) {
           input.value = location.href.split('#')[0];
         }
+        // 收集进行中/已出结果：计数由后端（去重清单，权威）通过 __xhsdownProgress /
+        // __xhsdownCollectSync 独家写入，定时器不碰——两个来源会差一两条，必须单源。
+        // 定时器只负责"解析前"的展示（已加载 N / 共 M 条 + 药丸的总数/默认态）
+        if (window.__xhsdownCollecting || window.__xhsdownDoneLabel) {
+          return;
+        }
         var n = countCards();
         var total = totalCards();
         var count = document.getElementById('xhsdown-count');
@@ -3878,17 +3900,11 @@ const PAGE_BAR_JS: &str = r#"(function () {
           else if (total > 0) count.textContent = '已收全 ' + n + ' 条';
           else count.textContent = '已加载 ' + n + ' 条';
         }
-        // 收起药丸的四态：解析前亮总数（主页自报发布数，不用等解析）→ 收集中实时进度
-        // → 结束后保留结果。优先级：收集 > 结果 > 总数 > 默认
+        // 药丸：解析前亮总数（主页自报发布数，不用等解析）；非主页显示默认
         window.__xhsdownLastN = n;
         var hl = document.getElementById('xhsdown-handle-label');
         if (hl) {
-          if (window.__xhsdownCollecting) {
-            hl.textContent =
-              n > 0 ? '收集中 ' + n + (total > n ? '/' + total : '') + ' 条' : '收集中…';
-          } else if (window.__xhsdownDoneLabel) {
-            hl.textContent = window.__xhsdownDoneLabel;
-          } else if (total > 0) {
+          if (total > 0) {
             hl.textContent = '共 ' + total + ' 条';
           } else {
             hl.textContent = '解析';
@@ -4004,6 +4020,9 @@ fn spawn_page_bar(app: tauri::AppHandle) {
                             "window.__xhsdownUserN=0;window.__xhsdownFeedN=0;window.__xhsdownSearchN=0;",
                         );
                         let _ = window.eval(COLLECT_SYNC_ON);
+                        let _ = window.eval(
+                            "(function(){if(window.__xhsdownProgress)window.__xhsdownProgress(0);})()",
+                        );
                         xhs_core::login::debug_log("网页收集：开始（可见模式，边滚边收集）");
                         let _ = app.emit("collect://update", serde_json::json!({ "count": 0 }));
                     } else if value == "stop" {
@@ -4071,6 +4090,12 @@ fn spawn_page_bar(app: tauri::AppHandle) {
                     }
                     if collected.len() > before {
                         stale = 0;
+                        // 进度唯一写入口：以后端去重清单为准（与最终送进软件的条数同源，
+                        // 页面状态数出来的数可能差一两条——"不能有偏差"就必须单源）
+                        let _ = window.eval(&format!(
+                            "(function(){{if(window.__xhsdownProgress)window.__xhsdownProgress({});}})()",
+                            collected.len()
+                        ));
                         let _ = app.emit(
                             "collect://update",
                             serde_json::json!({ "count": collected.len() }),
