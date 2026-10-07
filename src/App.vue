@@ -150,8 +150,8 @@ onMounted(async () => {
   });
 
   // WEB 地址栏的「解析」按钮：把当前地址送到解析页
-  unlistenFromWeb = await api.onWebToParse((url) => {
-    if (url) openSource(url);
+  unlistenFromWeb = await api.onWebToParse((url, fill) => {
+    if (url) openSource(url, !fill);
   });
 
   // 网页内收集：进度与完成
@@ -227,8 +227,8 @@ async function finishOnboarding(payload) {
 /** 内容库点「去解析」时带过来的来源：设置后切到解析页，那边看到就自动解析 */
 const pendingSource = ref(null);
 
-function openSource(url) {
-  pendingSource.value = { url, stamp: Date.now() };
+function openSource(url, autoParse = true) {
+  pendingSource.value = { url, stamp: Date.now(), autoParse };
   page.value = "parse";
 }
 

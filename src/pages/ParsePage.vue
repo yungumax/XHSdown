@@ -155,10 +155,20 @@ watch(
   async (stamp) => {
     const url = props.pendingSource?.url;
     if (!stamp || !url) return;
-    text.value = url;
+    const auto = props.pendingSource?.autoParse !== false;
+    if (auto) {
+      text.value = url;
+    } else {
+      // 复制模式：**追加**而不是覆盖——用户可能在攒一批链接
+      const existing = text.value.trim();
+      const lines = existing ? existing.split("\n") : [];
+      if (!lines.includes(url)) lines.push(url);
+      text.value = lines.join("\n");
+      emit("toast", "已把网页地址复制到解析栏");
+    }
     view.value = "input";
     await nextTick();
-    if (!parsing.value) await parse();
+    if (auto && !parsing.value) await parse();
   }
 );
 

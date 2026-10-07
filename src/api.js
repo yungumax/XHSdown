@@ -263,7 +263,9 @@ export async function onCollectDone(handler) {
 /** WEB 地址栏点「解析」：把当前网页地址送到解析页 */
 export async function onWebToParse(handler) {
   if (!hasTauri) return () => {};
-  return listen("web://to-parse", (event) => handler(event.payload?.url || ""));
+  return listen("web://to-parse", (event) =>
+    handler(String(event.payload?.url || ""), !!event.payload?.fill),
+  );
 }
 
 /** 打开网页窗口：登录了就开当前账号主页，没登录就开推荐流 */

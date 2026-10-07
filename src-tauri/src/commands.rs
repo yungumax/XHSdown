@@ -3802,6 +3802,16 @@ const PAGE_BAR_JS: &str = r#"(function () {
         }
       });
       bar.appendChild(input);
+      // 复制：把当前地址直接送进软件的解析栏（追加，不自动解析）——
+      // 浏览时看到想下的单条，一键攒进解析列表
+      btn('复制', '把当前地址复制到软件的解析栏（不自动解析）', function () {
+        var u = input.value.trim();
+        if (u.indexOf('http') !== 0) u = location.href.split('#')[0];
+        try {
+          history.replaceState(null, '', '#xhsdownparse=' + encodeURIComponent(u) + '&fill=1');
+        } catch (e) {}
+        try { navigator.clipboard.writeText(u); } catch (e) {}
+      });
       // 收集开关的全局同步口：后端在停止/自动停止/重新注入时调用它保持按钮与真实状态一致。
       // 结束时带上条数：药丸**保留结果**（「已收 357 条」）而不是归零——
       // 收集几十秒就到底了，用户收起地址栏再看时如果归零，就永远看不到进度（实测踩过）
@@ -4252,12 +4262,21 @@ fn spawn_page_bar(app: tauri::AppHandle) {
                     }
                 } else if let Some(idx) = text.find("xhsdownparse=") {
                     let rest = &text[idx + "xhsdownparse=".len()..];
-                    let payload = rest.split('&').next().unwrap_or("");
+                    let mut parts = rest.splitn(2, '&');
+                    let payload = parts.next().unwrap_or("");
+                    let params = parts.next().unwrap_or("");
                     let target = percent_decode(payload);
+                    // fill=1 = 只复制进解析栏（不自动解析）；缺省 = 旧的"送解析"行为
+                    let fill = params.contains("fill=1");
                     clear_hash(&window);
                     if !target.is_empty() {
-                        xhs_core::login::debug_log(&format!("网页地址栏送解析：{target}"));
-                        let _ = app.emit("web://to-parse", serde_json::json!({ "url": target }));
+                        xhs_core::login::debug_log(&format!(
+                            "网页地址栏送解析栏：{target}（fill={fill}）"
+                        ));
+                        let _ = app.emit(
+                            "web://to-parse",
+                            serde_json::json!({ "url": target, "fill": fill }),
+                        );
                     }
                 }
             }
