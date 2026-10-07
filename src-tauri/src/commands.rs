@@ -1547,6 +1547,7 @@ const EXTRACT_JS: &str = r#"(function () {
           var meta = unwrap(it.videoMeta) || {};
           pool.push({
             url: murl,
+            width: Number(unwrap(it.width)) || Number(unwrap(meta.width)) || 0,
             height: Number(unwrap(it.height)) || Number(unwrap(meta.height)) || 0,
             duration: Number(unwrap(it.videoDuration)) || Number(unwrap(meta.duration)) || 0,
             bitrate: Number(unwrap(it.videoBitrate)) || 0,
@@ -1555,7 +1556,7 @@ const EXTRACT_JS: &str = r#"(function () {
       }
       pool.sort(function (a, b) { return b.bitrate - a.bitrate; });
       for (var v = 0; v < pool.length; v++) {
-        videos.push({ url: pool[v].url, height: pool[v].height, duration: pool[v].duration });
+        videos.push({ url: pool[v].url, width: pool[v].width, height: pool[v].height, duration: pool[v].duration });
       }
       var nu = unwrap(note.user) || {};
       report({
@@ -2184,12 +2185,41 @@ impl NoteBundle {
                 else {
                     continue;
                 };
+                let width = item.get("width").and_then(|v| v.as_u64()).unwrap_or(0);
                 let height = item.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
-                videos.push((height_label(height), https(url)));
+                // 清晰度分级按**短边**算：竖屏视频站点上报的 height 是长边
+                // （720×1104 的竖屏视频 height=1104，按它标就成了"1080P"，
+                //  实际横宽只有 720——用户按 720P 理解，实测被当 bug 报过）
+                videos.push((height_label(quality_class(width, height)), https(url)));
             }
         }
         videos.sort_by(|a, b| height_rank(&b.0).cmp(&height_rank(&a.0)));
         videos.dedup_by(|a, b| a.1 == b.1);
+        {
+            // 留一份流规格对账：标注与实际文件不符时日志可查
+            let dims: Vec<String> = value
+                .get("videos")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|item| {
+                            format!(
+                                "{}x{}",
+                                item.get("width").and_then(|v| v.as_u64()).unwrap_or(0),
+                                item.get("height").and_then(|v| v.as_u64()).unwrap_or(0)
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if !dims.is_empty() {
+                xhs_core::login::debug_log(&format!(
+                    "视频流规格：{} → 标注 {}",
+                    dims.join(", "),
+                    videos.iter().map(|(l, _)| l.as_str()).collect::<Vec<_>>().join("/")
+                ));
+            }
+        }
         let duration = value
             .get("videos")
             .and_then(|v| v.as_array())
@@ -2563,6 +2593,16 @@ fn https(url: &str) -> String {
 }
 
 /// 视频高度 → 档位标签
+/// 清晰度分级维度：按**短边**算（横屏 1920×1080 → 1080；竖屏 720×1104 → 720）。
+/// 站点对竖屏视频的 height 字段给的是长边，直接用会虚标一档（实测 720P 被标成 1080P）
+fn quality_class(width: u64, height: u64) -> u64 {
+    if width > 0 && height > 0 {
+        width.min(height)
+    } else {
+        width.max(height)
+    }
+}
+
 fn height_label(height: u64) -> String {
     if height >= 1080 {
         "1080P".into()
@@ -5380,6 +5420,17 @@ mod tests {
     }
 
     /// 扩展名要从 CDN 的 `!规格` 里认（路径上没有扩展名）
+    #[test]
+    fn quality_class_uses_short_side() {
+        // 竖屏 720×1104：站点 height 给长边，直接用会虚标 1080P（实测被用户抓包）
+        assert_eq!(quality_class(720, 1104), 720);
+        // 横屏 1920×1080 → 1080
+        assert_eq!(quality_class(1920, 1080), 1080);
+        // 缺一边时用已知的那边
+        assert_eq!(quality_class(0, 1104), 1104);
+        assert_eq!(quality_class(720, 0), 720);
+    }
+
     #[test]
     fn url_ext_reads_cdn_variant_format() {
         assert_eq!(
