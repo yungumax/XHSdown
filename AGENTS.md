@@ -66,6 +66,13 @@
   逐个试开+新鲜 token 对照（分辨「链接形态」vs「token 绑定」vs「会话风控」）；
   内容为 `injecttest`=回传通道对比实验。结论全部写进 `xhs_debug.log`——
   远程排查下载失败先用它，别让用户当测试员。
+- **图片规格（实测，2026-10）**：笔记详情图站点只放出两个变体，**分辨率相同、只有压缩质量差别**：
+  `WB_DFT`（`!nd_dft_wlteh_webp_3`，原图，1080 宽如 1080x1440）与 `WB_PRV`（`!nd_prv_wlteh_webp_3`，
+  同 1080 宽高压缩，实测同图 84KB vs 18KB）。1080 宽即网页端图片上限，**没有更高档可加**。
+  推荐流卡片封面是 640 宽（只用于浏览，不下载）；视频笔记首图是 643x857 海报档。
+  **网传"取原图"技巧全部已失效（实测全 403）**：换域名（sns-img-hw / sns-img-bd /
+  ci.xiaohongshu.com）、剥掉 `!` 后缀、换规则后缀（jpg/png/webp_1/_0）、`imageView2/2/w/0`
+  ——签名绑定完整路径与后缀，**只有页面自己给出的签字 URL 能下**，别再试了。
 - **数据在 `__INITIAL_STATE__`**：笔记详情在 `noteDetailMap[id].note`；
   用户主页在 `user.userPageData` + `user.notes[]`。里面的裸 `undefined` 不是合法 JSON，
   必须替换成 null（替换串写 `${1}null`，`$1null` 会被正则当组名——踩过）。
