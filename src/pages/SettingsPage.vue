@@ -156,16 +156,19 @@ function beginDraft() {
 }
 beginDraft();
 
-// 媒体页的两个单值下拉
+// 媒体页的两个单值下拉：选项说明直接写在标签里（下拉栏内一眼看清，不占字段下方的版面）
 const IMAGE_FORMATS = [
-  { value: "large", label: "原图（最佳画质）" },
-  { value: "thumbnail", label: "压缩图（体积小）" },
+  { value: "large", label: "原图（站点最大规格，约 1~3 MB/张）" },
+  { value: "thumbnail", label: "压缩图（省空间，约原图 1/4）" },
 ];
 
 const VIDEO_QUALITIES = [
-  { value: "auto", label: "最佳可用" },
-  { value: "hd", label: "高清" },
-  { value: "sd", label: "标清" },
+  { value: "auto", label: "最佳可用（分辨率与码率都最高）" },
+  { value: "2160p", label: "2160P（4K，单条可达 70 MB）" },
+  { value: "1440p", label: "1440P（2K）" },
+  { value: "1080p", label: "1080P（多数视频的最高档）" },
+  { value: "720p", label: "720P（体积适中）" },
+  { value: "480p", label: "480P（最小，省流量）" },
 ];
 
 const AUDIO_QUALITIES = [
@@ -576,20 +579,12 @@ async function cleanup(kind) {
                 <select v-model.number="draft.max_concurrent_tasks">
                   <option v-for="n in CONCURRENCY" :key="n" :value="n">{{ n }}</option>
                 </select>
-                <p class="note">
-                  同时进行的下载数量。调大可提升总速度，但并发太高更容易触发站点限流，
-                  建议维持 2~3。
-                </p>
               </div>
               <div class="field">
                 <label>失败自动重试次数</label>
                 <select v-model.number="draft.retry_count">
                   <option v-for="n in RETRIES" :key="n" :value="n">{{ n }}</option>
                 </select>
-                <p class="note">
-                  单条任务失败后自动重试的次数（网络抖动、临时限流时能自愈）；
-                  重试间隔会自动翻倍，不会猛敲站点。
-                </p>
               </div>
             </div>
 
@@ -600,10 +595,6 @@ async function cleanup(kind) {
                   {{ n === 0 ? "不限速" : `${n} MiB/s` }}
                 </option>
               </select>
-              <p class="note">
-                所有任务合计的速度上限。想边下边用网络（看视频、开会）或网络不稳时，
-                设一个值能避免占满带宽；平时保持不限速。
-              </p>
             </div>
 
             <div class="checks full">
@@ -611,18 +602,10 @@ async function cleanup(kind) {
                 <input type="checkbox" v-model="draft.resume_on_start" />
                 <span>启动时自动继续未完成任务</span>
               </label>
-              <p class="note">
-                上次没下完的任务（含暂停的），下次打开软件自动接着下——
-                断点续传，已下过的部分不会重复下载。
-              </p>
               <label class="check">
                 <input type="checkbox" v-model="draft.keep_temp" />
                 <span>保留临时文件（调试用）</span>
               </label>
-              <p class="note">
-                保留下载中的 .part 分片文件，便于排查“下载中断”类问题；
-                正常使用建议关闭（会自动清理）。
-              </p>
             </div>
 
             <div class="group full">
@@ -659,7 +642,6 @@ async function cleanup(kind) {
                     <option :value="2000">2 秒</option>
                     <option :value="3000">3 秒</option>
                   </select>
-                  <p class="note">两轮解析之间的间隔，给站点留出喘息，降低被限流的概率。</p>
                 </div>
                 <div class="field">
                   <label>每 {{ draft.parse_rest_every }} 条休息 <span class="info" title="累计解析这么多条后额外休息一次">?</span></label>
@@ -675,10 +657,6 @@ async function cleanup(kind) {
                       <option :value="5000">5 秒</option>
                     </select>
                   </div>
-                  <p class="note">
-                    解析累计到这么多条后，额外停下来歇一次——长时间批量解析时最容易被风控，
-                    这一停能明显降低被限流的概率。
-                  </p>
                 </div>
               </div>
               <p class="note">{{ parsePaceNote }}</p>
@@ -720,10 +698,6 @@ async function cleanup(kind) {
                     {{ item.label }}
                   </option>
                 </select>
-                <p class="note">
-                  <b>原图</b>：站点提供的最大规格（实测约 1080 宽、webp 格式，单张 1~3 MB）。<br />
-                  <b>压缩图</b>：预览档，分辨率更低、体积约为原图 1/4，适合只做存档或省流量。
-                </p>
               </div>
               <div class="field">
                 <label>视频清晰度</label>
@@ -732,13 +706,12 @@ async function cleanup(kind) {
                     {{ item.label }}
                   </option>
                 </select>
-                <p class="note">
-                  <b>最佳可用</b>：分辨率与码率都最高的流（实测有 2160P/4K、1440P、1080P、720P 等，约 50~70 MB 一条）。<br />
-                  <b>高清</b>：优先 ≥720P 里最高的；<b>标清</b>：≤480P，体积最小。<br />
-                  档位按视频<b>短边</b>命名（竖屏 720×1280 即 720P）；某档不存在时自动退到最佳可用。
-                </p>
               </div>
             </div>
+            <p class="note">
+              图片规格决定多图笔记下载原图还是压缩图；视频清晰度不可用时自动取最佳可用档
+              （网页端常见 1080P / 720P 档）。
+            </p>
 
             <label class="check card-check full">
               <input type="checkbox" v-model="draft.download_text" />
@@ -1028,10 +1001,6 @@ async function cleanup(kind) {
                 placeholder="例如 http://127.0.0.1:7890，留空为直连"
                 @keydown.enter="commitProxy"
               />
-              <p class="note">
-                网络无法直连小红书时填写（本机代理如 Clash/V2Ray 的 http 端口）；无需代理时留空。
-                网页窗口的浏览走系统网络，此项影响的是程序自身的下载与校验请求。
-              </p>
             </div>
 
             <div class="field full">
@@ -1041,11 +1010,6 @@ async function cleanup(kind) {
                   {{ item.label }}
                 </option>
               </select>
-              <p class="note">
-                <b>调试</b>：记录每次请求与取数轨迹（排查问题时用，日志最全）；<br />
-                <b>信息</b>：常规运行记录；<b>警告 / 错误</b>：只记异常，日志最干净。<br />
-                日志文件在数据目录的 <code>xhs_debug.log</code>，遇到问题先切到「调试」再复现。
-              </p>
             </div>
 
             <div class="field full">

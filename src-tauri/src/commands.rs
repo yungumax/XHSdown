@@ -272,15 +272,37 @@ fn bundle_source(value: &serde_json::Value) -> String {
         .to_string()
 }
 
-/// 视频清晰度选项：auto 永远在，hd/sd 按实际有没有给。
+/// 视频清晰度选项：auto（最佳可用）永远在，其余**按这条视频实际有的档位列出**
+/// （2160P/1440P/1080P/720P…，按短边像素命名）——下拉里能直接看到哪几档可下，
+/// 而不是笼统的"高清/标清"（实测用户要的是具体档位）。
 fn quality_options(videos: &[(String, String)]) -> Vec<QualityOption> {
-    let has_hd = videos.iter().any(|(label, _)| quality_rank(label) >= 720);
-    let has_sd = !videos.is_empty();
-    vec![
-        QualityOption { value: "auto".into(), label: "最佳可用".into(), available: true, hint: String::new() },
-        QualityOption { value: "hd".into(), label: "高清".into(), available: has_hd, hint: if has_hd { String::new() } else { "该来源没有高清档".into() } },
-        QualityOption { value: "sd".into(), label: "标清".into(), available: has_sd, hint: String::new() },
-    ]
+    let mut tiers: Vec<u32> = videos
+        .iter()
+        .map(|(label, _)| quality_rank(label))
+        .filter(|n| *n > 0)
+        .collect();
+    tiers.sort_unstable_by(|a, b| b.cmp(a));
+    tiers.dedup();
+
+    let best = tiers.first().copied().unwrap_or(0);
+    let mut out = vec![QualityOption {
+        value: "auto".into(),
+        label: match best {
+            0 => "最佳可用".to_string(),
+            n => format!("最佳可用（{n}P）"),
+        },
+        available: true,
+        hint: "分辨率与码率都最高的流".into(),
+    }];
+    for n in tiers {
+        out.push(QualityOption {
+            value: format!("{n}p"),
+            label: format!("{n}P{}", if n >= 2160 { "（4K）" } else if n >= 1440 { "（2K）" } else { "" }),
+            available: true,
+            hint: String::new(),
+        });
+    }
+    out
 }
 
 /// 主页地址：原链接带 token 就原样用（搜索来源的主页必须带），否则按 uid 拼裸链接。
@@ -1191,11 +1213,30 @@ fn pick_video(videos: &[(String, String)], quality: &str) -> (String, String) {
             .or_else(|| sorted.last())
             .map(|&(l, u)| (l.clone(), u.clone()))
             .unwrap_or_default(),
-        // auto：最高档
-        _ => sorted
-            .first()
-            .map(|&(l, u)| (l.clone(), u.clone()))
-            .unwrap_or_default(),
+        // 具体档位（"1080p"）：取**不超过**该档的最高流（要 1080P 就不该下 4K 那 70MB）；
+        // 若所有流都高于它，退到最佳可用
+        other => {
+            let want = other
+                .trim_end_matches(['p', 'P'])
+                .parse::<u32>()
+                .unwrap_or(0);
+            if want > 0 {
+                if let Some(hit) = sorted
+                    .iter()
+                    .find(|(label, _)| {
+                        let n = quality_rank(label);
+                        n > 0 && n <= want
+                    })
+                {
+                    return (hit.0.clone(), hit.1.clone());
+                }
+            }
+            // auto（及兜底）：最高档
+            sorted
+                .first()
+                .map(|&(l, u)| (l.clone(), u.clone()))
+                .unwrap_or_default()
+        }
     }
 }
 
@@ -5415,6 +5456,25 @@ mod tests {
     }
 
     /// 扩展名要从 CDN 的 `!规格` 里认（路径上没有扩展名）
+    #[test]
+    fn pick_video_honors_explicit_tier() {
+        let videos = vec![
+            ("2160P".to_string(), "u4k".to_string()),
+            ("1080P".to_string(), "u1080".to_string()),
+            ("720P".to_string(), "u720".to_string()),
+        ];
+        // auto 取最高
+        assert_eq!(pick_video(&videos, "auto").1, "u4k");
+        // 具体档位：取不超过该档的最高流
+        assert_eq!(pick_video(&videos, "1080p").1, "u1080");
+        assert_eq!(pick_video(&videos, "720p").1, "u720");
+        // 请求高于所有流 → 退最佳可用
+        assert_eq!(pick_video(&videos, "4320p").1, "u4k");
+        // 旧设置值兼容
+        assert_eq!(pick_video(&videos, "hd").1, "u4k");
+        assert_eq!(pick_video(&videos, "sd").1, "u720");
+    }
+
     #[test]
     fn quality_rank_parses_pixels() {
         // 旧表写死到 1080：2160P 会被归到"其余"排最低——实测 4K 流选错
