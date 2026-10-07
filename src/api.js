@@ -246,7 +246,7 @@ export async function onCollectUpdate(handler) {
   return listen("collect://update", (event) => handler(event.payload?.count || 0));
 }
 
-/** 网页内收集：完成（整份列表 + 页面自己报的主页总数，0 表示没读到） */
+/** 网页内收集：完成（整份列表 + 主页自报总数 + 页面状态去重数，0 表示没读到） */
 export async function onCollectDone(handler) {
   if (!hasTauri) return () => {};
   return listen("collect://done", (event) =>
@@ -254,6 +254,7 @@ export async function onCollectDone(handler) {
       event.payload?.items || [],
       !!event.payload?.auto,
       Number(event.payload?.total) || 0,
+      Number(event.payload?.state_uniq) || 0,
     ),
   );
 }

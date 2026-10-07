@@ -159,22 +159,28 @@ onMounted(async () => {
     collectCount.value = count;
     if (count > 0) showToast(`网页收集中：已收集 ${count} 条`);
   });
-  unlistenCollectDone = await api.onCollectDone((items, auto, total) => {
+  unlistenCollectDone = await api.onCollectDone((items, auto, total, stateUniq) => {
     collectCount.value = 0;
     if (!items.length) {
       showToast("网页收集：没有收集到内容");
       return;
     }
     collected.value = { items, stamp: Date.now() };
-    // 总数拿得到就直接给结论：收全了 / 还差多少。用户看到"停在 N 条"时最需要这个答案。
-    // 措辞按登录态分：登录着还说"去登录"就是误导（实测被用户抓包）
+    // 总数拿得到就直接给结论。缺口分两种，对账数据（页面状态去重数）说话：
+    // 去重 ≤ 已收 = 网页信息流只放出这么多（站点未下发，仅自己可见/审核中等），
+    // 再滚也滚不出来；去重 > 已收 = 尾部还没加载完，再收一次能补
     if (total > 0 && items.length >= total) {
       showToast(`网页收集完成：${items.length} 条，已收全（主页共 ${total} 条）`);
     } else if (total > items.length) {
       const gap = total - items.length;
-      const hint = login.value.logged_in
-        ? `差的 ${gap} 条多半是个别笔记已删除/仅自己可见，或最后一批还没滚出来（再收一次常能补上）`
-        : "未登录时小红书会拦住后续笔记，登录后再收集即可拿全";
+      let hint;
+      if (stateUniq > 0 && stateUniq <= items.length) {
+        hint = `网页信息流只放出了 ${items.length} 条（其余 ${gap} 条站点未下发，多为仅自己可见/审核中）——网页端拿不全，可在 App 里分享单条链接下载`;
+      } else if (login.value.logged_in) {
+        hint = `最后一批可能还没滚出来，再收一次常能补上；或个别笔记已删除/仅自己可见`;
+      } else {
+        hint = `未登录时小红书会拦住后续笔记，登录后再收集即可拿全`;
+      }
       showToast(
         `网页收集完成：${items.length} 条，主页共 ${total} 条，还差 ${gap} 条（${hint}）`,
       );

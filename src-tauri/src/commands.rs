@@ -3588,11 +3588,57 @@ const COLLECT_SYNC_ON: &str =
 
 /// 结束收集：药丸与栏内计数**保留结果**而不是归零——收集几十秒就到底，
 /// 用户收起地址栏再看时已结束，归零就永远看不到进度（实测踩过）。
-/// 数字用后端去重清单的长度（与最终送进软件的条数同源）
-fn collect_sync_off(count: usize) -> String {
+/// 数字用后端去重清单的长度（与最终送进软件的条数同源）；
+/// 总数拿得到且没收全时带分母（已收 57/59 条），一眼看出差多少
+fn collect_sync_off(count: usize, total: u32) -> String {
+    let label = if total > 0 && (total as usize) > count {
+        format!("已收 {count}/{total} 条")
+    } else {
+        format!("已收 {count} 条")
+    };
     format!(
-        "(function(){{if(window.__xhsdownCollectSync)window.__xhsdownCollectSync(0,'已收 {count} 条');var b=document.getElementById('xhsdown-count');if(b)b.textContent='已收 {count} 条';}})()"
+        "(function(){{if(window.__xhsdownCollectSync)window.__xhsdownCollectSync(0,'{label}');var b=document.getElementById('xhsdown-count');if(b)b.textContent='{label}';}})()"
     )
+}
+
+/// 从对账读数里抠出「去重=…」——页面状态里唯一的笔记条数。
+/// 去重数 ≤ 收到的条数 = 网页信息流已经放完（缺口是站点没下发，再滚也不会有）
+fn parse_state_uniq(diag: &str) -> u32 {
+    for seg in diag.split_whitespace() {
+        if let Some(v) = seg.strip_prefix("去重=") {
+            return v.trim().parse::<u32>().unwrap_or(0);
+        }
+    }
+    0
+}
+
+/// 从栏内计数字样里抠总数：「已加载 57 / 共 59 条」→ 59；「已收全 N 条」→ N
+fn parse_total_from_counter(text: &str) -> u32 {
+    let pick = |after: &str| -> u32 {
+        text.split(after)
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|num| num.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+    };
+    let n = pick("已收全 ");
+    if n > 0 {
+        return n;
+    }
+    pick("共 ")
+}
+
+/// 读一次对账读数（栏内计数 ||| 状态对账 ||| 页尾可选），供停止时分析
+async fn read_collect_stats(window: &tauri::WebviewWindow, with_tail: bool) -> String {
+    let tail_js = if with_tail {
+        "var t=document.body.innerText||'';t=t.split(String.fromCharCode(10)).join(' ');var tail=t.slice(-200);"
+    } else {
+        "var tail='';"
+    };
+    let _ = window.eval(&format!(
+        "(function(){{var c=document.getElementById('xhsdown-count');var n=c?c.textContent:'';var d=window.__xhsdownDiag?window.__xhsdownDiag():'无';{tail_js}history.replaceState(null,'','#xhsdownselftest='+encodeURIComponent(n+' ||| '+d+(tail?' ||| '+tail:'')));}})()"
+    ));
+    read_selftest(window).await.unwrap_or_default()
 }
 
 /// 注入到网页里的浮动地址栏（后退/前进/刷新/地址/收集开关/收起）。
@@ -3980,22 +4026,7 @@ fn spawn_page_bar(app: tauri::AppHandle) {
         let clear_hash = |window: &tauri::WebviewWindow| {
             let _ = window.eval("history.replaceState(null,'',location.pathname+location.search)");
         };
-        // 从解析栏读数里抠出主页总数：「已收全 625 条」或「已加载 320 / 共 625 条」
-        let parse_total = |text: &str| -> u32 {
-            let pick = |after: &str| -> u32 {
-                text.split(after)
-                    .nth(1)
-                    .and_then(|rest| rest.split(' ').next())
-                    .and_then(|num| num.parse::<u32>().ok())
-                    .unwrap_or(0)
-            };
-            let n = pick("已收全 ");
-            if n > 0 {
-                return n;
-            }
-            pick("共 ")
-        };
-        let emit_done = |app: &tauri::AppHandle, collected: &[PostEntry], auto: bool, total: u32| {
+        let emit_done = |app: &tauri::AppHandle, collected: &[PostEntry], auto: bool, total: u32, state_uniq: u32| {
             if collected.is_empty() {
                 xhs_core::login::debug_log("网页收集：没有收集到内容");
                 return;
@@ -4019,7 +4050,7 @@ fn spawn_page_bar(app: tauri::AppHandle) {
             ));
             let _ = app.emit(
                 "collect://done",
-                serde_json::json!({ "items": collected, "auto": auto, "total": total }),
+                serde_json::json!({ "items": collected, "auto": auto, "total": total, "state_uniq": state_uniq }),
             );
         };
 
@@ -4030,7 +4061,7 @@ fn spawn_page_bar(app: tauri::AppHandle) {
             };
             if !window.is_visible().unwrap_or(false) {
                 if collecting {
-                    emit_done(&app, &collected, false, 0);
+                    emit_done(&app, &collected, false, 0, 0);
                     collecting = false;
                 }
                 break;
@@ -4076,18 +4107,13 @@ fn spawn_page_bar(app: tauri::AppHandle) {
                         let _ = app.emit("collect://update", serde_json::json!({ "count": 0 }));
                     } else if value == "stop" {
                         collecting = false;
-                        let _ = window.eval(collect_sync_off(collected.len()));
-                        // 手动点「完成解析」：顺手把页面读一遍拿总数，好告诉用户收够了没有
-                        let total = {
-                            let _ = window.eval(
-                                "(function(){var c=document.getElementById('xhsdown-count');history.replaceState(null,'','#xhsdownselftest='+encodeURIComponent(c?c.textContent:''));})()",
-                            );
-                            read_selftest(&window)
-                                .await
-                                .map(|text| parse_total(&text))
-                                .unwrap_or(0)
-                        };
-                        emit_done(&app, &collected, false, total);
+                        // 手动点「完成解析」：同样读一次对账，把"站点没下发"和"没滚完"区分开
+                        let read = read_collect_stats(&window, false).await;
+                        let mut seg = read.split("|||");
+                        let total = parse_total_from_counter(seg.next().unwrap_or(""));
+                        let state_uniq = seg.next().map(parse_state_uniq).unwrap_or(0);
+                        let _ = window.eval(collect_sync_off(collected.len(), total));
+                        emit_done(&app, &collected, false, total, state_uniq);
                     }
                 } else if let Some(idx) = text.find("xhsdownparse=") {
                     let rest = &text[idx + "xhsdownparse=".len()..];
@@ -4109,21 +4135,17 @@ fn spawn_page_bar(app: tauri::AppHandle) {
             }
             if stale >= 4 {
                 collecting = false;
-                // 把页面尾部提示记下来：区分"站点说没有更多了"与"被登录墙/风控挡住"；
-                // 顺带带上状态对账（原始条目/去重/自报总数），置顶重复或尾部没加载一眼可辨
-                let _ = window.eval(
-                    "(function(){var t=document.body.innerText||'';t=t.split(String.fromCharCode(10)).join(' ');var tail=t.slice(-200);var c=document.getElementById('xhsdown-count');var n=c?c.textContent:'';var d=window.__xhsdownDiag?window.__xhsdownDiag():'无';history.replaceState(null,'','#xhsdownselftest='+encodeURIComponent(n+' ||| '+d+' ||| '+tail));})()",
-                );
-                let mut total = 0;
-                if let Some(tail) = read_selftest(&window).await {
-                    // 读数里前半是解析栏自己的计数（已加载 N / 共 M / 已收全 N），后半是页尾文字：
-                    // 一起记下来，才分得清"真到底了"和"被站点挡住了"
-                    xhs_core::login::debug_log(&format!("网页收集：自动停止时的页面读数 = {tail}"));
-                    total = parse_total(tail.split("|||").next().unwrap_or(""));
-                }
+                // 对账 + 页尾一起读：「状态条目/去重/自报总数」三个数区分
+                // "尾部没加载完"（去重 > 已收）与"站点没下发"（去重 ≤ 已收，
+                // 实测：57/59 的主页两次收集状态都停在 57，网页流就是不发那 2 条）
+                let read = read_collect_stats(&window, true).await;
+                xhs_core::login::debug_log(&format!("网页收集：自动停止时的页面读数 = {read}"));
+                let mut seg = read.split("|||");
+                let total = parse_total_from_counter(seg.next().unwrap_or(""));
+                let state_uniq = seg.next().map(parse_state_uniq).unwrap_or(0);
                 let _ = window.eval("history.replaceState(null,'',location.pathname+location.search)");
-                let _ = window.eval(collect_sync_off(collected.len()));
-                emit_done(&app, &collected, true, total);
+                let _ = window.eval(collect_sync_off(collected.len(), total));
+                emit_done(&app, &collected, true, total, state_uniq);
                 continue;
             }
             let _ = window.eval(SCROLL_BOTTOM_JS);
