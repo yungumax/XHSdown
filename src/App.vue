@@ -369,7 +369,8 @@ function onWebConfirmed(loginInfo) {
   api.uiLog(
     `登录事件收到：昵称=${loginInfo.uname || "空"} 头像=${loginInfo.face ? "有" : "无"}`,
   );
-  showToast(loginInfo.uname ? `已登录：${loginInfo.uname}` : "已登录小红书");
+  // logged_in=false = 用户在网页里自行退出了（登录检查点发现并广播）
+  showToast(loginInfo.logged_in ? `已登录：${loginInfo.uname || "小红书账号"}` : "已退出登录");
   showLogin.value = false;
 }
 

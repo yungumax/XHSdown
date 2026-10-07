@@ -1960,14 +1960,18 @@ const IDENTITY_DOM_JS: &str = r#"(function () {
   };
   try {
     var out = { ready: true, selfPage: false };
-    // **本人页防呆（错误登录事故的根源）**：state.user 在「别人的主页」上是对方的资料、
-    // 在「笔记页」上文档标题是笔记标题——把它们当登录者就是错误登录。
-    // 所以身份只在 /user/profile/me 上读取；其它页面一律报"这里没有我的资料"，
-    // 由调用方导航到 /me 再读。
-    if (location.href.indexOf('/user/profile/me') < 0) {
+    var here = location.href;
+    // **三档防呆（错误登录事故的根源）**：
+    // - 别人的主页（/user/profile/{uid}）：state.user 是对方的资料——绝不可读；
+    // - /user/profile/me：完整读（状态 + DOM 兜底，标题=我的昵称）；
+    // - 其它页（探索/笔记/搜索）：state 里是**浏览者**资料，可读状态，
+    //   但**绝不碰标题/昵称 DOM**——笔记页标题是笔记名，拿来当昵称就是错误登录
+    var onOtherProfile = here.indexOf('/user/profile/') >= 0 && here.indexOf('/user/profile/me') < 0;
+    if (onOtherProfile) {
       report(out);
       return;
     }
+    var onMe = here.indexOf('/user/profile/me') >= 0;
     var st = window.__INITIAL_STATE__ || {};
     var pu = unwrap(st.user) || {};
     var page = unwrap(pu.userPageData);
@@ -1981,7 +1985,7 @@ const IDENTITY_DOM_JS: &str = r#"(function () {
       }
       return '';
     };
-    out.selfPage = true;
+    out.selfPage = onMe;
     out.name =
       pick(page, ['nickname', 'nickName', 'nick_name', 'name']) ||
       pick(info, ['nickname', 'nickName', 'nick_name', 'name']);
@@ -1989,24 +1993,26 @@ const IDENTITY_DOM_JS: &str = r#"(function () {
     out.avatar =
       pick(page, ['headImage', 'image', 'avatar', 'images', 'avatarUrl']) ||
       pick(info, ['headImage', 'image', 'avatar', 'images', 'avatarUrl']);
-    // 状态里没有就退回 DOM（/me 页的标题=我的昵称、页头有我的头像图）
-    if (!out.name) {
-      var raw = (document.title || '').trim();
-      var generic = raw === '小红书' || raw.indexOf('你的生活兴趣社区') >= 0;
-      if (!generic) out.name = raw.replace(/\s*[-—|]\s*小红书.*$/, '').trim();
-    }
-    if (!out.name) {
-      var el = document.querySelector('[class*="user-name"], [class*="nickname"], [class*="user-nickname"]');
-      if (el) {
-        var t = (el.textContent || '').trim();
-        if (t && t.length <= 30 && t.indexOf('小红书') < 0) out.name = t;
+    // DOM 兜底只在 /me 有效
+    if (onMe) {
+      if (!out.name) {
+        var raw = (document.title || '').trim();
+        var generic = raw === '小红书' || raw.indexOf('你的生活兴趣社区') >= 0;
+        if (!generic) out.name = raw.replace(/\s*[-—|]\s*小红书.*$/, '').trim();
       }
-    }
-    if (!out.avatar) {
-      var imgs = document.querySelectorAll('img');
-      for (var i = 0; i < imgs.length && i < 400; i++) {
-        var src = imgs[i].getAttribute('src') || '';
-        if (src.indexOf('sns-avatar') >= 0) { out.avatar = src; break; }
+      if (!out.name) {
+        var el = document.querySelector('[class*="user-name"], [class*="nickname"], [class*="user-nickname"]');
+        if (el) {
+          var t = (el.textContent || '').trim();
+          if (t && t.length <= 30 && t.indexOf('小红书') < 0) out.name = t;
+        }
+      }
+      if (!out.avatar) {
+        var imgs = document.querySelectorAll('img');
+        for (var i = 0; i < imgs.length && i < 400; i++) {
+          var src = imgs[i].getAttribute('src') || '';
+          if (src.indexOf('sns-avatar') >= 0) { out.avatar = src; break; }
+        }
       }
     }
     report(out);
@@ -2052,16 +2058,20 @@ async fn read_identity(window: &tauri::WebviewWindow) -> Option<(String, String,
 async fn browser_login_check(
     app: &tauri::AppHandle,
 ) -> Result<Option<(String, String, String)>, String> {
-    // 只在当前页面就是 /me 时快读（其它页面 state.user 是别人的资料或为空，
-    // 笔记页标题是笔记名——拿它们当登录者 = 错误登录，实测踩过）
+    // 当前页快读：**别人的主页除外**（state.user 是对方的资料）。
+    // /me 全读；探索/笔记等页读浏览者状态（登录后落在这些页时不用导航就能确认，
+    // 也绕开了"窗口正被使用"的门——刚登录完用户正盯着窗口呢）
     let value = {
         let mut found: Option<serde_json::Value> = None;
         if let Some(window) = app.get_webview_window("xhs-work") {
-            let on_me = window
+            let on_other_profile = window
                 .url()
-                .map(|u| u.to_string().contains("/user/profile/me"))
+                .map(|u| {
+                    let s = u.to_string();
+                    s.contains("/user/profile/") && !s.contains("/user/profile/me")
+                })
                 .unwrap_or(false);
-            if on_me {
+            if !on_other_profile {
                 for _ in 0..3 {
                     let _ = window.eval(IDENTITY_DOM_JS);
                     if let Some((uid, name, avatar)) = read_identity(&window).await {
@@ -2660,13 +2670,16 @@ async fn login_watch(app: tauri::AppHandle) {
         // 阶段 1：完整取数（含导航）最多每 20 秒一次；其余时间只读当前页面，
         // 让页面的异步资料有机会加载完
         let now = std::time::Instant::now();
-        // 优先在当前页面读账号资料——**仅限 /me 页**（身份脚本自身有防呆，
-        // 非 /me 页一律不报身份；这里再按 URL 短路，省掉 5 秒的无效轮询）
-        let on_me_page = window
+        // 优先在当前页面读账号资料——别人的主页除外（state.user 是对方资料，
+        // 身份脚本自身也有三档防呆；这里按 URL 短路省掉 5 秒的无效轮询）
+        let on_other_profile = window
             .url()
-            .map(|u| u.to_string().contains("/user/profile/me"))
+            .map(|u| {
+                let s = u.to_string();
+                s.contains("/user/profile/") && !s.contains("/user/profile/me")
+            })
             .unwrap_or(false);
-        let mut value = if on_me_page {
+        let mut value = if !on_other_profile {
             let _ = window.eval(IDENTITY_DOM_JS);
             match read_identity(&window).await {
                 Some((uid, name, avatar)) if !name.is_empty() => Some(serde_json::json!({
@@ -4052,6 +4065,8 @@ fn spawn_page_bar(app: tauri::AppHandle) {
         // 去重集合与 collected 同步维护：几千条时逐条 any() 扫描是 O(n²)，滚久了会卡
         let mut seen_bids: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut stale: u32 = 0;
+        // 登录页哨兵：上一轮看到的页面是否是 /login
+        let mut was_on_login = false;
 
         let clear_hash = |window: &tauri::WebviewWindow| {
             let _ = window.eval("history.replaceState(null,'',location.pathname+location.search)");
@@ -4151,6 +4166,47 @@ fn spawn_page_bar(app: tauri::AppHandle) {
                 .url()
                 .map(|u| u.to_string().split('#').next().unwrap_or("").to_string())
                 .unwrap_or_default();
+            // 哨兵一：用户在网页里**自行登录**（没走软件的登录面板，login_watch 不会跑）
+            // ——页面从 /login 跳走的瞬间，跟进确认一次登录态，角标才能亮起来
+            let on_login_page = url.contains("/login");
+            if on_login_page {
+                was_on_login = true;
+            } else if was_on_login && url.starts_with("http") {
+                was_on_login = false;
+                xhs_core::login::debug_log("检测到登录页跳走（用户在网页里自行登录），跟进确认登录态");
+                let app2 = app.clone();
+                tokio::spawn(async move {
+                    // 等登录后的落地页把浏览者资料写进状态
+                    tokio::time::sleep(Duration::from_secs(3)).await;
+                    match browser_login_check(&app2).await {
+                        Ok(Some((uid, name, avatar))) => {
+                            let state = app2.state::<crate::state::AppState>();
+                            match finish_login(&app2, &state, uid, name, avatar, false).await {
+                                Ok(info) => {
+                                    xhs_core::login::debug_log(&format!(
+                                        "网页内自行登录：已确认（{:?}）", info.uname
+                                    ));
+                                    let _ = app2.emit("login://confirmed", info);
+                                }
+                                Err(e) => {
+                                    xhs_core::login::debug_log(&format!("网页内自行登录：收尾失败 {e}"))
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            let state = app2.state::<crate::state::AppState>();
+                            *state.login.write().unwrap() = None;
+                            let _ = app2.emit("login://confirmed", LoginInfo::default());
+                        }
+                        Err(e) => {
+                            // 读不成不打紧：收起窗口时还有检查点兜底
+                            xhs_core::login::debug_log(&format!(
+                                "网页内自行登录：跟进确认没读成（{e}），收起窗口时再兜底"
+                            ));
+                        }
+                    }
+                });
+            }
             if url != last_url || last_inject.elapsed() > Duration::from_secs(5) {
                 last_url = url.clone();
                 last_inject = std::time::Instant::now();
@@ -4329,6 +4385,43 @@ pub fn web_bar_hide(app: tauri::AppHandle) -> Result<(), String> {
     if let Some(window) = app.get_webview_window("xhs-work") {
         let _ = window.hide();
     }
+    // 检查点：窗口收起后做一次登录态核对。用户在网页里**自行登录/退出**（不走软件
+    // 登录面板）时，软件原本无从得知；此刻窗口已隐藏，核对要导航也不打扰任何人。
+    let app2 = app.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        match browser_login_check(&app2).await {
+            Ok(Some((uid, name, avatar))) => {
+                let state = app2.state::<crate::state::AppState>();
+                // 已记录的是同一账号就只刷新资料，不重复广播
+                let same = state
+                    .login
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .map(|l| l.logged_in && l.mid == uid)
+                    .unwrap_or(false);
+                match finish_login(&app2, &state, uid, name, avatar, false).await {
+                    Ok(info) => {
+                        if !same {
+                            let _ = app2.emit("login://confirmed", info);
+                        }
+                    }
+                    Err(e) => xhs_core::login::debug_log(&format!("登录检查点：收尾失败 {e}")),
+                }
+            }
+            Ok(None) => {
+                let state = app2.state::<crate::state::AppState>();
+                let was = state.login.read().unwrap().as_ref().map(|l| l.logged_in).unwrap_or(false);
+                *state.login.write().unwrap() = None;
+                if was {
+                    xhs_core::login::debug_log("登录检查点：确认未登录（用户可能在网页里退出了），通知界面");
+                    let _ = app2.emit("login://confirmed", LoginInfo::default());
+                }
+            }
+            Err(e) => xhs_core::login::debug_log(&format!("登录检查点：没读成（{e}），保持现状")),
+        }
+    });
     Ok(())
 }
 
