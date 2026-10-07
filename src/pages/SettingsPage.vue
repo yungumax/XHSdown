@@ -157,9 +157,11 @@ function beginDraft() {
 beginDraft();
 
 // 媒体页的两个单值下拉：选项说明直接写在标签里（下拉栏内一眼看清，不占字段下方的版面）
+// 实测口径：笔记图片站点只放出两个变体，分辨率相同（1080 宽 = 站点上限），
+// 差别在压缩质量（实测同图 84 KB vs 18 KB，约 1/4.6）——没有更高的图片档位可加
 const IMAGE_FORMATS = [
-  { value: "large", label: "原图（站点最大规格，约 1~3 MB/张）" },
-  { value: "thumbnail", label: "压缩图（省空间，约原图 1/4）" },
+  { value: "large", label: "原图（1080 宽·最高画质，站点上限）" },
+  { value: "thumbnail", label: "压缩图（同 1080 宽·高压缩，约 1/4 体积）" },
 ];
 
 const VIDEO_QUALITIES = [
