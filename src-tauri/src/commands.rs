@@ -4016,12 +4016,14 @@ pub fn web_bar_state(
         .unwrap_or_default();
     // 窗口可见时持续跟踪"用户最后在看的页面"：之后点 WEB 恢复的就是它。
     // 取数/收起期间窗口不可见，不会把取数残留页误记成用户的页面；
-    // /me、登录页、404 也不是用户自己浏览的页面（登录检测/风控落的），同样不记
+    // /me、登录页、404、验证码页也不是用户自己浏览的页面（检测/风控落的），同样不记
     let user_browsing = visible
         && url.starts_with("http")
         && !url.contains("/user/profile/me")
         && !url.contains("/login")
-        && !url.contains("/404");
+        && !url.contains("/404")
+        && !url.contains("/captcha")
+        && !url.contains("website-login");
     if user_browsing {
         *state.last_web_url.lock().unwrap() = url.clone();
     }
@@ -4098,29 +4100,59 @@ fn spawn_title_sync(app: tauri::AppHandle) {
 #[tauri::command]
 pub async fn open_web_home(app: tauri::AppHandle, state: State<'_, AppState>) -> Result<(), String> {
     let settings = state.settings_snapshot();
-    // 等正在进行的取数/登录检测完成再动窗口：它们的导航被打断会双双失败
-    // （锁在函数结束前释放——浏览本身不该持锁，也不该阻塞后续下载）
-    let _fetch_guard = state.fetch_lock.lock().await;
+    // 等正在进行的取数/登录检测完成再动窗口；最多等 5 秒——宁可这次放弃恢复导航，
+    // 也别让 WEB 按钮卡死在长取数后面（实测 /me 检测一持锁就是 40 秒）
+    let _fetch_guard =
+        match tokio::time::timeout(Duration::from_secs(5), state.fetch_lock.lock()).await {
+            Ok(guard) => guard,
+            Err(_) => {
+                xhs_core::login::debug_log("WEB 打开：取数/检测进行中（等 5 秒未完），直接显示不导航");
+                if let Some(window) = app.get_webview_window("xhs-work") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                    spawn_title_sync(app.clone());
+                    spawn_page_bar(app.clone());
+                }
+                return Ok(());
+            }
+        };
     // 窗口是不是这次调用新建的：新建才做尺寸/居中，别每次点 WEB 都把用户调好的窗口拍回去
     let existed = app.get_webview_window("xhs-work").is_some();
     let window = ensure_work_window(&app, &settings).await?;
 
-    // 去哪儿：本会话第一次点 WEB → 发现页；之后 → 恢复用户最后在看的页面
-    // （取数会把窗口导航走，恢复逻辑保证点 WEB 永远回到用户自己的页面）
+    // 去哪儿——**恢复优先**：记录着"用户最后在看的页面"就回那里。覆盖两种偏航：
+    // 1) 窗口被 X 关掉过（重建后是 about:blank——实测第一次实现在这里错去了发现页）
+    // 2) 被取数导航去了别的页。没有记录（本会话第一次点 WEB）才去发现页。
     let saved = state.last_web_url.lock().unwrap().clone();
     let current = window
         .url()
         .map(|u| u.to_string().split('#').next().unwrap_or("").to_string())
         .unwrap_or_default();
-    if saved.is_empty() || !current.starts_with("http") {
-        let parsed: tauri::Url = "https://www.xiaohongshu.com/explore"
-            .parse()
-            .map_err(|e| format!("地址无效：{e}"))?;
-        window.navigate(parsed).map_err(err)?;
-    } else if current != saved {
-        let parsed: tauri::Url = saved.parse().map_err(|e| format!("地址无效：{e}"))?;
+    let (target, action) = if !saved.is_empty() {
+        if current == saved {
+            (saved.clone(), "原地不动（已在目标页）")
+        } else {
+            (saved.clone(), "恢复上次页面")
+        }
+    } else {
+        (
+            "https://www.xiaohongshu.com/explore".to_string(),
+            "本会话首次：去发现页",
+        )
+    };
+    if action != "原地不动（已在目标页）" {
+        let parsed: tauri::Url = target.parse().map_err(|e| format!("地址无效：{e}"))?;
         window.navigate(parsed).map_err(err)?;
     }
+    xhs_core::login::debug_log(&format!(
+        "WEB 打开：记录={} 当前={} → {action}",
+        if saved.is_empty() {
+            "(空)".to_string()
+        } else {
+            xhs_core::error::truncate(&saved, 90)
+        },
+        xhs_core::error::truncate(&current, 90),
+    ));
     if !existed {
         let _ = window.set_title("小红书（网页）");
         let _ = window.set_size(tauri::Size::Logical(tauri::LogicalSize::new(1000.0, 760.0)));
