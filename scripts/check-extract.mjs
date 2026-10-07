@@ -35,6 +35,11 @@ global.location = {
   href: "https://www.xiaohongshu.com/user/profile/66f3c481000000001c002a76",
   replace: (u) => { captured = u; },
 };
+// 回传通道：EXTRACT_JS 用 history.replaceState 上报（实测 location.replace 会触发
+// 笔记页反篡改、立刻被弹回首页），桩也走这里
+global.history = {
+  replaceState: (_a, _b, u) => { captured = u; },
+};
 global.window = global;
 global.document = { title: "无期迷途 - 小红书", querySelector: () => null, querySelectorAll: () => [] };
 
@@ -70,6 +75,7 @@ function run(pages, posted) {
   };
   captured = "";
   eval(code);
+  // 回传通道实测切到 history.replaceState（location.replace 写一次就把笔记页弹走）
   const m = captured.match(/#xhsdownid=[^~]*~(.+)$/);
   if (!m) throw new Error("没有捕获到上报片段");
   return JSON.parse(decodeURIComponent(m[1]));

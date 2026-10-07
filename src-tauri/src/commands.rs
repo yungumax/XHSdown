@@ -1305,7 +1305,7 @@ const SCROLL_BOTTOM_JS: &str = r#"(function () {
 const EXTRACT_JS: &str = r#"(function () {
   var report = function (out) {
     try {
-      location.replace('#xhsdownid=' + Date.now() + '~' + encodeURIComponent(JSON.stringify(out)));
+      history.replaceState(null, '', '#xhsdownid=' + Date.now() + '~' + encodeURIComponent(JSON.stringify(out)));
     } catch (e) {}
   };
   // 小红书把状态字段包在 Vue 的 ref 里（{__v_isRef:true,_value:…}），必须逐层剥开，
@@ -1892,7 +1892,7 @@ async fn webview_fetch_inner(
 const IDENTITY_DOM_JS: &str = r#"(function () {
   var report = function (out) {
     try {
-      location.replace('#xhsdownid=' + Date.now() + '~' + encodeURIComponent(JSON.stringify(out)));
+      history.replaceState(null, '', '#xhsdownid=' + Date.now() + '~' + encodeURIComponent(JSON.stringify(out)));
     } catch (e) {}
   };
   var unwrap = function (v) {
@@ -2703,7 +2703,7 @@ pub async fn web_login_watch(app: tauri::AppHandle, state: State<'_, AppState>) 
 const PAGE_SNAPSHOT_JS: &str = r#"(function () {
   var report = function (out) {
     try {
-      location.replace('#xhsdownselftest=' + encodeURIComponent(JSON.stringify(out)));
+      history.replaceState(null, '', '#xhsdownselftest=' + encodeURIComponent(JSON.stringify(out)));
     } catch (e) {}
   };
   // 状态字段可能是 Vue ref，先解包
@@ -2818,7 +2818,7 @@ const PAGE_SNAPSHOT_JS: &str = r#"(function () {
 /// 从探索页状态里抓一张新卡片的 id + token（笔记自检第一步用）
 const NOTE_SELFTEST_CARD_JS: &str = r#"(function () {
   var report = function (t) {
-    try { location.replace('#xhsdownselftest=' + encodeURIComponent(t)); } catch (e) {}
+    try { history.replaceState(null, '', '#xhsdownselftest=' + encodeURIComponent(t)); } catch (e) {}
   };
   try {
     var unwrap = function (v) {
@@ -2849,6 +2849,10 @@ const NOTE_SELFTEST_CARD_JS: &str = r#"(function () {
 /// 笔记自检：用本会话实测「笔记详情页是否被弹回首页」。
 /// 由数据目录里的 note_selftest 标记文件触发（平时不跑），用来远程判断
 /// 下载失败是不是会话被风控——先探后答，别让用户当测试员。
+///
+/// 标记文件为空：从探索页抓一张新卡片试开（会话级体检）。
+/// 标记文件是一条笔记链接：把它按**来源/路径变体矩阵**逐一试开，最后再用
+/// 探索页的新鲜 token 做对照——用来分辨「链接形态被拒」还是「会话被风控」。
 async fn note_selftest(app: tauri::AppHandle, settings: Settings, custom_url: String) {
     // 等 40 秒：让启动时的登录检测先跑完（它也导航这个窗口，别互相抢）
     tokio::time::sleep(Duration::from_secs(40)).await;
@@ -2861,42 +2865,205 @@ async fn note_selftest(app: tauri::AppHandle, settings: Settings, custom_url: St
     };
     let _ = window.hide();
 
-    // 第一步：拿一条新鲜的笔记 id+token（探索页第一张卡片），避免拿旧 token 得出假阴性
-    let target = if !custom_url.is_empty() {
-        xhs_core::login::debug_log("笔记自检：使用标记文件里指定的链接");
-        custom_url
+    // 通道对比实验：A=不动；C=location.replace 只写一次；D=history.replaceState 高频；
+    // E=Cookie 高频。哪个稳住就用哪个通道回传数据。
+    if custom_url == "injecttest" {
+        let mut results: Vec<String> = Vec::new();
+
+        for (label, channel) in [
+            ("A(不注入)", Channel::None),
+            ("C(replace只写1次)", Channel::ReplaceOnce),
+            ("D(replaceState高频)", Channel::ReplaceState),
+            ("E(Cookie高频)", Channel::Cookie),
+        ] {
+            let (id, tok) = fresh_feed_card(&window).await;
+            if id.is_empty() {
+                xhs_core::login::debug_log(&format!("笔记自检·{label}：没抓到卡片，跳过"));
+                continue;
+            }
+            let url =
+                format!("https://www.xiaohongshu.com/explore/{id}?xsec_token={tok}&xsec_source=pc_feed");
+            let verdict = channel_leg(&window, &url, channel).await;
+            xhs_core::login::debug_log(&format!("笔记自检·{label}：{verdict}"));
+            results.push(format!("{label}={verdict}"));
+        }
+        let d_ok = results
+            .iter()
+            .any(|r| r.starts_with("D(") && r.contains("稳定"));
+        let e_ok = results
+            .iter()
+            .any(|r| r.starts_with("E(") && r.contains("稳定"));
+        let c_ok = results
+            .iter()
+            .any(|r| r.starts_with("C(") && r.contains("稳定"));
+        let conclusion = if d_ok {
+            "结论：改用 history.replaceState 回传（不发事件、不加历史记录）"
+        } else if e_ok {
+            "结论：改用 Cookie 回传"
+        } else if c_ok {
+            "结论：location.replace 只写一次可用——改成仅就绪时上报"
+        } else {
+            "结论：所有写通道都会触发弹走——需要走 ExecuteScript 直读（无页面改动）"
+        };
+        xhs_core::login::debug_log(&format!("笔记自检：{conclusion}"));
+        return;
+    }
+
+    let (id, token) = if custom_url.is_empty() {
+        (String::new(), String::new())
     } else {
-        if let Ok(parsed) = "https://www.xiaohongshu.com/explore".parse::<tauri::Url>() {
-            let _ = window.navigate(parsed);
-        }
-        tokio::time::sleep(Duration::from_secs(5)).await;
-        let _ = window.eval(NOTE_SELFTEST_CARD_JS);
-        let card = read_selftest(&window).await.unwrap_or_default();
-        let mut parts = card.splitn(3, '~');
-        let kind = parts.next().unwrap_or("");
-        let id = parts.next().unwrap_or("").to_string();
-        let token = parts.next().unwrap_or("").to_string();
-        if kind != "CARD" || id.is_empty() || token.is_empty() {
-            xhs_core::login::debug_log(&format!(
-                "笔记自检：探索页没取到新卡片（{card}），自检终止"
-            ));
-            return;
-        }
-        xhs_core::login::debug_log(&format!("笔记自检：取到新卡片 id={id}"));
-        format!(
-            "https://www.xiaohongshu.com/explore/{id}?xsec_token={token}&xsec_source=pc_feed"
-        )
+        split_note_url(&custom_url)
     };
 
-    // 第二步：导航到笔记页，盯地址 11 秒——稳在笔记页 = 正常，被弹走 = 会话仍被风控
-    if let Ok(parsed) = target.parse::<tauri::Url>() {
+    if !id.is_empty() && !token.is_empty() {
+        // ── 变体矩阵：同一个 id+token，逐个形态试 ──
+        xhs_core::login::debug_log(&format!("笔记自检：变体矩阵开始（id={id}）"));
+        let variants: Vec<(&str, String)> = vec![
+            ("原样", custom_url.clone()),
+            ("pc_user", format!("https://www.xiaohongshu.com/explore/{id}?xsec_token={token}&xsec_source=pc_user")),
+            ("pc_search", format!("https://www.xiaohongshu.com/explore/{id}?xsec_token={token}&xsec_source=pc_search")),
+            ("pc_feed", format!("https://www.xiaohongshu.com/explore/{id}?xsec_token={token}&xsec_source=pc_feed")),
+            ("discovery/item", format!("https://www.xiaohongshu.com/discovery/item/{id}?xsec_token={token}&xsec_source=pc_user")),
+            ("裸链接", format!("https://www.xiaohongshu.com/explore/{id}")),
+        ];
+        let mut any_ok = false;
+        for (label, url) in variants {
+            let verdict = probe_note_page(&window, &url).await;
+            xhs_core::login::debug_log(&format!("笔记自检·{label}：{verdict}"));
+            if verdict.contains("稳定") {
+                any_ok = true;
+                break;
+            }
+        }
+        // ── 对照组：探索页的新鲜 token（昨天通过的形态）──
+        let control = fresh_feed_note_probe(&window).await;
+        xhs_core::login::debug_log(&format!(
+            "笔记自检·对照(新鲜token)：{control}"
+        ));
+        let conclusion = if any_ok {
+            "结论：链接形态问题——矩阵里有能用的形态，按它改下载链接的构建方式"
+        } else if control.contains("稳定") {
+            "结论：这类 token 整体被拒（对照的新鲜 token 能开）——token 与来源上下文绑定，下载前要先回原页面上下文"
+        } else {
+            "结论：会话当前开不了任何笔记页（对照也不行）——会话被风控中，等几分钟或退出重登"
+        };
+        xhs_core::login::debug_log(&format!("笔记自检：{conclusion}"));
+        return;
+    }
+
+    // ── 会话级体检：新鲜卡片直接开 ──
+    if !custom_url.is_empty() {
+        let verdict = probe_note_page(&window, &custom_url).await;
+        xhs_core::login::debug_log(&format!("笔记自检·指定链接：{verdict}"));
+        return;
+    }
+    let control = fresh_feed_note_probe(&window).await;
+    xhs_core::login::debug_log(&format!("笔记自检：结论 → {control}"));
+}
+
+/// 从探索页抓一张新卡片（只返回 id+token，不试开）
+async fn fresh_feed_card(window: &tauri::WebviewWindow) -> (String, String) {
+    if let Ok(parsed) = "https://www.xiaohongshu.com/explore".parse::<tauri::Url>() {
+        let _ = window.navigate(parsed);
+    }
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let _ = window.eval(NOTE_SELFTEST_CARD_JS);
+    let card = read_selftest(window).await.unwrap_or_default();
+    let mut parts = card.splitn(3, '~');
+    let kind = parts.next().unwrap_or("");
+    let id = parts.next().unwrap_or("").to_string();
+    let token = parts.next().unwrap_or("").to_string();
+    if kind != "CARD" {
+        return (String::new(), String::new());
+    }
+    (id, token)
+}
+
+/// 从探索页抓一张新卡片并试开（会话级体检的标准动作）
+async fn fresh_feed_note_probe(window: &tauri::WebviewWindow) -> String {
+    let (id, token) = fresh_feed_card(window).await;
+    if id.is_empty() {
+        return "探索页没取到新卡片".into();
+    }
+    xhs_core::login::debug_log(&format!("笔记自检：对照卡片 id={id}"));
+    let url = format!(
+        "https://www.xiaohongshu.com/explore/{id}?xsec_token={token}&xsec_source=pc_feed"
+    );
+    probe_note_page(window, &url).await
+}
+
+/// 通道对比实验的写通道
+#[derive(Clone, Copy, PartialEq)]
+enum Channel {
+    /// 只看不写（对照组）
+    None,
+    /// location.replace 只写一次（页面加载 2 秒后）
+    ReplaceOnce,
+    /// history.replaceState 每 700ms 写（带 2KB 载荷模拟真实数据量）
+    ReplaceState,
+    /// document.cookie 每 700ms 写（带 2KB 载荷）
+    Cookie,
+}
+
+/// 通道对比实验的一条腿：导航到笔记页，按指定通道**写满整个观察窗**（模拟真实
+/// 取数的持续注入），中途被弹走才算失败——只看 1.4 秒会得出假阳性。
+async fn channel_leg(window: &tauri::WebviewWindow, url: &str, channel: Channel) -> String {
+    if let Ok(parsed) = url.parse::<tauri::Url>() {
         let _ = window.navigate(parsed);
     }
     let note_prefix = "https://www.xiaohongshu.com/explore/".to_string();
+    let mut writes = 0u32;
+    for tick in 0..12 {
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        let script = match channel {
+            Channel::None => None,
+            Channel::ReplaceOnce => {
+                if tick != 3 {
+                    None
+                } else {
+                    Some("location.replace('#xhsdownid='+Date.now()+'~'+encodeURIComponent(JSON.stringify({ready:false,filler:'x'.repeat(2048)})))".to_string())
+                }
+            }
+            Channel::ReplaceState => Some(
+                "try{history.replaceState(null,'','#xhsdownid='+Date.now()+'~'+encodeURIComponent(JSON.stringify({ready:false,filler:'x'.repeat(2048)})))}catch(e){}".to_string(),
+            ),
+            Channel::Cookie => Some(
+                "try{document.cookie='xhsdown_t='+Date.now()+'~'+'x'.repeat(2048)+';path=/'}catch(e){}".to_string(),
+            ),
+        };
+        if let Some(js) = script {
+            let _ = window.eval(&js);
+            writes += 1;
+        }
+        let live = window
+            .url()
+            .map(|u| u.to_string().split('#').next().unwrap_or("").to_string())
+            .unwrap_or_default();
+        if live.contains("/explore") && !live.contains("/explore/")
+            || live.contains("/404")
+            || live.contains("/login")
+            || live.contains("/search_result")
+        {
+            return format!(
+                "被弹走（写了 {writes} 次后；落地={}）",
+                xhs_core::error::truncate(&live, 90)
+            );
+        }
+    }
+    format!("笔记页稳定打开，写满观察窗（写了 {writes} 次）没被弹")
+}
+
+/// 导航到一条笔记页并盯最多 8 秒：稳在笔记页 = 能开；被弹走 = 被拒。
+/// 返回给日志看的结论文字。
+async fn probe_note_page(window: &tauri::WebviewWindow, url: &str) -> String {
+    if let Ok(parsed) = url.parse::<tauri::Url>() {
+        let _ = window.navigate(parsed);
+    }
+    let note_prefix = "https://www.xiaohongshu.com/explore/".to_string();
+    let discovery_prefix = "https://www.xiaohongshu.com/discovery/item/".to_string();
     let mut stable = 0u32;
     let mut landed = String::new();
-    let mut bounced = false;
-    for _ in 0..16 {
+    for _ in 0..12 {
         tokio::time::sleep(Duration::from_millis(700)).await;
         let live = window
             .url()
@@ -2905,31 +3072,28 @@ async fn note_selftest(app: tauri::AppHandle, settings: Settings, custom_url: St
         if live.is_empty() {
             continue;
         }
-        if live.starts_with(&note_prefix) && live.len() > note_prefix.len() + 10 {
-            if landed.is_empty() {
-                xhs_core::login::debug_log("笔记自检：笔记页已打开，观察是否被弹走…");
-            }
+        if (live.starts_with(&note_prefix) && live.len() > note_prefix.len() + 10)
+            || (live.starts_with(&discovery_prefix)
+                && live.len() > discovery_prefix.len() + 10)
+        {
             landed = live;
             stable += 1;
-            if stable >= 3 {
-                break;
+            if stable >= 2 {
+                return "笔记页稳定打开（能开）".into();
             }
-        } else if live.contains("/explore") || live.contains("/404") || live.contains("/login") {
-            landed = live;
-            bounced = true;
-            break;
+        } else if live.contains("/explore")
+            || live.contains("/404")
+            || live.contains("/login")
+            || live.contains("/search_result")
+        {
+            return format!("被弹走（落地={}）", xhs_core::error::truncate(&live, 90));
         }
     }
-    let verdict = if bounced {
-        "会话仍被风控：笔记页刚打开就被弹走（这就是下载失败的原因，与链接/token 无关）。建议退出登录重新扫码，换一个新会话"
-    } else if stable >= 3 {
-        "会话正常：笔记页稳定打开没被弹走（现在可以下载了，先小批量试 3~5 条）"
-    } else if landed.is_empty() {
-        "结果不明：11 秒内没有任何落页（网络慢？再跑一次自检）"
+    if landed.is_empty() {
+        "8 秒内没有任何落页（网络慢？）".into()
     } else {
-        "结果不明：没等到稳定落页也没被弹走（再跑一次自检确认）"
-    };
-    xhs_core::login::debug_log(&format!("笔记自检：结论 → {verdict}"));
+        "没等到稳定也没被弹走".into()
+    }
 }
 
 /// 登录页自检：隐藏窗口打开官方登录页，探测「二维码状态 + 保活脚本是否生效」并写日志。
@@ -3065,7 +3229,7 @@ async fn login_selftest(app: tauri::AppHandle, settings: Settings, probe_url: St
                         if let Ok(window) = ensure_work_window(&app, &settings).await {
                             // 不用正则，避免 Rust 字符串里的反斜杠转义问题
                             let _ = window.eval(
-                                "(function(){var t=document.body.innerText||'';t=t.split(String.fromCharCode(10)).join(' ').split('  ').join(' ');location.replace('#xhsdownselftest='+encodeURIComponent(t.slice(0,400)));})()",
+                                "(function(){var t=document.body.innerText||'';t=t.split(String.fromCharCode(10)).join(' ').split('  ').join(' ');history.replaceState(null,'','#xhsdownselftest='+encodeURIComponent(t.slice(0,400)));})()",
                             );
                             if let Some(text) = read_selftest(&window).await {
                                 xhs_core::login::debug_log(&format!("自检·页尾提示：{text}"));
@@ -3191,7 +3355,7 @@ const QR_KEEPER_JS: &str = r#"(function () {
     // 只在状态变化时才写 URL：每 2.5 秒改一次地址栏会打扰页面自身逻辑
     if (state === window.__xhsdownQrLastReport) return;
     window.__xhsdownQrLastReport = state;
-    try { location.replace('#xhsdownqr=' + state); } catch (e) {}
+    try { history.replaceState(null, '', '#xhsdownqr=' + state); } catch (e) {}
   };
   var tick = function () {
     var text = document.body.innerText || '';
@@ -3286,9 +3450,9 @@ const LOGIN_SELFTEST_JS: &str = r#"(function () {
       clicks: window.__xhsdownQrClicks || 0,
       reloads: window.__xhsdownQrReloads || 0
     };
-    location.replace('#xhsdownselftest=' + encodeURIComponent(JSON.stringify(out)));
+    history.replaceState(null, '', '#xhsdownselftest=' + encodeURIComponent(JSON.stringify(out)));
   } catch (e) {
-    location.replace('#xhsdownselftest=' + encodeURIComponent(JSON.stringify({ error: String(e) })));
+    history.replaceState(null, '', '#xhsdownselftest=' + encodeURIComponent(JSON.stringify({ error: String(e) })));
   }
 })();"#;
 
@@ -3512,10 +3676,10 @@ const PAGE_BAR_JS: &str = r#"(function () {
         input.blur();
       });
       btn('开始解析', '在本页滚动收集笔记（数字会实时增长）', function () {
-        location.replace('#xhsdowncollect=start');
+        history.replaceState(null, '', '#xhsdowncollect=start');
       });
       btn('完成解析', '停止收集并把整份列表送进软件', function () {
-        location.replace('#xhsdowncollect=stop');
+        history.replaceState(null, '', '#xhsdowncollect=stop');
       });
       var count = document.createElement('span');
       count.id = 'xhsdown-count';
@@ -3732,7 +3896,7 @@ fn spawn_page_bar(app: tauri::AppHandle) {
                         // 手动点「完成解析」：顺手把页面读一遍拿总数，好告诉用户收够了没有
                         let total = {
                             let _ = window.eval(
-                                "(function(){var c=document.getElementById('xhsdown-count');location.replace('#xhsdownselftest='+encodeURIComponent(c?c.textContent:''));})()",
+                                "(function(){var c=document.getElementById('xhsdown-count');history.replaceState(null,'','#xhsdownselftest='+encodeURIComponent(c?c.textContent:''));})()",
                             );
                             read_selftest(&window)
                                 .await
@@ -3761,7 +3925,7 @@ fn spawn_page_bar(app: tauri::AppHandle) {
                 collecting = false;
                 // 把页面尾部提示记下来：区分"站点说没有更多了"与"被登录墙/风控挡住"
                 let _ = window.eval(
-                    "(function(){var t=document.body.innerText||'';t=t.split(String.fromCharCode(10)).join(' ');var tail=t.slice(-260);var c=document.getElementById('xhsdown-count');var n=c?c.textContent:'';location.replace('#xhsdownselftest='+encodeURIComponent(n+' ||| '+tail));})()",
+                    "(function(){var t=document.body.innerText||'';t=t.split(String.fromCharCode(10)).join(' ');var tail=t.slice(-260);var c=document.getElementById('xhsdown-count');var n=c?c.textContent:'';history.replaceState(null,'','#xhsdownselftest='+encodeURIComponent(n+' ||| '+tail));})()",
                 );
                 let mut total = 0;
                 if let Some(tail) = read_selftest(&window).await {

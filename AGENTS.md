@@ -53,6 +53,19 @@
   探完自动关窗。远程排查登录页问题用这个，别让用户当测试员。
 - **xsec_token**：笔记链接必须带 `xsec_token`（App 分享链接自带；用户主页解析出的
   条目由 `note_page_url()` 拼好）。文件：`crates/xhs-core/src/parser.rs`。
+- **回传通道必须用 `history.replaceState`，绝不能用 `location.replace('#…')`**：
+  笔记详情页有反篡改——URL 被伪导航改写（哪怕只写一次）页面立刻被弹回 `/explore`，
+  表象是「下载时取数失败：页面跳回了首页」，而主页/搜索/推荐流页**容忍**
+  `location.replace`（收集流程写了几个月都没事），所以极易误判成 token 失效/风控。
+  实测（note_selftest 的 A/B/C/D/E 对照）：不注入=稳；`location.replace` 写 1 次=弹；
+  `history.replaceState` 写满 12 次=稳；Cookie 高频写=稳。所有上报（EXTRACT_JS、
+  IDENTITY_DOM_JS、自检、页面按钮信号）都走 `history.replaceState`——Rust 侧靠
+  轮询读 `window.url()`，不需要事件，无缝替换。
+- **笔记自检开关**：数据目录放 `note_selftest` 文件再启动：内容为空=用本会话从
+  探索页抓新卡片试开（会话级体检）；内容是一条笔记链接=把它按来源/路径变体矩阵
+  逐个试开+新鲜 token 对照（分辨「链接形态」vs「token 绑定」vs「会话风控」）；
+  内容为 `injecttest`=回传通道对比实验。结论全部写进 `xhs_debug.log`——
+  远程排查下载失败先用它，别让用户当测试员。
 - **数据在 `__INITIAL_STATE__`**：笔记详情在 `noteDetailMap[id].note`；
   用户主页在 `user.userPageData` + `user.notes[]`。里面的裸 `undefined` 不是合法 JSON，
   必须替换成 null（替换串写 `${1}null`，`$1null` 会被正则当组名——踩过）。
