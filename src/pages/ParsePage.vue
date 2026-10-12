@@ -24,62 +24,13 @@ const emit = defineEmits(["toast", "goto"]);
 
 const text = ref("");
 
-/** 操作说明卡折叠状态：本地记住（老手折一次，以后一直折着）。
- *  折叠动画作用于**整张卡片**（含 padding 一起缩到只剩标题一行）——
- *  只缩内容的话 .card 的固定 padding 会留一大块空白（实测截图抓到）。 */
+/** 操作说明折叠面板（BILIdown 同款）：默认收起，不占高频操作的空间；
+ *  折叠/展开的高度动画交给 CSS（grid-template-rows 0fr↔1fr 过渡），状态本地记住 */
 const HOWTO_KEY = "xhsdown_howto_open";
-const howtoOpen = ref(localStorage.getItem(HOWTO_KEY) !== "0");
-const howtoCard = ref(null);
-const howtoBody = ref(null);
-let howtoAnimating = false;
-
-function slideHowto(open) {
-  const card = howtoCard.value;
-  const body = howtoBody.value;
-  if (!card || !body || howtoAnimating) {
-    if (body) body.style.display = open ? "" : "none";
-    howtoOpen.value = open;
-    return;
-  }
-  howtoAnimating = true;
-  // 卡片当前总高（含 padding/border）→ 折叠目标 = 只够装头部那一行
-  const from = card.getBoundingClientRect().height;
-  body.style.display = open ? "" : "";
-  const head = card.querySelector(".howto-head");
-  const padY =
-    parseFloat(getComputedStyle(card).paddingTop) +
-    parseFloat(getComputedStyle(card).paddingBottom);
-  const target = open
-    ? card.scrollHeight
-    : (head ? head.getBoundingClientRect().height : 24) + padY + 2;
-  const start = open ? from : from;
-  const duration = 240;
-  const t0 = performance.now();
-  const step = (t) => {
-    const p = Math.min((t - t0) / duration, 1);
-    const e = 1 - Math.pow(1 - p, 3); // easeOutCubic
-    const h = (open ? start + (target - start) * e : start - (start - target) * e);
-    card.style.height = `${h}px`;
-    card.style.overflow = "hidden";
-    body.style.opacity = String(open ? 0.3 + 0.7 * e : 1 - e);
-    if (p < 1) {
-      requestAnimationFrame(step);
-    } else {
-      card.style.height = "";
-      card.style.overflow = "";
-      body.style.opacity = "";
-      body.style.display = open ? "" : "none";
-      howtoAnimating = false;
-    }
-  };
-  requestAnimationFrame(step);
-}
-
+const howtoOpen = ref(localStorage.getItem(HOWTO_KEY) === "1");
 function toggleHowto() {
-  const next = !howtoOpen.value;
-  slideHowto(next);
-  howtoOpen.value = next;
-  localStorage.setItem(HOWTO_KEY, next ? "1" : "0");
+  howtoOpen.value = !howtoOpen.value;
+  localStorage.setItem(HOWTO_KEY, howtoOpen.value ? "1" : "0");
 }
 const parsing = ref(false);
 
@@ -1146,38 +1097,44 @@ function kindLabel(kind) {
       </div>
     </section>
 
-    <!-- 操作说明：两种取内容的路径。可折叠——新用户展开看，老手折起省版面（状态本地记住） -->
-    <section class="card howto" ref="howtoCard" :class="{ folded: !howtoOpen }">
-      <button class="howto-head" @click="toggleHowto" :aria-expanded="howtoOpen">
-        <h2>操作说明</h2>
-        <span class="howto-summary" v-if="!howtoOpen">网页收集 · 粘贴链接 / 一键复制</span>
+    <!-- 操作说明：BILIdown 同款折叠面板——独立卡、默认收起、分节展开；
+         高度动画用 grid-template-rows 0fr↔1fr（卡片高度随折叠平滑缩放） -->
+    <section class="card guide-card" :class="{ open: howtoOpen }">
+      <button class="guide-toggle" :aria-expanded="howtoOpen" @click="toggleHowto">
+        <Icon name="info" />
+        <span>操作说明</span>
         <span class="spacer"></span>
-        <Icon name="chevronDown" class="howto-caret" :class="{ up: howtoOpen }" />
+        <Icon name="chevronDown" class="guide-caret" />
       </button>
-      <div class="howto-grid" ref="howtoBody">
-        <div class="howto-way">
-          <div class="howto-title"><span class="badge">推荐</span>网页收集（整个主页 / 搜索结果）</div>
-          <ol>
-            <li>点右上角 <b>WEB</b> 打开小红书网页，登录一次（之后保持登录）</li>
-            <li>在网页里打开想收集的用户主页——左下角会显示 <b>共 N 条</b></li>
-            <li>点页面顶部红色 <b>开始解析</b>，网页自动滚动收集，进度实时可见</li>
-            <li>收集完成自动回到这里——勾选内容，点下载即可</li>
-          </ol>
-          <p class="howto-note">
-            提示：收集按笔记去重，重复收集不会产生重复条目，只用来补尾部；
-            少数笔记（仅自己可见/审核中）网页端不放出，可在 App 里分享单条链接下载。
-          </p>
-        </div>
-        <div class="howto-way">
-          <div class="howto-title"><span class="badge alt">单条</span>粘贴链接 / 一键复制（单条笔记）</div>
-          <ol>
-            <li>在 App 里打开笔记 → 分享 → 复制链接（整段分享文本可直接粘贴）；或点网页地址栏的 <b>复制</b>，当前网页地址直接进解析栏</li>
-            <li>粘贴到上方输入框（一行一个，可批量；点复制是追加，攒多条一起解析），点 <b>开始解析</b></li>
-            <li>解析完成后进入「选择内容」页，勾选下载</li>
-          </ol>
-          <p class="howto-note">
-            支持笔记链接、xhslink 短链、用户主页与探索页链接；带 xsec_token 的链接成功率更高。
-          </p>
+      <div class="guide-fold" :class="{ folded: !howtoOpen }">
+        <div class="guide-body">
+          <div class="guide-sec">
+            <h3>一次完整的下载</h3>
+            <ol class="guide-steps">
+              <li><b>打开网页</b>：点右上角 <b>WEB</b> 打开小红书网页，登录一次（之后保持登录）。</li>
+              <li><b>网页收集</b>：在网页里打开用户主页（左下角显示「共 N 条」），点页面顶部红色「开始解析」，网页自动滚动收集，进度实时可见；收集完自动回到这里。</li>
+              <li><b>粘贴链接</b>：单条内容也可以在 App 里分享复制链接（或点网页地址栏「复制」直接送进解析栏），一行一个、可批量，点「开始解析」或 Ctrl + Enter。</li>
+              <li><b>勾选与下载</b>：在「选择内容」页勾选条目，可在「下载设置」里调整本批的视频清晰度 / 图片规格，点「下载所选」。</li>
+              <li><b>查看进度</b>：到「传输」页看进度，行内可暂停 / 继续 / 取消，完成后「打开位置」定位文件。</li>
+            </ol>
+          </div>
+          <div class="guide-sec">
+            <h3>链接会怎么解析</h3>
+            <ul>
+              <li>用户主页：读取主页最新一批笔记；更早的内容网页端不提供，请在 App 里分享具体笔记链接。</li>
+              <li>笔记链接：支持 App 分享文本整段粘贴、xhslink 短链、探索页链接；带 xsec_token 的链接成功率更高。</li>
+              <li>探索页 / 搜索结果：解析当前页的卡片；更多内容用网页收集滚动拿全。</li>
+            </ul>
+          </div>
+          <div class="guide-sec">
+            <h3>小贴士</h3>
+            <ul>
+              <li>重复收集不会产生重复条目：收集按笔记去重，再收一次只用来补尾部没加载出的条目。</li>
+              <li>少数笔记（仅自己可见 / 审核中）网页端不放出——总数比可收数多几条属正常；想要的单条在 App 里分享链接即可下载。</li>
+              <li>图片只有两档（分辨率相同、最高 1080 宽，区别在压缩质量）；视频清晰度按短边分级，最高 2160P/4K，所选档不存在时自动取最佳可用。</li>
+              <li>重复下载不会产生副本：已存在的文件自动跳过。</li>
+            </ul>
+          </div>
         </div>
       </div>
     </section>
@@ -1373,110 +1330,107 @@ input:focus {
   color: var(--muted);
 }
 
-/* 操作说明卡：两条路径并排，窄屏自动换行；头部可点折叠 */
-.howto-head {
+/* 操作说明（BILIdown 同款）：独立卡、头部一行、分节正文；
+   卡片 padding 归到头部与正文自己身上，折叠到 0fr 时没有残留空白 */
+.guide-card {
+  padding: 0;
+  overflow: hidden;
+}
+
+.guide-toggle {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   width: 100%;
-  padding: 0;
-  margin: 0 0 12px;
+  padding: 14px 22px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--muted);
   background: none;
   border: none;
   cursor: pointer;
   text-align: left;
-  color: inherit;
 }
 
-.howto-head h2 {
-  margin: 0;
-  font-size: 15px;
-}
-
-.howto-summary {
-  font-size: 12px;
-  color: var(--muted);
-}
-
-.howto-caret {
-  flex: none;
-  width: 14px;
-  height: 14px;
-  color: var(--muted);
-  transition: transform 0.18s ease;
-}
-
-.howto-caret.up {
-  transform: rotate(180deg);
-}
-
-/* 折叠态：卡片随内容一起收缩（高度动画由 JS 逐帧驱动），只留头部一行 */
-.howto.folded {
-  padding-top: 14px;
-  padding-bottom: 14px;
-}
-
-.howto.folded .howto-head {
-  margin-bottom: 0;
-}
-
-.howto .spacer {
-  flex: 1;
-}
-
-.howto-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-  gap: 14px;
-}
-
-.howto-way {
-  padding: 13px 14px;
-  background: var(--field);
-  border: 1px solid var(--line);
-  border-radius: var(--radius, 10px);
-}
-
-.howto-title {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 9px;
-  font-size: 13px;
-  font-weight: 600;
-}
-
-.howto-title .badge {
-  flex: none;
-  padding: 2px 7px;
-  font-size: 10.5px;
-  font-weight: 600;
-  color: #fff;
-  background: var(--accent);
-  border-radius: 999px;
-}
-
-.howto-title .badge.alt {
-  color: var(--accent);
-  background: var(--accent-soft);
-  border: 1px solid var(--accent-line);
-}
-
-.howto-way ol {
-  margin: 0;
-  padding-left: 18px;
-  font-size: 12.5px;
-  line-height: 1.9;
+.guide-toggle:hover {
   color: var(--text);
 }
 
-.howto-note {
-  margin: 9px 0 0;
-  padding-top: 9px;
-  border-top: 1px dashed var(--line-soft);
-  font-size: 11.5px;
-  line-height: 1.7;
+.guide-toggle svg {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  color: var(--accent);
+}
+
+.guide-toggle .spacer {
+  flex: 1;
+}
+
+.guide-caret {
+  color: var(--faint);
+  transition: transform 0.18s ease;
+}
+
+.guide-card.open .guide-caret {
+  transform: rotate(180deg);
+}
+
+/* 折叠动效：grid-template-rows 0fr↔1fr 平滑过渡，卡片高度随折叠缩放 */
+.guide-fold {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows 240ms ease;
+}
+
+.guide-fold.folded {
+  grid-template-rows: 0fr;
+}
+
+.guide-body {
+  min-height: 0;
+  overflow: hidden;
+  /* 横向留白对齐卡片内边距；竖向 padding 由各小节自带（折叠到 0fr 时无残留） */
+  padding: 0 22px;
+  font-size: 12.5px;
+  line-height: 1.8;
   color: var(--muted);
+}
+
+.guide-sec {
+  padding: 10px 0;
+  border-top: 1px solid var(--line-soft);
+}
+
+.guide-sec:last-child {
+  padding-bottom: 16px;
+}
+
+.guide-sec h3 {
+  margin: 0 0 6px;
+  font-size: 12.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.guide-steps {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.guide-steps li,
+.guide-sec ul li {
+  margin: 2px 0;
+}
+
+.guide-sec ul {
+  margin: 0;
+  padding-left: 18px;
+}
+
+.guide-body b {
+  color: var(--text);
+  font-weight: 600;
 }
 
 .sources-label {
