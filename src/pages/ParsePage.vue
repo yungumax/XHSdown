@@ -32,6 +32,9 @@ function toggleHowto() {
   howtoOpen.value = !howtoOpen.value;
   localStorage.setItem(HOWTO_KEY, howtoOpen.value ? "1" : "0");
 }
+
+/** 解析结果卡折叠（BILIdown 同款）：解析完是要看的，默认展开；折起只留标题行 */
+const resultsFolded = ref(false);
 const parsing = ref(false);
 
 /** 主按钮磁吸：轻微朝鼠标偏移（±4px），移开弹回。只动 transform。 */
@@ -159,6 +162,8 @@ watch(
     items.value = [{ input: key, ok: true, error: "", probe, quality: "auto" }];
     selected.value = new Set();
     batchInput.value = key;
+    // 进入选择页时把结果卡折起来：内容已在选择页里，结果卡只留个可展开的入口
+    resultsFolded.value = true;
     view.value = "select";
     await nextTick();
   },
@@ -1139,65 +1144,80 @@ function kindLabel(kind) {
       </div>
     </section>
 
-    <!-- 解析结果入口：成功的一律进「选择内容」页，这里只留入口与失败项 -->
+    <!-- 解析结果入口：成功的一律进「选择内容」页，这里只留入口与失败项。
+         可折叠（BILIdown 同款）：解析完是要看的所以默认展开，折起省版面 -->
     <section v-if="items.length" class="card results page-in">
       <header class="results-head">
         <h2>解析结果</h2>
         <span class="count num">{{ okItems.length }}</span>
         <span class="spacer"></span>
         <button class="ghost" @click="resetParsed">清空</button>
+        <button
+          class="ghost fold-btn"
+          :title="resultsFolded ? '展开解析结果' : '折叠解析结果'"
+          :aria-expanded="!resultsFolded"
+          @click="resultsFolded = !resultsFolded"
+        >
+          <Icon name="chevronDown" class="fold-caret" :class="{ folded: resultsFolded }" />
+        </button>
       </header>
 
-      <div v-if="okItems.length" class="parsed-bar">
-        <button
-          v-for="item in okItems"
-          :key="item.input"
-          class="parsed-chip"
-          :title="item.probe.title || item.input"
-          @click="openSelect(item.input)"
-        >
-          <span class="kind">{{ KIND_LABELS[item.probe.kind] }}</span>
-          <span class="chip-title">{{ item.probe.title || item.input }}</span>
-          <span class="num faint">{{ sourceCount(item) }}</span>
-        </button>
-      </div>
-
-      <div v-if="parseSkipped.length || dedupedCount > 0" class="skipped-box">
-        <p class="skipped-head">
-          去重结果
-          <span class="num faint">
-            {{ parseSkipped.length ? `跳过 ${parseSkipped.length} 个重复来源` : "" }}
-            {{ parseSkipped.length && dedupedCount ? " · " : "" }}
-            {{ dedupedCount ? `合并 ${dedupedCount} 条重复内容` : "" }}
-          </span>
-          <span v-if="parseSkipped.length > 5" class="skipped-more faint">（列表内可滚动）</span>
-        </p>
-        <ul class="skipped-list">
-          <li v-for="(item, index) in parseSkipped" :key="`${item.input}-${index}`">
-            <span class="skipped-input" :title="item.input">{{ item.input }}</span>
-            <span class="skipped-reason">{{ item.reason }}</span>
-          </li>
-          <li v-if="dedupedCount > 0" class="skipped-merged">
-            <span class="skipped-reason">
-              另有 {{ dedupedCount }} 条内容与已有来源重复，已合并（不重复下载）
-            </span>
-          </li>
-        </ul>
-      </div>
-
-      <ul v-if="failedItems.length" class="list">
-        <li v-for="item in failedItems" :key="item.input" class="item failed">
-          <div class="meta">
-            <p class="title">{{ item.input }}</p>
-            <p class="error">{{ item.error }}</p>
+      <!-- 折叠/展开时卡片高度随动（grid-template-rows 0fr↔1fr）；
+           本卡不受输入卡那条 min-height 约束的问题已对说明卡处理，这里同享豁免 -->
+      <div class="results-fold" :class="{ folded: resultsFolded }">
+        <div class="results-body">
+          <div v-if="okItems.length" class="parsed-bar">
+            <button
+              v-for="item in okItems"
+              :key="item.input"
+              class="parsed-chip"
+              :title="item.probe.title || item.input"
+              @click="openSelect(item.input)"
+            >
+              <span class="kind">{{ KIND_LABELS[item.probe.kind] }}</span>
+              <span class="chip-title">{{ item.probe.title || item.input }}</span>
+              <span class="num faint">{{ sourceCount(item) }}</span>
+            </button>
           </div>
-          <button class="remove" title="移除" @click="removeItem(item.input)">✕</button>
-        </li>
-      </ul>
 
-      <p v-if="!login.logged_in && okItems.length" class="login-tip">
-        未登录时部分内容会被风控拦下；登录后解析更稳定，也能读取自己的主页笔记。
-      </p>
+          <div v-if="parseSkipped.length || dedupedCount > 0" class="skipped-box">
+            <p class="skipped-head">
+              去重结果
+              <span class="num faint">
+                {{ parseSkipped.length ? `跳过 ${parseSkipped.length} 个重复来源` : "" }}
+                {{ parseSkipped.length && dedupedCount ? " · " : "" }}
+                {{ dedupedCount ? `合并 ${dedupedCount} 条重复内容` : "" }}
+              </span>
+              <span v-if="parseSkipped.length > 5" class="skipped-more faint">（列表内可滚动）</span>
+            </p>
+            <ul class="skipped-list">
+              <li v-for="(item, index) in parseSkipped" :key="`${item.input}-${index}`">
+                <span class="skipped-input" :title="item.input">{{ item.input }}</span>
+                <span class="skipped-reason">{{ item.reason }}</span>
+              </li>
+              <li v-if="dedupedCount > 0" class="skipped-merged">
+                <span class="skipped-reason">
+                  另有 {{ dedupedCount }} 条内容与已有来源重复，已合并（不重复下载）
+                </span>
+              </li>
+            </ul>
+          </div>
+
+          <ul v-if="failedItems.length" class="list">
+            <li v-for="item in failedItems" :key="item.input" class="item failed">
+              <div class="meta">
+                <p class="title">{{ item.input }}</p>
+                <p class="error">{{ item.error }}</p>
+              </div>
+              <button class="remove" title="移除" @click="removeItem(item.input)">✕</button>
+            </li>
+          </ul>
+
+          <p v-if="!login.logged_in && okItems.length" class="login-tip">
+            未登录时部分内容会被风控拦下；登录后解析更稳定，也能读取自己的主页笔记。
+          </p>
+        </div>
+      </div>
     </section>
     </template>
   </div>
@@ -1638,7 +1658,8 @@ input:focus {
 
 /* 说明卡不参与这条最小高度：它是折叠面板，折叠后只剩标题一行，
    被 min-height 顶住就会出现"内容收了、卡片还撑一大块空白"（实测截图抓到） */
-.parse-page:not(.fill-height) > .card.guide-card {
+.parse-page:not(.fill-height) > .card.guide-card,
+.parse-page:not(.fill-height) > .card.results {
   min-height: 0;
 }
 
@@ -1977,6 +1998,42 @@ input:focus {
   align-items: center;
   gap: 9px;
   margin-bottom: 8px;
+}
+
+/* 解析结果折叠（BILIdown 同款）：高度随 0fr↔1fr 平滑缩放 */
+.fold-btn {
+  flex: none;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.fold-caret {
+  width: 14px;
+  height: 14px;
+  transition: transform 0.18s ease;
+}
+
+.fold-caret.folded {
+  transform: rotate(-90deg);
+}
+
+.results-fold {
+  display: grid;
+  grid-template-rows: 1fr;
+  transition: grid-template-rows 240ms ease;
+}
+
+.results-fold.folded {
+  grid-template-rows: 0fr;
+}
+
+.results-body {
+  min-height: 0;
+  overflow: hidden;
 }
 
 h2 {
