@@ -1636,6 +1636,12 @@ input:focus {
   min-height: 300px;
 }
 
+/* 说明卡不参与这条最小高度：它是折叠面板，折叠后只剩标题一行，
+   被 min-height 顶住就会出现"内容收了、卡片还撑一大块空白"（实测截图抓到） */
+.parse-page:not(.fill-height) > .card.guide-card {
+  min-height: 0;
+}
+
 .parse-page:not(.fill-height) > .card textarea {
   flex: 1 1 auto;
   min-height: 110px;
