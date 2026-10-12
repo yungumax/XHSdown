@@ -24,12 +24,59 @@ const emit = defineEmits(["toast", "goto"]);
 
 const text = ref("");
 
-/** 操作说明卡折叠状态：本地记住（老手折一次，以后一直折着） */
+/** 操作说明卡折叠状态：本地记住（老手折一次，以后一直折着）。
+ *  折叠时卡片跟着内容一起平滑收缩（grid 高度逐帧过渡，而不是瞬间消失）。 */
 const HOWTO_KEY = "xhsdown_howto_open";
 const howtoOpen = ref(localStorage.getItem(HOWTO_KEY) !== "0");
+const howtoBody = ref(null);
+const howtoBodyStyle = ref("");
+let howtoAnimating = false;
+
+function slideHowto(open) {
+  const el = howtoBody.value;
+  if (!el || howtoAnimating) {
+    // 兜底：没法动画就直接切换
+    if (el) el.style.overflow = "";
+    howtoBodyStyle.value = open ? "" : "display:none";
+    howtoOpen.value = open;
+    return;
+  }
+  howtoAnimating = true;
+  const first = el.getBoundingClientRect().height;
+  el.style.overflow = "hidden";
+  el.style.display = "";
+  const full = el.scrollHeight;
+  el.style.display = "none";
+  const start = open ? first : full;
+  const end = open ? full : 0;
+  const duration = 220;
+  const t0 = performance.now();
+  const step = (t) => {
+    const p = Math.min((t - t0) / duration, 1);
+    // easeOutCubic
+    const e = 1 - Math.pow(1 - p, 3);
+    const h = start + (end - start) * e;
+    el.style.display = "";
+    el.style.height = `${h}px`;
+    el.style.opacity = String(open ? 0.35 + 0.65 * e : 1 - e * 0.65);
+    if (p < 1) {
+      requestAnimationFrame(step);
+    } else {
+      el.style.height = "";
+      el.style.opacity = "";
+      el.style.overflow = "";
+      if (!open) el.style.display = "none";
+      howtoAnimating = false;
+    }
+  };
+  requestAnimationFrame(step);
+}
+
 function toggleHowto() {
-  howtoOpen.value = !howtoOpen.value;
-  localStorage.setItem(HOWTO_KEY, howtoOpen.value ? "1" : "0");
+  const next = !howtoOpen.value;
+  slideHowto(next);
+  howtoOpen.value = next;
+  localStorage.setItem(HOWTO_KEY, next ? "1" : "0");
 }
 const parsing = ref(false);
 
@@ -1104,7 +1151,7 @@ function kindLabel(kind) {
         <span class="spacer"></span>
         <Icon name="chevronDown" class="howto-caret" :class="{ up: howtoOpen }" />
       </button>
-      <div class="howto-grid" v-show="howtoOpen">
+      <div class="howto-grid" ref="howtoBody" :style="howtoBodyStyle">
         <div class="howto-way">
           <div class="howto-title"><span class="badge">推荐</span>网页收集（整个主页 / 搜索结果）</div>
           <ol>
@@ -1360,10 +1407,14 @@ input:focus {
   transform: rotate(180deg);
 }
 
-/* 折叠态：整卡收成一行（隐藏内边距，只留头部） */
+/* 折叠态：卡片随内容一起收缩（高度动画由 JS 逐帧驱动），只留头部一行 */
 .howto.folded {
   padding-top: 14px;
   padding-bottom: 14px;
+}
+
+.howto.folded .howto-head {
+  margin-bottom: 0;
 }
 
 .howto .spacer {
