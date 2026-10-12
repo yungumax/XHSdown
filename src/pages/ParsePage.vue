@@ -23,6 +23,14 @@ const props = defineProps({
 const emit = defineEmits(["toast", "goto"]);
 
 const text = ref("");
+
+/** 操作说明卡折叠状态：本地记住（老手折一次，以后一直折着） */
+const HOWTO_KEY = "xhsdown_howto_open";
+const howtoOpen = ref(localStorage.getItem(HOWTO_KEY) !== "0");
+function toggleHowto() {
+  howtoOpen.value = !howtoOpen.value;
+  localStorage.setItem(HOWTO_KEY, howtoOpen.value ? "1" : "0");
+}
 const parsing = ref(false);
 
 /** 主按钮磁吸：轻微朝鼠标偏移（±4px），移开弹回。只动 transform。 */
@@ -1088,10 +1096,15 @@ function kindLabel(kind) {
       </div>
     </section>
 
-    <!-- 操作说明：两种取内容的路径，常驻显示（新用户不用翻文档） -->
-    <section class="card howto">
-      <h2>操作说明</h2>
-      <div class="howto-grid">
+    <!-- 操作说明：两种取内容的路径。可折叠——新用户展开看，老手折起省版面（状态本地记住） -->
+    <section class="card howto" :class="{ folded: !howtoOpen }">
+      <button class="howto-head" @click="toggleHowto" :aria-expanded="howtoOpen">
+        <h2>操作说明</h2>
+        <span class="howto-summary" v-if="!howtoOpen">网页收集 · 粘贴链接 / 一键复制</span>
+        <span class="spacer"></span>
+        <Icon name="chevronDown" class="howto-caret" :class="{ up: howtoOpen }" />
+      </button>
+      <div class="howto-grid" v-show="howtoOpen">
         <div class="howto-way">
           <div class="howto-title"><span class="badge">推荐</span>网页收集（整个主页 / 搜索结果）</div>
           <ol>
@@ -1310,10 +1323,51 @@ input:focus {
   color: var(--muted);
 }
 
-/* 操作说明卡：两条路径并排，窄屏自动换行 */
-.howto h2 {
+/* 操作说明卡：两条路径并排，窄屏自动换行；头部可点折叠 */
+.howto-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 0;
   margin: 0 0 12px;
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-align: left;
+  color: inherit;
+}
+
+.howto-head h2 {
+  margin: 0;
   font-size: 15px;
+}
+
+.howto-summary {
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.howto-caret {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  color: var(--muted);
+  transition: transform 0.18s ease;
+}
+
+.howto-caret.up {
+  transform: rotate(180deg);
+}
+
+/* 折叠态：整卡收成一行（隐藏内边距，只留头部） */
+.howto.folded {
+  padding-top: 14px;
+  padding-bottom: 14px;
+}
+
+.howto .spacer {
+  flex: 1;
 }
 
 .howto-grid {
