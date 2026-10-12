@@ -106,6 +106,7 @@ async function checkUpdate() {
   try {
     const update = await api.updateCheckPlugin().catch(() => null);
     if (update) {
+      // 插件发现了新版本（带签名的更新包，可直接下载安装）
       pluginUpdate.value = update;
       updateResult.value = {
         current: update.currentVersion,
@@ -113,9 +114,18 @@ async function checkUpdate() {
         up_to_date: false,
         error: "",
       };
+      emit("toast", `发现新版本 v${update.version}`);
     } else {
+      // 插件返回 null = 已是最新（签名校验过的权威结论），不再绕后端兜底——
+      // 之前这里会去请求 GitHub API 兜底，网络不好时反而显示"无法检测"，误导
       pluginUpdate.value = null;
-      updateResult.value = await api.checkUpdates();
+      updateResult.value = {
+        current: props.settings?.version || "",
+        latest: "",
+        up_to_date: true,
+        error: "",
+      };
+      emit("toast", `已是最新版本（v${props.settings?.version || ""}）`);
     }
   } catch (error) {
     updateResult.value = {
@@ -124,6 +134,7 @@ async function checkUpdate() {
       up_to_date: false,
       error: String(error),
     };
+    emit("toast", `检测更新失败：${error}`);
   } finally {
     checkingUpdate.value = false;
   }
