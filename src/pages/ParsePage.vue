@@ -1527,20 +1527,22 @@ input:focus {
 
 /* 输入页里的"已解析来源"入口 */
 .parsed-bar {
-  display: flex;
-  flex-wrap: wrap;
+  /* 一排两个，行内等高（grid 默认 stretch）——长标题省略号截断，两列对齐（BILIdown 同款） */
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 8px;
   margin-top: 0;
 }
 
 .parsed-chip {
-  display: inline-flex;
+  display: flex;
   align-items: center;
   gap: 8px;
-  max-width: 100%;
+  min-width: 0;
   padding: 7px 12px;
   font-size: 12.5px;
   color: var(--text);
+  text-align: left;
   background: var(--field);
   border: 1px solid var(--line);
   border-radius: var(--radius-sm);
@@ -1551,8 +1553,19 @@ input:focus {
   background: var(--raised);
 }
 
+.parsed-chip .kind {
+  flex: none;
+  padding: 2px 7px;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 999px;
+}
+
 .parsed-chip .chip-title {
-  max-width: 320px;
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
